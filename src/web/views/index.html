@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wx-summary</title>
+  <link rel="stylesheet" href="/css/app.css?v=__ASSET_VERSION__" />
+</head>
+<body>
+  <script>
+    window.__WX_TOKEN__ = "__SESSION_TOKEN__";
+  </script>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">wx</span>
+      <span class="brand-name">wx-summary</span>
+      <span class="badge" title="只读本机微信 v4 数据库副本；未检测到微信时不显示演示数据">本机只读</span>
+    </div>
+    <nav class="nav">
+      <a href="#/digest" data-route="digest">总结</a>
+      <a href="#/history" data-route="history">历史</a>
+      <a href="#/settings" data-route="settings">设置</a>
+    </nav>
+    <div class="topbar-right">
+      <select id="account-switcher" class="account-switcher" title="切换微信账号"></select>
+      <button class="icon-btn" id="theme-toggle" title="切换主题">☀</button>
+    </div>
+  </header>
+
+  <main id="app">
+    <section class="page">
+      <section class="notice-card">
+        <strong>正在检查本机状态</strong>
+        <span>正在读取微信账号、配置和本地服务状态，请稍等。</span>
+      </section>
+    </section>
+  </main>
+
+  <!-- 模板：主页 -->
+  <template id="tpl-digest">
+    <section class="page page-digest">
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <input type="text" id="group-search" placeholder="搜索群（支持拼音首字母）" autocomplete="off" title="/ 聚焦搜索" />
+        </div>
+        <ul class="group-list" id="group-list">
+          <li class="muted loading">正在扫描本机 key 候选并读取群列表，首次可能需要约 1 分钟...</li>
+        </ul>
+        <div class="sidebar-footer">
+          <span id="selected-count">已选 0 个</span>
+          <button class="link-btn" id="select-whitelist">全选白名单</button>
+        </div>
+      </aside>
+
+      <div class="main-pane">
+        <section class="notice-card hidden" id="wechat-notice"></section>
+
+        <section class="card">
+          <h3 class="card-title">时间范围</h3>
+          <div class="quick-range" id="quick-range">
+            <button data-range="today">今天</button>
+            <button data-range="yesterday">昨天</button>
+            <button data-range="last4h">最近 4h</button>
+            <button data-range="last12h">最近 12h</button>
+            <button data-range="last1d" class="active">最近 1d</button>
+            <button data-range="thisweek">本周</button>
+            <button data-range="custom">自定义</button>
+          </div>
+          <div class="custom-range hidden" id="custom-range">
+            <div class="range-picker" id="range-picker">
+              <button class="range-field" id="range-start" type="button" data-range-side="since">
+                <span>开始</span>
+                <strong id="range-start-text"></strong>
+              </button>
+              <span class="dash">~</span>
+              <button class="range-field" id="range-end" type="button" data-range-side="until">
+                <span>结束</span>
+                <strong id="range-end-text"></strong>
+              </button>
+              <div class="range-popover hidden" id="range-popover">
+                <div class="calendar-head">
+                  <button class="icon-btn" id="range-prev-month" type="button" title="上个月">&lt;</button>
+                  <strong id="range-month-title"></strong>
+                  <button class="icon-btn" id="range-next-month" type="button" title="下个月">&gt;</button>
+                </div>
+                <div class="weekday-row">
+                  <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+                </div>
+                <div class="calendar-grid" id="range-calendar"></div>
+                <div class="time-select-row">
+                  <label>时间</label>
+                  <select id="range-hour"></select>
+                  <select id="range-minute"></select>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h3 class="card-title">过滤（可选）</h3>
+          <div class="filter-row">
+            <label>发送人</label>
+            <div class="chip-input" data-name="senders">
+              <input type="text" placeholder="输入后回车 / 逗号分隔" />
+            </div>
+          </div>
+          <div class="filter-row">
+            <label>关键词</label>
+            <div class="chip-input" data-name="keywords">
+              <input type="text" placeholder="输入后回车 / 逗号分隔" />
+            </div>
+          </div>
+          <div class="filter-row">
+            <label>排除类型</label>
+            <div class="check-row">
+              <label><input type="checkbox" name="ex" value="image" /> 图片</label>
+              <label><input type="checkbox" name="ex" value="voice" /> 语音</label>
+              <label><input type="checkbox" name="ex" value="video" /> 视频</label>
+              <label><input type="checkbox" name="ex" value="file" /> 文件</label>
+            </div>
+          </div>
+          <div class="filter-row">
+            <label>最少消息数</label>
+            <input type="number" id="min-messages" value="5" min="1" max="9999" class="num-input" />
+          </div>
+        </section>
+
+        <section class="card">
+          <h3 class="card-title">渲染选项</h3>
+          <div class="filter-row">
+            <label>主题</label>
+            <div class="radio-row">
+              <label><input type="radio" name="theme" value="auto" checked /> 跟随系统</label>
+              <label><input type="radio" name="theme" value="light" /> 浅色</label>
+              <label><input type="radio" name="theme" value="dark" /> 暗色</label>
+            </div>
+          </div>
+          <div class="filter-row">
+            <label>字号</label>
+            <div class="radio-row">
+              <label><input type="radio" name="fontsize" value="normal" checked /> 标准</label>
+              <label><input type="radio" name="fontsize" value="large" /> 大号</label>
+            </div>
+          </div>
+        </section>
+
+        <div class="action-row">
+          <button class="btn btn-primary" id="btn-generate" disabled title="Ctrl+Enter">生成长图</button>
+          <button class="btn btn-ghost" id="btn-preview-text" disabled>仅预览文本</button>
+        </div>
+
+        <section class="card progress-card hidden" id="progress-card">
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <ul class="progress-stages" id="progress-stages"></ul>
+          <div class="progress-log-tools hidden" id="progress-log-tools">
+            <button class="btn btn-ghost" id="progress-log-toggle" type="button">查看日志</button>
+            <span class="status" id="progress-log-status"></span>
+          </div>
+          <pre class="progress-log hidden" id="progress-log"></pre>
+        </section>
+
+        <section class="card preview-card hidden" id="preview-card">
+          <div class="preview-canvas-wrap">
+            <canvas id="digest-canvas" title="点击查看 100%"></canvas>
+          </div>
+          <div class="preview-actions">
+            <button class="btn" id="btn-download" title="Ctrl+S">⬇ 下载 PNG</button>
+            <button class="btn" id="btn-copy" title="Ctrl+Shift+C">📋 复制到剪贴板</button>
+            <button class="btn" id="btn-reveal" disabled title="保存后可用">📁 在文件夹中显示</button>
+            <button class="btn btn-ghost" id="btn-rerender">🔄 重新渲染</button>
+            <span class="status" id="preview-status">点击长图查看 100%</span>
+          </div>
+        </section>
+
+        <section class="card text-preview-card hidden" id="text-preview-card">
+          <div class="card-head">
+            <h3 class="card-title">文本预览</h3>
+            <div class="preview-actions compact">
+              <button class="btn btn-ghost" id="btn-export-md" disabled>导出 MD</button>
+              <span class="status" id="text-preview-status"></span>
+            </div>
+          </div>
+          <pre id="text-preview"></pre>
+        </section>
+      </div>
+    </section>
+  </template>
+
+  <!-- 模板：历史页 -->
+  <template id="tpl-history">
+    <section class="page page-history">
+      <div class="page-head">
+        <h2>历史摘要</h2>
+        <input type="text" id="history-search" placeholder="搜索群名 / 日期" />
+      </div>
+      <div class="history-grid" id="history-grid"></div>
+      <p class="empty hidden" id="history-empty">还没有摘要记录。回到「总结」页生成一个吧。</p>
+    </section>
+  </template>
+
+  <!-- 模板：设置页 -->
+  <template id="tpl-settings">
+    <section class="page page-settings">
+      <div class="page-head"><h2>设置</h2><span class="muted">所有设置均在网页内完成，无需编辑文件</span></div>
+
+      <section class="card setting-card">
+        <h3>AI 接入</h3>
+        <div class="form-row"><label>Provider</label>
+          <div class="radio-row">
+            <label><input type="radio" name="s-provider" value="openai" /> OpenAI</label>
+            <label><input type="radio" name="s-provider" value="anthropic" /> Anthropic</label>
+          </div>
+        </div>
+        <div class="form-row"><label>Base URL</label><input id="s-baseurl" type="text" placeholder="https://your-endpoint/v1" /></div>
+        <div class="form-row"><label>API Key</label>
+          <div class="key-input">
+            <input id="s-apikey" type="password" placeholder="sk-..." />
+            <button class="icon-btn" id="s-apikey-toggle" type="button">👁</button>
+          </div>
+          <span class="muted small" id="s-apikey-mask"></span>
+        </div>
+        <div class="form-row inline">
+          <button class="btn" id="s-list-models">获取模型</button>
+          <span class="status" id="s-model-status"></span>
+        </div>
+        <div class="form-row"><label>模型</label>
+          <select id="s-model-select"></select>
+          <label class="inline-check"><input id="s-model-custom" type="checkbox" /> 自定义</label>
+          <input id="s-model" class="hidden" type="text" placeholder="model-id" />
+        </div>
+        <div class="form-row"><label>长上下文模型</label>
+          <select id="s-model-long-select"></select>
+          <label class="inline-check"><input id="s-model-long-custom" type="checkbox" /> 自定义</label>
+          <input id="s-model-long" class="hidden" type="text" placeholder="model-id" />
+        </div>
+        <div class="form-row inline">
+          <button class="btn" id="s-test-llm">测试连通</button>
+          <button class="btn btn-primary" id="s-save-llm">保存</button>
+          <span class="status" id="s-llm-status"></span>
+        </div>
+      </section>
+
+      <section class="card setting-card">
+        <h3>群与调度</h3>
+        <div class="form-row"><label>白名单</label>
+          <div class="whitelist-area" id="s-whitelist"></div>
+        </div>
+        <div class="form-row inline">
+          <label class="switch"><input type="checkbox" id="s-scheduler" /> 启用定时摘要 (daemon)</label>
+        </div>
+        <div class="form-row"><label>检查间隔</label>
+          <input id="s-scheduler-interval" type="hidden" />
+          <div class="duration-control" data-duration-field="s-scheduler-interval">
+            <input id="s-scheduler-interval-value" type="number" min="1" step="1" />
+            <select id="s-scheduler-interval-unit" aria-label="检查间隔单位">
+              <option value="m">分钟</option>
+              <option value="h">小时</option>
+              <option value="d">天</option>
+            </select>
+          </div>
+          <span class="muted small">定时任务多久检查一次</span>
+        </div>
+        <div class="form-row"><label>摘要窗口</label>
+          <input id="s-scheduler-window" type="hidden" />
+          <div class="duration-control" data-duration-field="s-scheduler-window">
+            <input id="s-scheduler-window-value" type="number" min="1" step="1" />
+            <select id="s-scheduler-window-unit" aria-label="摘要窗口单位">
+              <option value="m">分钟</option>
+              <option value="h">小时</option>
+              <option value="d">天</option>
+            </select>
+          </div>
+          <span class="muted small">每次自动总结向前看的时间范围</span>
+        </div>
+        <div class="form-row"><label>最低消息数</label>
+          <input id="s-scheduler-min" type="number" min="1" step="1" />
+        </div>
+        <div class="form-row"><label>关键词覆盖</label>
+          <div class="override-editor">
+            <div class="override-add-row">
+              <select id="s-override-group"></select>
+              <input id="s-override-keywords" type="text" placeholder="关键词，逗号分隔" />
+              <input id="s-override-min" type="number" min="1" step="1" placeholder="最低消息数" />
+              <button class="btn" id="s-add-override" type="button">添加</button>
+            </div>
+            <div class="override-list" id="s-overrides"></div>
+            <span class="muted small">可为某个群单独设置关键词 OR 过滤与最低消息数；不填则使用上方全局设置。</span>
+          </div>
+        </div>
+        <div class="form-row inline">
+          <button class="btn btn-primary" id="s-save-groups" disabled>保存</button>
+          <button class="btn" id="s-run-scheduler" type="button" disabled>立即检查一次</button>
+          <span class="status" id="s-scheduler-status"></span>
+        </div>
+      </section>
+
+      <section class="card setting-card">
+        <h3>渲染与输出</h3>
+        <div class="form-row"><label>默认主题</label>
+          <select id="s-theme"><option value="auto">跟随系统</option><option value="light">浅色</option><option value="dark">暗色</option></select>
+        </div>
+        <div class="form-row"><label>默认字号</label>
+          <select id="s-fontsize"><option value="normal">标准</option><option value="large">大号</option></select>
+        </div>
+        <div class="form-row"><label>输出目录</label>
+          <input id="s-outdir" type="text" />
+          <button class="btn btn-ghost" id="s-open-outdir" disabled>打开</button>
+          <span class="muted small">必须在项目根之下</span>
+        </div>
+        <div class="form-row"><label>保留天数</label>
+          <input id="s-retention" type="number" min="0" />
+          <span class="muted small">0 = 无限保留</span>
+        </div>
+        <div class="form-row inline">
+          <button class="btn btn-primary" id="s-save-render" disabled>保存</button>
+          <span class="status" id="s-render-status"></span>
+        </div>
+      </section>
+
+      <section class="card setting-card">
+        <h3>隐私与安全</h3>
+        <div class="form-row inline">
+          <label><input type="checkbox" id="s-redact-phone" /> 手机号脱敏</label>
+          <label><input type="checkbox" id="s-redact-id" /> 身份证脱敏</label>
+          <label><input type="checkbox" id="s-redact-bank" /> 银行卡脱敏</label>
+          <label><input type="checkbox" id="s-redact-email" /> 邮箱脱敏</label>
+        </div>
+        <div class="form-row"><label>密钥模式</label>
+          <select id="s-keymode"><option value="auto">自动（默认）</option><option value="manual">手动（一条或多条 64/96 hex）</option></select>
+        </div>
+        <div class="form-row hidden" id="s-manual-key-row"><label>手动密钥</label><textarea id="s-manual-key" rows="3" spellcheck="false" autocomplete="off" placeholder="每行一个 64/96 位 hex；也可用逗号或空格分隔；留空则保留已保存值"></textarea></div>
+        <div class="form-row inline">
+          <button class="btn btn-primary" id="s-save-privacy" disabled>保存</button>
+          <button class="btn btn-ghost" id="s-export-diag" disabled>导出诊断包</button>
+          <span class="status" id="s-privacy-status"></span>
+        </div>
+      </section>
+
+      <section class="card setting-card">
+        <div class="card-head">
+          <h3 class="card-title">验收证据</h3>
+          <button class="btn btn-ghost" id="s-export-acceptance-md" type="button" disabled>导出记录</button>
+          <button class="btn btn-ghost" id="s-refresh-acceptance" type="button" disabled>刷新</button>
+        </div>
+        <div class="acceptance-checks" id="s-acceptance-checks">
+          <p class="empty">正在读取诊断状态...</p>
+        </div>
+        <span class="status" id="s-acceptance-status"></span>
+      </section>
+
+      <section class="card setting-card muted">
+        <h3>关于</h3>
+        <p>版本 0.1.0 · 平台 <span id="s-platform"></span> · 项目根 <span id="s-projroot"></span></p>
+        <p>本工具在本机只读采集与解密；生成摘要时只把所选时间窗内容发送到你配置的 AI 端点，不发往其他服务。密钥提取走纯只读路径，不 hook 不注入。</p>
+      </section>
+    </section>
+  </template>
+
+  <!-- 模板：首次启动向导 -->
+  <template id="tpl-setup">
+    <section class="page page-setup">
+      <div class="setup-card">
+        <div class="setup-header">
+          <h2 id="setup-title">欢迎使用 wx-summary</h2>
+          <div class="setup-progress"><span id="setup-step">1</span> / 4</div>
+        </div>
+        <div class="setup-body" id="setup-body"></div>
+        <div class="setup-footer">
+          <button class="btn btn-ghost" id="setup-back" disabled>上一步</button>
+          <button class="btn btn-primary" id="setup-next">下一步</button>
+        </div>
+      </div>
+    </section>
+  </template>
+
+  <script type="module" src="/js/app.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>
