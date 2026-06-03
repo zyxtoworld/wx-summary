@@ -2436,7 +2436,7 @@ async function renderSetup() {
       const secretWarning = state.secrets_invalid
         ? `<div class="notice-card setup-secret-warning">
             <strong>检测到本机密钥无法解密</strong>
-            <span>当前 Windows 用户不能解开已有的 DPAPI 密钥文件。请重新填写 AI Key 和可选微信手动密钥；旧密文不会展示，也不会上传。</span>
+            <span>当前系统用户不能解开已有的本机密钥文件。请重新填写 AI Key 和可选微信手动密钥；旧密文不会展示，也不会上传。</span>
           </div>`
         : '';
       $body.innerHTML = `
@@ -2493,7 +2493,7 @@ async function renderSetup() {
         <p>已能读取本机群列表、文本、引用、图片、文件、视频关键帧、语音/音频元信息；媒体解封失败时会保留时间、发送人和文件元信息，不假装看过或听过内容。</p>
         <p class="muted">${escapeHtml(state.wechat?.message || '检测中')}</p>
         <div class="form-row"><label>手动密钥（可选）</label><textarea id="w-manual-key" rows="3" spellcheck="false" autocomplete="off" placeholder="自动失败时填一条或多条 64/96 位 hex">${escapeHtml(wizardData.wechat.manual_key || '')}</textarea></div>
-        <p class="muted small">留空表示继续使用自动扫描；填写后会先保存到本机 DPAPI 加密密钥区，再进入群列表。</p>
+        <p class="muted small">留空表示继续使用自动扫描；填写后会先保存到本机加密密钥区，再进入群列表。</p>
         <span class="status" id="w-key-status"></span>`;
     } else if (step === 4) {
       $title.textContent = '选择群白名单';

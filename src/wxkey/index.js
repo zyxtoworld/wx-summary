@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { DATA_DIR } from '../lib/paths.js';
 import { discoverDataRoots, discoverWxAccounts, getWeixinProcesses } from '../wxenv/discovery.js';
 import { imageKeyValidationCount } from '../wxdb/image-dat.js';
 
@@ -158,6 +159,18 @@ export async function probeWxKey({
       stage: 'process',
       reason: processes.length ? '未识别到主 Weixin.exe 进程。' : '未检测到 Weixin.exe，请先登录微信。',
       process_count: processes.length,
+    };
+  }
+  if (process.platform !== 'win32') {
+    return {
+      ok: false,
+      stage: 'unsupported_platform',
+      process: { pid: main.pid, path: main.path },
+      process_count: processes.length,
+      scan_process_count: 0,
+      reason: process.platform === 'darwin'
+        ? 'Mac 微信内存自动密钥扫描尚未适配，请填写手动数据库密钥。'
+        : '自动密钥扫描目前仅支持 Windows。',
     };
   }
 
@@ -472,10 +485,18 @@ export async function scanLocalWeixinKeyCandidates({
 async function localKeyCandidateRoots() {
   const roots = [];
   const dataRoots = await discoverDataRoots().catch(() => []);
-  for (const root of dataRoots || []) roots.push(path.join(root, 'xwechat_files', 'all_users'));
+  for (const root of dataRoots || []) {
+    roots.push(path.join(root, 'xwechat_files', 'all_users'));
+    roots.push(path.join(root, 'all_users'));
+  }
   const accounts = await discoverWxAccounts().catch(() => []);
   for (const account of accounts || []) {
     if (account?.account_root) roots.push(account.account_root);
+  }
+  roots.push(DATA_DIR);
+  if (process.env.HOME) {
+    roots.push(path.join(process.env.HOME, '.wx-cli'));
+    roots.push(path.join(process.env.HOME, '.wechat-mcp'));
   }
   if (process.env.APPDATA) roots.push(path.join(process.env.APPDATA, 'Tencent', 'xwechat', 'config'));
   const out = [];

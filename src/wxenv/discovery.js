@@ -122,7 +122,14 @@ const MAX_STATIC_XREF_FUNCTION_XREF_FUNCTIONS = 8;
 const MAX_STATIC_XREF_FUNCTION_XREF_NEIGHBOR_BUCKETS = 8;
 const STATIC_XREF_FUNCTION_XREF_NEIGHBOR_RADIUS = 0x600;
 
+const MAC_HOME = process.env.HOME || '';
+const MAC_XWECHAT_DATA = path.join(MAC_HOME, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', 'Documents', 'xwechat_files');
+const MAC_CONFIG_INI = path.join(MAC_HOME, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', '.wechat_config.ini');
+
 export async function getWeixinProcesses() {
+  if (process.platform === 'darwin') {
+    return getMacWeixinProcesses();
+  }
   if (process.platform !== 'win32') {
     return [];
   }
@@ -152,7 +159,43 @@ export function isMainWeixinProcess(commandLine) {
   return /Weixin\.exe/i.test(text) && !/--type=/i.test(text);
 }
 
+export function isMainMacWeixinProcess(commandLine) {
+  const text = String(commandLine || '').trim();
+  return /\/WeChat$/i.test(text) && !/Sparkle|Updater|Installer/i.test(text);
+}
+
+async function getMacWeixinProcesses() {
+  try {
+    const out = await execFileText('pgrep', ['-f', '/WeChat$']);
+    if (!out.trim()) return [];
+    const pids = out.trim().split(/\s+/).map(s => parseInt(s.trim())).filter(n => Number.isFinite(n) && n > 0);
+    const results = [];
+    for (const pid of pids) {
+      try {
+        const cmdline = await execFileText('ps', ['-p', String(pid), '-o', 'comm=']);
+        const p = cmdline.trim() || '';
+        results.push({ pid, path: p, command_line: p, is_main: isMainMacWeixinProcess(p) });
+      } catch {}
+    }
+    return results.filter(p => p.is_main);
+  } catch {
+    return [];
+  }
+}
+
 export async function readConfiguredDataRoot() {
+  if (process.platform === 'darwin') {
+    try {
+      const text = await fsp.readFile(MAC_CONFIG_INI, 'utf-8');
+      const line = text.split(/\r?\n/).map(s => s.trim()).find(Boolean);
+      if (line && path.isAbsolute(line)) return line;
+    } catch {}
+    try {
+      const st = await fsp.stat(MAC_XWECHAT_DATA);
+      if (st.isDirectory()) return MAC_XWECHAT_DATA;
+    } catch {}
+    return '';
+  }
   const candidates = [];
   try {
     const files = await fsp.readdir(XWECHAT_CONFIG_DIR, { withFileTypes: true });
@@ -171,10 +214,14 @@ export async function discoverDataRoots() {
   const roots = [];
   const configured = await readConfiguredDataRoot();
   if (configured) roots.push(configured);
-  roots.push(
-    path.join(process.env.APPDATA || '', 'Tencent', 'xwechat'),
-    path.join(process.env.USERPROFILE || '', 'Documents', 'WeChat Files'),
-  );
+  if (process.platform === 'darwin') {
+    roots.push(MAC_XWECHAT_DATA);
+  } else {
+    roots.push(
+      path.join(process.env.APPDATA || '', 'Tencent', 'xwechat'),
+      path.join(process.env.USERPROFILE || '', 'Documents', 'WeChat Files'),
+    );
+  }
 
   const existing = [];
   const seen = new Set();
@@ -191,7 +238,15 @@ export async function discoverWxAccounts() {
   const dataRoots = await discoverDataRoots();
   const accounts = [];
   for (const root of dataRoots) {
-    const xwechatFiles = path.join(root, 'xwechat_files');
+    // On macOS the root itself may be xwechat_files; on Windows it contains xwechat_files/
+    let xwechatFiles = path.join(root, 'xwechat_files');
+    let st = await fsp.stat(xwechatFiles).catch(() => null);
+    if (!st?.isDirectory()) {
+      // Try using root directly (macOS layout where root IS xwechat_files)
+      xwechatFiles = root;
+      st = await fsp.stat(xwechatFiles).catch(() => null);
+      if (!st?.isDirectory()) continue;
+    }
     const accountDirs = await fsp.readdir(xwechatFiles, { withFileTypes: true }).catch(() => []);
     for (const entry of accountDirs) {
       if (!entry.isDirectory()) continue;
@@ -280,7 +335,13 @@ export async function getWeixinBinaryEvidence() {
       running: processes.length > 0,
       process_count: processes.length,
       captured_at: new Date().toISOString(),
-      reason: processes.length ? '未识别到主 Weixin.exe 进程路径。' : '未检测到 Weixin.exe。',
+      reason: processes.length
+        ? (process.platform === 'darwin'
+          ? '未识别到主 WeChat 进程路径。'
+          : '未识别到主 Weixin.exe 进程路径。')
+        : (process.platform === 'darwin'
+          ? '未检测到 Mac 微信。'
+          : '未检测到 Weixin.exe。'),
     };
   }
   const file = await hashFileSha256(main.path);
