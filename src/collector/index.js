@@ -199,10 +199,15 @@ function enrichDbKeyFailure(error, diagnostics, dbName) {
   const processes = Number(d.scan_process_count || 0);
   const readonly = d.read_only_handle_ok === true ? '只读句柄正常' : '只读句柄未确认';
   const detail = [
-    `自动密钥扫描已执行（${readonly}，扫描 ${processes || 0} 个微信进程）`,
+    process.platform === 'darwin'
+      ? 'Mac 微信内存自动密钥扫描尚未适配，已尝试读取本地 key 缓存'
+      : `自动密钥扫描已执行（${readonly}，扫描 ${processes || 0} 个微信进程）`,
     `共得到 ${total} 个候选：内存 ${memory}、本地配置 ${local}、手动 ${manual}`,
     `但这些候选都没有匹配 ${dbName}`,
     `原始验证错误：${message}`,
+    ...(process.platform === 'darwin'
+      ? ['如已用外部工具导出 key，可放到 ~/.wx-cli/all_keys.json、data/all_keys.json 或 data/wechat-keys.json，或在设置页填写 64/96 位 hex 手动密钥']
+      : []),
   ].join('；');
   const enriched = Object.assign(new Error(`${detail}。当前需要填写有效手动密钥，或继续适配当前微信版本的 key 形态。`), {
     status: error?.status || 502,
