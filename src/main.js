@@ -179,6 +179,16 @@ function compareSha256(left, right) {
   return left?.sha256 && right?.sha256 ? left.sha256 === right.sha256 : null;
 }
 
+function weixinExecutableLabel() {
+  return process.platform === 'darwin' ? 'WeChat' : 'Weixin.exe';
+}
+
+function secretStorageLabel() {
+  if (process.platform === 'darwin') return 'macOS Keychain';
+  if (process.platform === 'win32') return 'Windows DPAPI';
+  return '本机密钥存储';
+}
+
 function freshLauncherBaseline() {
   return WEIXIN_BINARY_LAUNCHER_BASELINE?.fresh_for_this_service ? WEIXIN_BINARY_LAUNCHER_BASELINE : null;
 }
@@ -687,8 +697,14 @@ async function handleApi(req, res, parsedUrl) {
     const item = await findHistoryItem(settings, digestId);
     if (!item) return sendJson(res, 404, { error: 'digest not found' });
     const file = await assertRevealable(settings, item.file_path, { extensions: ['.png'] });
-    const thumb = await renderDigestThumbnailPng({ filePath: file, digestId: item.digest_id });
-    const data = await fsp.readFile(thumb);
+    let data;
+    try {
+      const thumb = await renderDigestThumbnailPng({ filePath: file, digestId: item.digest_id });
+      data = await fsp.readFile(thumb);
+    } catch (e) {
+      if (e?.status !== 501) throw e;
+      data = await fsp.readFile(file);
+    }
     return send(res, 200, data, { 'Content-Type': 'image/png' });
   }
 
@@ -701,6 +717,9 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/rerender-history' && req.method === 'POST') {
+    if (process.platform !== 'win32') {
+      throw Object.assign(new Error('历史重新渲染当前仅支持 Windows；macOS 可回到总结页重新生成摘要长图。'), { status: 501 });
+    }
     const body = await readBody(req);
     const settings = await loadSettings();
     const item = await findHistoryItem(settings, body.digest_id || '');
@@ -794,7 +813,9 @@ async function handleApi(req, res, parsedUrl) {
       last_reveal_request: LAST_REVEAL_EVIDENCE,
     };
     const secrets = {
-      dpapi_ok: !settings._secrets_invalid,
+      storage: secretStorageLabel(),
+      ok: !settings._secrets_invalid,
+      dpapi_ok: process.platform === 'win32' ? !settings._secrets_invalid : null,
       invalid: !!settings._secrets_invalid,
     };
     const weixinBinary = {
@@ -814,13 +835,13 @@ async function handleApi(req, res, parsedUrl) {
       comparison_scope: 'service_startup_vs_diagnostics_export',
       launcher_comparison_scope: 'cmd_pre_tray_and_tray_pre_node_vs_service_startup_and_diagnostics_export_when_fresh',
       external_baseline_required: true,
-      verification_note: 'external_user_baseline 是启动本工具前由用户独立记录的 Weixin.exe SHA256，可写入 data/external-weixin-binary-baseline.json；launcher_pre_node 由托盘在启动 Node 前采集；prelaunch 仅在本地另行提供 data/prelaunch-weixin-binary.json 时参与比较。external_to_* 为 true 时可作为 A3 的外部基线证据；launcher_to_* 可加强证明本工具启动链路内没有改动 Weixin.exe。',
+      verification_note: `external_user_baseline 是启动本工具前由用户独立记录的 ${weixinExecutableLabel()} SHA256，可写入 data/external-weixin-binary-baseline.json；launcher_pre_node 由托盘在启动 Node 前采集；prelaunch 仅在本地另行提供 data/prelaunch-weixin-binary.json 时参与比较。external_to_* 为 true 时可作为 A3 的外部基线证据；launcher_to_* 可加强证明本工具启动链路内没有改动 ${weixinExecutableLabel()}。`,
     };
     return sendJson(res, 200, {
       ok: true,
       project_root: PROJECT_ROOT,
       service,
-      acceptance_manual_checks: manualAcceptanceChecks({ service, localActionEvidence, secrets, weixinBinary }),
+      acceptance_manual_checks: manualAcceptanceChecks({ service, localActionEvidence, secrets, weixinBinary, platform: process.platform }),
       local_action_evidence: localActionEvidence,
       log_tail: logTail,
       secrets,
@@ -858,7 +879,10 @@ function persistedRenderOptions(options = {}) {
   return { theme, font_size: fontSize, accent_color: accentColor };
 }
 
-function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secrets = {}, weixinBinary = {} } = {}) {
+function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secrets = {}, weixinBinary = {}, platform = process.platform } = {}) {
+  const binaryLabel = platform === 'darwin' ? 'WeChat' : 'Weixin.exe';
+  const fileManagerLabel = platform === 'darwin' ? 'Finder' : 'Windows 资源管理器';
+  const secretLabel = secrets.storage || (platform === 'darwin' ? 'macOS Keychain' : 'Windows DPAPI');
   const uptimeHours = Number(service.uptime_hours || 0);
   const uptimeReady = uptimeHours >= 24;
   const clipboardEvidence = localActionEvidence.last_clipboard_copy;
@@ -877,16 +901,16 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
   const externalBaselineMatched = weixinBinary.external_to_current_unchanged === true && externalBeforeServiceStart;
   const externalBaselineLate = weixinBinary.external_to_current_unchanged === true && !externalBeforeServiceStart;
   const a3Summary = externalBaselineMatched
-    ? '独立外部基线已记录，且与当前 Weixin.exe 哈希一致；仍需用户确认这份记录是在启动 wx-summary 前生成。'
+    ? `独立外部基线已记录，且与当前 ${binaryLabel} 哈希一致；仍需用户确认这份记录是在启动 wx-summary 前生成。`
     : externalBaselineLate
-      ? '已找到独立基线记录且与当前 Weixin.exe 哈希一致，但记录时间晚于本轮服务启动，只能作为下一轮验收准备。'
+      ? `已找到独立基线记录且与当前 ${binaryLabel} 哈希一致，但记录时间晚于本轮服务启动，只能作为下一轮验收准备。`
     : a3SoftwareReady
-      ? '本工具启动入口、托盘、服务内的 Weixin.exe 哈希对照已可用；仍需用户启动前外部哈希。'
-      : '本工具链路内哈希对照不完整，请重启后导出诊断包或检查 Weixin 是否运行。';
+      ? `本工具启动入口、托盘、服务内的 ${binaryLabel} 哈希对照已可用；仍需用户启动前外部哈希。`
+      : `本工具链路内哈希对照不完整，请重启后导出诊断包或检查 ${binaryLabel} 是否运行。`;
   return [
     {
       id: 'A3',
-      title: 'Weixin.exe 启动前外部哈希对照',
+      title: `${binaryLabel} 启动前外部哈希对照`,
       status: 'needs_user_confirmation',
       user_confirmation_required: true,
       ready_for_user_confirmation: externalBaselineMatched || a3SoftwareReady,
@@ -896,8 +920,8 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       next_step: externalBaselineMatched
         ? '确认 data/external-weixin-binary-baseline.json 是启动 wx-summary 前独立生成；确认后即可作为 A3 的外部基线证据。'
         : externalBaselineLate
-          ? '下次验收时先退出 wx-summary，再独立记录 Weixin.exe SHA256，然后启动 wx-summary 并导出诊断包。'
-        : '启动 wx-summary 前先独立记录 Weixin.exe SHA256 作为外部基线；已启动后只能作为下一轮验收的准备证据。',
+          ? `下次验收时先退出 wx-summary，再独立记录 ${binaryLabel} SHA256，然后启动 wx-summary 并导出诊断包。`
+        : `启动 wx-summary 前先独立记录 ${binaryLabel} SHA256 作为外部基线；已启动后只能作为下一轮验收的准备证据。`,
     },
     {
       id: 'A6',
@@ -922,7 +946,7 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       software_evidence_summary: clipboardEvidence
         ? `最近一次系统剪贴板写入：${clipboardEvidence.relative_path || '未知文件'}${clipboardSize ? `，尺寸 ${clipboardSize}` : ''}。`
         : '本轮服务还没有成功复制 PNG 到系统剪贴板的动作证据。',
-      evidence_available: ['Windows 剪贴板 fallback 支持', 'local_action_evidence.last_clipboard_copy'],
+      evidence_available: [platform === 'win32' ? 'Windows 剪贴板 fallback 支持' : '浏览器剪贴板复制需人工确认', 'local_action_evidence.last_clipboard_copy'],
       latest_evidence: clipboardEvidence,
       next_step: '在 Edge 或 Chrome 中复制长图后，实际 Ctrl+V 到微信窗口并发送。',
     },
@@ -934,24 +958,24 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       ready_for_user_confirmation: !!revealEvidence,
       software_evidence_status: revealEvidence ? (explorerMatched ? 'explorer_selection_matched' : 'reveal_requested_needs_visual_confirmation') : 'needs_local_reveal_action',
       software_evidence_summary: revealEvidence
-        ? `最近一次请求打开：${revealEvidence.relative_path || '未知文件'}；Explorer 选中匹配=${explorerMatched ? 'true' : String(explorerSelection?.matched ?? 'unknown')}。`
+        ? `最近一次请求打开：${revealEvidence.relative_path || '未知文件'}；${fileManagerLabel} 选中匹配=${explorerMatched ? 'true' : String(explorerSelection?.matched ?? 'unknown')}。`
         : '本轮服务还没有“在文件夹中显示”的动作证据。',
       evidence_available: ['reveal API 路径边界', 'local_action_evidence.last_reveal_request'],
       latest_evidence: revealEvidence,
-      next_step: '点击“在文件夹中显示”后，目测确认 Windows 资源管理器弹出并选中目标 PNG。',
+      next_step: `点击“在文件夹中显示”后，目测确认 ${fileManagerLabel} 弹出并选中目标 PNG。`,
     },
     {
       id: 'D5',
-      title: '跨 Windows 用户 DPAPI',
+      title: `跨系统用户 ${secretLabel}`,
       status: 'needs_user_confirmation',
       user_confirmation_required: true,
       ready_for_user_confirmation: true,
       software_evidence_status: 'bad_secret_file_path_tested_external_user_needed',
       software_evidence_summary: secrets.invalid
-        ? '当前用户已检测到密钥不可解并会回到向导；真实跨 Windows 用户仍需人工切换确认。'
-        : '当前用户 DPAPI 密钥可读；坏密钥文件路径已由验收脚本覆盖，真实跨 Windows 用户仍需人工切换确认。',
+        ? `当前用户已检测到 ${secretLabel} 密钥不可解并会回到向导；真实跨系统用户仍需人工切换确认。`
+        : `当前用户 ${secretLabel} 密钥可读；坏密钥文件路径已由验收脚本覆盖，真实跨系统用户仍需人工切换确认。`,
       evidence_available: ['坏密钥文件清理测试', 'secrets.invalid', '向导提示'],
-      next_step: '换另一个 Windows 用户登录后，确认密钥解密失败会回到向导，且不展示旧密文。',
+      next_step: '换另一个系统用户登录后，确认密钥解密失败会回到向导，且不展示旧密文。',
     },
   ];
 }

@@ -157,7 +157,7 @@ export async function probeWxKey({
     return {
       ok: false,
       stage: 'process',
-      reason: processes.length ? '未识别到主 Weixin.exe 进程。' : '未检测到 Weixin.exe，请先登录微信。',
+      reason: missingWeixinProcessMessage(processes.length),
       process_count: processes.length,
     };
   }
@@ -417,6 +417,13 @@ export async function probeWxKey({
     if (result.image_unique_candidate_count) result.reason = '已找到可解开图片样本的图片 key 候选。';
   }
   return result;
+}
+
+function missingWeixinProcessMessage(processCount = 0) {
+  if (process.platform === 'darwin') {
+    return processCount ? '未识别到主 Mac 微信进程。' : '未检测到 Mac 微信，请先登录微信。';
+  }
+  return processCount ? '未识别到主 Weixin.exe 进程。' : '未检测到 Weixin.exe，请先登录微信。';
 }
 
 export async function verifyReadOnlyProcessAccess(pid) {

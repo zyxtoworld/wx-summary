@@ -320,10 +320,25 @@ export async function discoverWeixinEnvironment() {
     processes,
     data_roots,
     accounts,
-    message: processes.length
-      ? (accounts.length ? `已检测到 ${accounts.length} 个微信 v4 数据目录。` : '已检测到 Weixin.exe，但暂未发现 db_storage 数据目录。')
-      : '未检测到 Weixin.exe，请先登录微信。',
+    message: weixinEnvironmentMessage({ processes, accounts }),
   };
+}
+
+function weixinProcessLabel() {
+  return process.platform === 'darwin' ? 'Mac 微信' : 'Weixin.exe';
+}
+
+function weixinEnvironmentMessage({ processes = [], accounts = [] } = {}) {
+  const label = weixinProcessLabel();
+  if (accounts.length) {
+    return processes.length
+      ? `已检测到 ${accounts.length} 个微信 v4 数据目录。`
+      : `已检测到 ${accounts.length} 个微信 v4 数据目录；当前未检测到正在运行的 ${label}。`;
+  }
+  if (processes.length) return `已检测到 ${label}，但暂未发现 db_storage 数据目录。`;
+  return process.platform === 'darwin'
+    ? '未检测到 Mac 微信，也暂未发现微信 v4 数据目录。'
+    : '未检测到 Weixin.exe，请先登录微信。';
 }
 
 export async function getWeixinBinaryEvidence() {
@@ -358,7 +373,7 @@ export async function getWeixinBinaryEvidence() {
 
 async function hashFileSha256(file) {
   const st = await fsp.stat(file);
-  if (!st.isFile()) throw new Error('Weixin.exe path is not a file');
+  if (!st.isFile()) throw new Error(`${weixinProcessLabel()} path is not a file`);
   const hash = crypto.createHash('sha256');
   await new Promise((resolve, reject) => {
     const stream = fs.createReadStream(file);
@@ -375,7 +390,13 @@ async function hashFileSha256(file) {
 
 export async function getWeixinModuleEvidence() {
   if (process.platform !== 'win32') {
-    return { ok: false, running: false, reason: 'module evidence is only available on Windows' };
+    const processes = await getWeixinProcesses();
+    return {
+      ok: false,
+      running: processes.length > 0,
+      process_count: processes.length,
+      reason: 'module evidence is only available on Windows',
+    };
   }
   const processes = await getWeixinProcesses();
   const main = processes.find(p => p.is_main) || null;

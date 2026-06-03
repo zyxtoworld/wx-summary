@@ -44,7 +44,7 @@ export async function listGroups({ account_id = '' } = {}) {
   const env = await detectWeixin();
   if (!env.accounts?.length) {
     throw Object.assign(new Error(env.running === false
-      ? '未检测到 Weixin.exe，请先登录 Windows 微信后重试。'
+      ? missingWeixinDataMessage()
       : `未找到可读取的微信 v4 数据目录：${env.message || '请确认微信已登录并完成初始化。'}`), { status: 503 });
   }
 
@@ -67,6 +67,12 @@ export async function listGroups({ account_id = '' } = {}) {
     const msg = e?.message ? `读取本机微信群列表失败：${e.message}` : '读取本机微信群列表失败。';
     throw Object.assign(new Error(msg), { status: e?.status || 502 });
   }
+}
+
+function missingWeixinDataMessage() {
+  return process.platform === 'darwin'
+    ? '未检测到 Mac 微信，也未找到可读取的微信 v4 数据目录；请先登录微信，或确认 xwechat_files 数据目录可访问。'
+    : '未检测到 Weixin.exe，请先登录 Windows 微信后重试。';
 }
 
 export async function collectMessages({ account_id = '', group_id, group_name, since, until, filters = {}, min_messages = 5, signal } = {}) {
@@ -223,7 +229,13 @@ async function dbRawKeyCandidates() {
 async function dbRawKeyCandidateBundle() {
   const settings = await loadSettings({ includeSecrets: true }).catch(() => null);
   const manual = splitManualKeys(settings?.wechat?.manual_key);
-  const cacheKey = manual.join('|');
+  const local = await scanLocalWeixinKeyCandidates({ include_raw: true, cache: false }).catch(() => null);
+  const cacheKey = JSON.stringify({
+    platform: process.platform,
+    manual,
+    local_hashes: local?.candidate_hashes || [],
+    local_file_count: Number(local?.file_stats?.scanned || 0),
+  });
   if (DB_KEY_CANDIDATE_CACHE
     && DB_KEY_CANDIDATE_CACHE.key === cacheKey
     && Date.now() - DB_KEY_CANDIDATE_CACHE.at < DB_KEY_CANDIDATE_CACHE_MS) {
@@ -232,7 +244,6 @@ async function dbRawKeyCandidateBundle() {
       diagnostics: { ...DB_KEY_CANDIDATE_CACHE.diagnostics, cache_hit: true },
     };
   }
-  const local = await scanLocalWeixinKeyCandidates({ include_raw: true }).catch(() => null);
   const scan = await probeWxKey({ scan: true, include_raw: true, scan_all_processes: true });
   const rawKeys = uniqueStrings([...manual, ...(local?.raw_candidates || []), ...(scan._raw_candidates || [])]);
   const diagnostics = {

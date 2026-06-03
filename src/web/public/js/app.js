@@ -11,6 +11,14 @@ function selectedAccountId() {
   return document.getElementById('account-switcher')?.value || '';
 }
 
+function wechatAppLabel(platform = _appState?.platform) {
+  return platform === 'darwin' ? 'Mac 微信' : 'Weixin.exe';
+}
+
+function supportsServerRerender(platform = _appState?.platform) {
+  return platform === 'win32';
+}
+
 // ---------- API 封装 ----------
 function parseHttpErrorMessage(text, status = '') {
   const raw = String(text || '').trim();
@@ -527,10 +535,12 @@ async function renderDigest() {
   const recentRank = new Map(recentNames.map((name, index) => [String(name || ''), index]));
   const notice = document.getElementById('wechat-notice');
   if (state.data_mode !== 'wxdb' || state.wechat?.running === false) {
+    const hasWxData = state.data_mode === 'wxdb';
+    const label = wechatAppLabel(state.platform);
     notice.classList.remove('hidden');
     notice.innerHTML = `
-      <strong>${state.wechat?.running ? '未找到可读取的微信数据' : '未检测到 Weixin.exe'}</strong>
-      <span>${escapeHtml(state.wechat?.message || '当前只读取本机微信数据库副本。')} 未检测到微信或读取失败时不会显示演示群，也不会生成伪摘要。</span>
+      <strong>${hasWxData ? `未检测到正在运行的 ${label}` : (state.wechat?.running ? '未找到可读取的微信数据' : `未检测到 ${label}`)}</strong>
+      <span>${escapeHtml(state.wechat?.message || '当前只读取本机微信数据库副本。')} ${hasWxData ? '已发现本机数据库，仍会尝试读取；如 key 未命中，可以填写手动密钥或导入本地 key 缓存。' : '未检测到微信数据或读取失败时不会显示演示群，也不会生成伪摘要。'}</span>
       <button class="link-btn" id="wechat-retry">重试检测</button>
       <button class="link-btn" id="wechat-manual-key">填写手动密钥</button>`;
     document.getElementById('wechat-retry').addEventListener('click', async () => {
@@ -1763,7 +1773,13 @@ function historyItemCacheBust(item = {}) {
 
 function showHistoryModal(item) {
   const imageUrl = historyImageUrl(item.digest_id, historyItemCacheBust(item));
-  const canRerender = !!item.digest_path;
+  const serverRerenderSupported = supportsServerRerender();
+  const canRerender = !!item.digest_path && serverRerenderSupported;
+  const rerenderTitle = !item.digest_path
+    ? '旧记录缺少摘要 JSON，生成新摘要后可用'
+    : serverRerenderSupported
+      ? ''
+      : '当前系统不支持历史重新渲染；请回到总结页重新生成摘要长图';
   const modal = document.createElement('div');
   modal.className = 'modal-backdrop';
   modal.innerHTML = `
@@ -1779,7 +1795,7 @@ function showHistoryModal(item) {
         <a class="btn" data-download href="${imageUrl}" download>⬇ 下载 PNG</a>
         <button class="btn" data-copy>📋 复制到剪贴板</button>
         <button class="btn" data-reveal>📁 在文件夹中显示</button>
-        <button class="btn btn-ghost" data-rerender ${canRerender ? '' : 'disabled title="旧记录缺少摘要 JSON，生成新摘要后可用"'}>🔄 重新渲染</button>
+        <button class="btn btn-ghost" data-rerender ${canRerender ? '' : `disabled title="${escapeHtml(rerenderTitle)}"`}>🔄 重新渲染</button>
         <span class="status" data-status></span>
       </div>
     </div>`;
