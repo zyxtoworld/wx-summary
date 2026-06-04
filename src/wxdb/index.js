@@ -838,7 +838,7 @@ export async function listChatroomsFromWxDb({ account_id = '', raw_keys = [] } =
     `).all() || [];
     const sessions = new Map(sessionRows.map(row => [row.username, row]));
 
-    return rows.map(row => {
+    const groups = rows.map(row => {
       const s = sessions.get(row.id) || {};
       const ts = Number(s.sort_timestamp || s.last_timestamp || 0);
       const name = String(row.name || row.id);
@@ -854,6 +854,11 @@ export async function listChatroomsFromWxDb({ account_id = '', raw_keys = [] } =
         unread_count: Number(s.unread_count || 0),
       };
     }).sort((a, b) => (b.last_msg_at || 0) - (a.last_msg_at || 0));
+    Object.defineProperty(groups, '__verified_raw_keys', {
+      value: uniqueStrings([contact.raw_key, session?.raw_key].filter(Boolean)),
+      enumerable: false,
+    });
+    return groups;
   } finally {
     await contact.close();
     if (session) await session.close();
@@ -1371,6 +1376,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys) {
     }
     return {
       db,
+      raw_key: persistableRawKey(found.raw),
       key_hash: crypto.createHash('sha256').update(found.raw).digest('hex').slice(0, 12),
       key_profile: found.profile.id,
       copied,
@@ -1386,6 +1392,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys) {
     if (manual?.db) {
       return {
         db: manual.db,
+        raw_key: persistableRawKey(manual.raw_key),
         key_hash: manual.key_hash,
         key_profile: `${manual.key_profile}:verified_memory_hmac`,
         copied,
@@ -1400,6 +1407,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys) {
   if (manual?.db) {
     return {
       db: manual.db,
+      raw_key: persistableRawKey(manual.raw_key),
       key_hash: manual.key_hash,
       key_profile: manual.key_profile,
       copied,
@@ -1507,6 +1515,7 @@ async function openWeixinV4DecryptedDb(dbPath, rawKeys, Database) {
     return {
       db,
       plain_path: plainPath,
+      raw_key: persistableRawKey(found.raw),
       key_hash: crypto.createHash('sha256').update(found.raw).digest('hex').slice(0, 12),
       key_profile: WEIXIN_V4_MANUAL_PROFILE.id,
     };
@@ -1515,6 +1524,15 @@ async function openWeixinV4DecryptedDb(dbPath, rawKeys, Database) {
     await fsp.rm(plainPath, { force: true }).catch(() => {});
     throw e;
   }
+}
+
+function persistableRawKey(raw) {
+  const text = String(raw || '').trim().toLowerCase();
+  if (/^[a-f0-9]{64}$/.test(text)) return text;
+  if (/^[a-f0-9]{96}$/.test(text)) return text.slice(0, 64);
+  if (/^[a-f0-9]{128}$/.test(text)) return text.slice(0, 64);
+  if (/^[a-f0-9]{160}$/.test(text)) return text.slice(0, 64);
+  return '';
 }
 
 async function findWeixinV4PageKeyForCopiedDb(dbPath, rawKeys, options = {}) {
