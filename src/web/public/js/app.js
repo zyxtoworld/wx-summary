@@ -1223,9 +1223,29 @@ function showProgressLogPrompt(summary = '') {
   const tools = document.getElementById('progress-log-tools');
   const status = document.getElementById('progress-log-status');
   if (!tools || !status) return;
+  const cleanSummary = compactErrorSummary(summary);
   tools.classList.remove('hidden');
   status.className = 'status err';
-  status.textContent = summary ? `错误摘要：${summary}` : '生成失败';
+  status.textContent = cleanSummary ? `错误摘要：${cleanSummary}` : '生成失败';
+}
+
+function compactErrorSummary(value) {
+  let text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  if (/<(?:!doctype|html|head|body|title)\b/i.test(text)) {
+    const title = (text.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const code = text.match(/\bError code\s*(\d{3})\b/i)?.[1] || title.match(/\b(\d{3})\b/)?.[1] || '';
+    const phrase = /bad gateway/i.test(text) ? 'Bad gateway'
+      : /service unavailable/i.test(text) ? 'Service unavailable'
+        : /gateway timeout/i.test(text) ? 'Gateway timeout'
+          : title.replace(/^.*?\|\s*/, '').replace(/\b\d{3}\s*:\s*/g, '').trim();
+    const host = title.includes('|') ? title.split('|')[0].trim() : 'AI 端点/代理';
+    text = `${host} 返回${code ? ' ' + code : ''}${phrase ? ' ' + phrase : ''}，这是 AI 端点或代理网关错误。`;
+  }
+  return text.length > 360 ? `${text.slice(0, 360)}...` : text;
 }
 
 async function toggleProgressLog() {
@@ -1309,10 +1329,10 @@ async function runSingleDigestRequest({ target, since, until, previewText, signa
       const obj = JSON.parse(data);
       if (event === 'stage') onStage(obj);
       else if (event === 'digest') digest = obj;
-      else if (event === 'error') modelError = obj.message || '未知错误';
+      else if (event === 'error') modelError = compactErrorSummary(obj.message || '未知错误');
     }
   }
-  if (modelError) throw new Error(modelError);
+  if (modelError) throw new Error(compactErrorSummary(modelError));
   if (!digest) throw new Error('未收到摘要结果');
   return digest;
 }

@@ -1499,8 +1499,31 @@ function providerErrorMessage(json, fallback = '') {
     if (parsedDetail.message || parsedDetail.code) {
       return [parsedDetail.code, parsedDetail.message].filter(Boolean).join('：');
     }
+    const htmlDetail = htmlProviderErrorMessage(fallback);
+    if (htmlDetail) return htmlDetail;
   }
   return fallback || 'LLM request failed';
+}
+
+function htmlProviderErrorMessage(text) {
+  const raw = String(text || '');
+  if (!/<(?:!doctype|html|head|body|title)\b/i.test(raw)) return '';
+  const title = decodeHtml((raw.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '').replace(/<[^>]+>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim();
+  const code = raw.match(/\bError code\s*(\d{3})\b/i)?.[1]
+    || title.match(/\b(\d{3})\b/)?.[1]
+    || '';
+  const phrase = /bad gateway/i.test(raw) ? 'Bad gateway'
+    : /service unavailable/i.test(raw) ? 'Service unavailable'
+      : /gateway timeout/i.test(raw) ? 'Gateway timeout'
+        : title.replace(/^.*?\|\s*/, '').replace(/\b\d{3}\s*:\s*/g, '').trim();
+  const host = title.includes('|') ? title.split('|')[0].trim() : '';
+  const provider = host || 'AI 端点/代理';
+  return [
+    `${provider} 返回${code ? ` ${code}` : ''}${phrase ? ` ${phrase}` : ''}`,
+    '这是 AI 端点或代理网关错误，不是微信消息解析失败；请稍后重试，或切换更稳定的 Base URL/模型。',
+  ].join('。');
 }
 
 function extractProviderError(value) {
