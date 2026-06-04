@@ -28,6 +28,7 @@ const EXTERNAL_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'external-weixin-binar
 const PRELAUNCH_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'prelaunch-weixin-binary.json');
 const LAUNCHER_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'launcher-weixin-binary.json');
 const SAVE_RENDER_BODY_LIMIT = 120 * 1024 * 1024;
+const MAX_ACTIVE_DIGEST_REQUESTS = 6;
 const SERVICE_STARTED_AT = new Date();
 let ACTIVE_SERVER = null;
 let ACTIVE_PORT = null;
@@ -36,7 +37,8 @@ let WEIXIN_BINARY_EXTERNAL_BASELINE = null;
 let WEIXIN_BINARY_PRELAUNCH_BASELINE = null;
 let WEIXIN_BINARY_LAUNCHER_BASELINE = null;
 let WEIXIN_BINARY_BASELINE = null;
-let ACTIVE_DIGEST_REQUEST = null;
+let ACTIVE_DIGEST_REQUESTS = new Map();
+let NEXT_DIGEST_REQUEST_ID = 1;
 let ACTIVE_DEEP_KEY_STATUS = null;
 let LAST_CLIPBOARD_COPY_EVIDENCE = null;
 let LAST_REVEAL_EVIDENCE = null;
@@ -644,18 +646,20 @@ async function handleApi(req, res, parsedUrl) {
 
   if (pathname === '/api/digest' && req.method === 'POST') {
     const body = await readBody(req);
-    if (ACTIVE_DIGEST_REQUEST) {
-      throw Object.assign(new Error('已有摘要生成正在进行，请等待完成后再试。'), { status: 409 });
+    if (ACTIVE_DIGEST_REQUESTS.size >= MAX_ACTIVE_DIGEST_REQUESTS) {
+      throw Object.assign(new Error('当前摘要准备任务较多，请稍后再试。'), { status: 429 });
     }
-    ACTIVE_DIGEST_REQUEST = {
+    const requestId = NEXT_DIGEST_REQUEST_ID++;
+    ACTIVE_DIGEST_REQUESTS.set(requestId, {
       started_at: new Date().toISOString(),
       account_id: body.account_id || '',
       group_id: body.group_id || body.groups?.[0]?.id || body.groups?.[0] || '',
-    };
+      group: body.group_name || '',
+    });
     try {
       return await runDigestSSE(req, res, body);
     } finally {
-      ACTIVE_DIGEST_REQUEST = null;
+      ACTIVE_DIGEST_REQUESTS.delete(requestId);
     }
   }
 
@@ -807,6 +811,8 @@ async function handleApi(req, res, parsedUrl) {
       started_at: SERVICE_STARTED_AT.toISOString(),
       uptime_ms: Date.now() - SERVICE_STARTED_AT.getTime(),
       uptime_hours: Number(((Date.now() - SERVICE_STARTED_AT.getTime()) / 3_600_000).toFixed(3)),
+      active_digest_requests: ACTIVE_DIGEST_REQUESTS.size,
+      max_active_digest_requests: MAX_ACTIVE_DIGEST_REQUESTS,
     };
     const localActionEvidence = {
       last_clipboard_copy: LAST_CLIPBOARD_COPY_EVIDENCE,

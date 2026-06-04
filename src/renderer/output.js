@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import { outputDirFromSettings, PROJECT_ROOT, OUTPUTS_DIR, toProjectRelative, isInside } from '../lib/paths.js';
 import { ensureDir, readJson, writeJsonAtomic } from '../lib/json-store.js';
 
+let historyWriteQueue = Promise.resolve();
+
 export function historyIndexPath(settings) {
   return path.join(outputDirFromSettings(settings), 'index.json');
 }
@@ -68,7 +70,7 @@ export async function cleanupOldDigests(settings) {
     kept.push(item);
   }
 
-  if (removed) await writeJsonAtomic(historyIndexPath(settings), kept);
+  if (removed) await withHistoryWriteLock(() => writeJsonAtomic(historyIndexPath(settings), kept));
   return { removed };
 }
 
@@ -273,10 +275,18 @@ function resolveDigestPath(base, item = {}) {
 }
 
 async function upsertHistory(settings, item) {
-  const file = historyIndexPath(settings);
-  const list = await readJson(file, []);
-  const next = [item, ...list.filter(x => x.digest_id !== item.digest_id)].slice(0, 200);
-  await writeJsonAtomic(file, next);
+  await withHistoryWriteLock(async () => {
+    const file = historyIndexPath(settings);
+    const list = await readJson(file, []);
+    const next = [item, ...list.filter(x => x.digest_id !== item.digest_id)].slice(0, 200);
+    await writeJsonAtomic(file, next);
+  });
+}
+
+function withHistoryWriteLock(action) {
+  const run = historyWriteQueue.then(action, action);
+  historyWriteQueue = run.catch(() => {});
+  return run;
 }
 
 function buildFilename(digest) {

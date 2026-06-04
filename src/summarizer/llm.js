@@ -14,6 +14,7 @@ const ADAPTIVE_CHUNK_MAX_INPUT_CHARS = 80_000;
 const DEFAULT_DIGEST_CHUNK_CONCURRENCY = 2;
 const AI_LINK_RESEARCH_URLS_PER_CALL = 8;
 const DEFAULT_LINK_RESEARCH_CONCURRENCY = 2;
+const DEFAULT_AI_REQUEST_CONCURRENCY = 1;
 const DEFAULT_LINK_PREVIEW = {
   enabled: true,
   ai_web_search: true,
@@ -26,6 +27,8 @@ const DEFAULT_LINK_PREVIEW = {
   max_related_chars: 800,
 };
 const ATTACHMENT_DATA_KEYS = new Set(['data_url', 'frame_data_url', 'audio_data_url']);
+let ACTIVE_AI_REQUESTS = 0;
+const AI_WAIT_QUEUE = [];
 
 function throwIfAborted(signal) {
   if (!signal?.aborted) return;
@@ -43,6 +46,65 @@ function linkAbortSignal(controller, signal) {
 function notifyProgress(onProgress, data) {
   if (typeof onProgress !== 'function') return;
   try { onProgress(data); } catch {}
+}
+
+async function withAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲' } = {}, action) {
+  const release = await acquireAiRequestSlot({ signal, onProgress, label, detail });
+  try {
+    return await action();
+  } finally {
+    release();
+  }
+}
+
+function aiRequestConcurrency() {
+  const raw = Number(process.env.WX_SUMMARY_AI_CONCURRENCY || DEFAULT_AI_REQUEST_CONCURRENCY);
+  return Math.max(1, Math.min(2, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY));
+}
+
+function acquireAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲' } = {}) {
+  throwIfAborted(signal);
+  const limit = aiRequestConcurrency();
+  if (ACTIVE_AI_REQUESTS < limit) {
+    ACTIVE_AI_REQUESTS++;
+    return Promise.resolve(releaseAiRequestSlot);
+  }
+  notifyProgress(onProgress, {
+    phase: 'ai_queue',
+    label,
+    detail: `${detail} · 前面 ${AI_WAIT_QUEUE.length + ACTIVE_AI_REQUESTS} 个 AI 请求`,
+  });
+  return new Promise((resolve, reject) => {
+    const item = { resolve, reject, signal, onAbort: null };
+    item.onAbort = () => {
+      const index = AI_WAIT_QUEUE.indexOf(item);
+      if (index >= 0) AI_WAIT_QUEUE.splice(index, 1);
+      reject(httpError(499, '请求已取消'));
+    };
+    if (signal) signal.addEventListener('abort', item.onAbort, { once: true });
+    AI_WAIT_QUEUE.push(item);
+    drainAiRequestQueue();
+  });
+}
+
+function releaseAiRequestSlot() {
+  ACTIVE_AI_REQUESTS = Math.max(0, ACTIVE_AI_REQUESTS - 1);
+  drainAiRequestQueue();
+}
+
+function drainAiRequestQueue() {
+  const limit = aiRequestConcurrency();
+  while (ACTIVE_AI_REQUESTS < limit && AI_WAIT_QUEUE.length) {
+    const item = AI_WAIT_QUEUE.shift();
+    if (item.signal?.aborted) {
+      item.signal.removeEventListener('abort', item.onAbort);
+      item.reject(httpError(499, '请求已取消'));
+      continue;
+    }
+    item.signal?.removeEventListener('abort', item.onAbort);
+    ACTIVE_AI_REQUESTS++;
+    item.resolve(releaseAiRequestSlot);
+  }
 }
 
 export function sanitizeText(text, knownSecret = '') {
@@ -178,6 +240,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
         messageBundle: formatMessageBundle(enriched),
         mode: 'final/full',
         signal,
+        onProgress,
       });
     } catch (firstError) {
       const chunks = splitMessages(
@@ -243,6 +306,7 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
       messageBundle: formatMessageBundle(chunk),
       mode: `chunk ${index + 1}/${chunks.length}`,
       signal,
+      onProgress,
     });
     summaries[index] = `分段 ${index + 1}: ${JSON.stringify(part)}`;
     completed++;
@@ -266,6 +330,7 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
     messageBundle: { text: summaries.join('\n\n'), images: [] },
     mode: 'merge',
     signal,
+    onProgress,
   });
 }
 
@@ -844,7 +909,7 @@ async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null, on
       detail: `正在核查第 ${index + 1}/${chunks.length} 批链接`,
     });
     try {
-      const batch = await fetchAiLinkResearchBatch(chunk, settings, signal);
+      const batch = await fetchAiLinkResearchBatch(chunk, settings, signal, onProgress);
       for (const [url, research] of batch.entries()) out.set(url, research);
     } catch (err) {
       if (err?.status === 499 || signal?.aborted) throw err;
@@ -860,7 +925,7 @@ async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null, on
   return out;
 }
 
-async function fetchAiLinkResearchBatch(urls, settings, signal = null) {
+async function fetchAiLinkResearchBatch(urls, settings, signal = null, onProgress = null) {
   throwIfAborted(signal);
   const body = {
     model: settings.llm.long_context_model || settings.llm.model,
@@ -903,14 +968,19 @@ async function fetchAiLinkResearchBatch(urls, settings, signal = null) {
       ...urls.map((item, index) => `${index + 1}. ${item}`),
     ].join('\n'),
   };
-  const json = await fetchJson(`${settings.llm.base_url}/responses`, {
+  const json = await withAiRequestSlot({
+    signal,
+    onProgress,
+    label: 'AI 总结 · 等待 AI 查链接',
+    detail: `${urls.length} 个网页链接等待联网核查`,
+  }, () => fetchJson(`${settings.llm.base_url}/responses`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${settings.llm.api_key}` },
     body,
     timeout_ms: Math.max(30000, Math.min(Number(settings.llm.timeout_ms || 120000), 120000)),
     api_key: settings.llm.api_key,
     signal,
-  });
+  }));
   const text = extractResponsesText(json);
   if (!text) return new Map();
   const parsed = parseJsonModelText(text);
@@ -1133,7 +1203,7 @@ function decodeHtml(text) {
     .trim();
 }
 
-async function callJsonModel({ settings, model, groupName, since, until, messageBundle, mode, signal = null }) {
+async function callJsonModel({ settings, model, groupName, since, until, messageBundle, mode, signal = null, onProgress = null }) {
   throwIfAborted(signal);
   const messagesText = messageBundle?.text || '';
   const imageCount = messageBundle?.imageCount || 0;
@@ -1178,8 +1248,8 @@ async function callJsonModel({ settings, model, groupName, since, until, message
     throwIfAborted(signal);
     try {
       const text = settings.llm.provider === 'anthropic'
-        ? await callAnthropic({ settings, model, system, user, intro, blocks: activeBlocks, signal })
-        : await callOpenAI({ settings, model, system, user, intro, blocks: activeBlocks, signal });
+        ? await callAnthropic({ settings, model, system, user, intro, blocks: activeBlocks, signal, onProgress, mode })
+        : await callOpenAI({ settings, model, system, user, intro, blocks: activeBlocks, signal, onProgress, mode });
       try {
         return parseJsonModelText(text);
       } catch (parseError) {
@@ -1191,6 +1261,7 @@ async function callJsonModel({ settings, model, groupName, since, until, message
             rawText: parseError.raw_model_text,
             parseMessage: parseError.message,
             signal,
+            onProgress,
           });
           return parseJsonModelText(repairedText);
         }
@@ -1221,7 +1292,7 @@ async function callJsonModel({ settings, model, groupName, since, until, message
   throw lastError;
 }
 
-async function repairJsonModelText({ settings, model, rawText, parseMessage, signal = null }) {
+async function repairJsonModelText({ settings, model, rawText, parseMessage, signal = null, onProgress = null }) {
   throwIfAborted(signal);
   const limitedRawText = String(rawText || '').slice(0, 120_000);
   const system = [
@@ -1240,8 +1311,8 @@ async function repairJsonModelText({ settings, model, rawText, parseMessage, sig
     limitedRawText || '（空）',
   ].join('\n');
   return settings.llm.provider === 'anthropic'
-    ? callAnthropic({ settings, model, system, user, intro, blocks: [], signal })
-    : callOpenAI({ settings, model, system, user, intro, blocks: [], signal });
+    ? callAnthropic({ settings, model, system, user, intro, blocks: [], signal, onProgress, mode: 'repair' })
+    : callOpenAI({ settings, model, system, user, intro, blocks: [], signal, onProgress, mode: 'repair' });
 }
 
 function withoutAudioBlocksForRetry(blocks = []) {
@@ -1259,7 +1330,7 @@ function withoutAudioBlocksForRetry(blocks = []) {
     });
 }
 
-async function callOpenAI({ settings, model, system, user, intro, blocks = [], signal = null }) {
+async function callOpenAI({ settings, model, system, user, intro, blocks = [], signal = null, onProgress = null, mode = '' }) {
   const body = {
     model,
     temperature: settings.llm.temperature,
@@ -1269,20 +1340,25 @@ async function callOpenAI({ settings, model, system, user, intro, blocks = [], s
       { role: 'user', content: openAiUserContent(user, intro, blocks) },
     ],
   };
-  const json = await fetchJson(`${settings.llm.base_url}/chat/completions`, {
+  const json = await withAiRequestSlot({
+    signal,
+    onProgress,
+    label: 'AI 总结 · 等待 AI',
+    detail: `任务 ${mode || 'summary'} 等待模型请求`,
+  }, () => fetchJson(`${settings.llm.base_url}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${settings.llm.api_key}` },
     body,
     timeout_ms: settings.llm.timeout_ms,
     api_key: settings.llm.api_key,
     signal,
-  });
+  }));
   const text = json?.choices?.[0]?.message?.content;
   if (!text) throw httpError(502, 'Model returned empty content');
   return text;
 }
 
-async function callAnthropic({ settings, model, system, user, intro, blocks = [], signal = null }) {
+async function callAnthropic({ settings, model, system, user, intro, blocks = [], signal = null, onProgress = null, mode = '' }) {
   const body = {
     model,
     max_tokens: 4096,
@@ -1290,14 +1366,19 @@ async function callAnthropic({ settings, model, system, user, intro, blocks = []
     system,
     messages: [{ role: 'user', content: anthropicUserContent(user, intro, blocks) }],
   };
-  const json = await fetchJson(`${settings.llm.base_url}/messages`, {
+  const json = await withAiRequestSlot({
+    signal,
+    onProgress,
+    label: 'AI 总结 · 等待 AI',
+    detail: `任务 ${mode || 'summary'} 等待模型请求`,
+  }, () => fetchJson(`${settings.llm.base_url}/messages`, {
     method: 'POST',
     headers: { 'x-api-key': settings.llm.api_key, 'anthropic-version': '2023-06-01' },
     body,
     timeout_ms: settings.llm.timeout_ms,
     api_key: settings.llm.api_key,
     signal,
-  });
+  }));
   const text = Array.isArray(json?.content)
     ? json.content.map(part => part.text || '').join('\n').trim()
     : '';

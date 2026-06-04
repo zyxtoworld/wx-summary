@@ -1068,42 +1068,57 @@ async function generateDigest({ previewText = false } = {}) {
   $logStatus.textContent = '';
 
   const stageMap = {};
-  const stagesOrder = ['fetching', 'summarizing', 'rendering', 'saving'];
-  let completedGroups = 0;
-  let hadFailure = false;
+  const stagesOrder = previewText ? ['fetching', 'summarizing', 'rendering'] : ['fetching', 'summarizing', 'rendering', 'saving'];
   function upsertStage(s) {
-    let li = stageMap[s.name];
+    const key = s.key || s.name;
+    let li = stageMap[key];
     if (!li) {
       li = document.createElement('li');
-      stageMap[s.name] = li;
+      stageMap[key] = li;
       $stages.appendChild(li);
     }
     li.className = s.status;
+    li.dataset.stageName = s.stageName || s.name || '';
     const icon = s.status === 'done' ? '✓' : s.status === 'running' ? '⟳' : s.status === 'error' ? '✗' : '·';
     li.textContent = `${icon} ${s.label}${s.detail ? ' (' + s.detail + ')' : ''}`;
-    const currentDoneCount = stagesOrder.filter(n => stageMap[n] && stageMap[n].classList.contains('done')).length;
+    const doneStageCount = Object.values(stageMap).filter(item => stagesOrder.includes(item.dataset.stageName) && item.classList.contains('done')).length;
     const totalSteps = Math.max(1, targets.length * stagesOrder.length);
-    $fill.style.width = ((completedGroups * stagesOrder.length + currentDoneCount) / totalSteps * 100) + '%';
+    $fill.style.width = Math.min(100, (doneStageCount / totalSteps * 100)) + '%';
   }
-  function resetGroupStages() {
-    for (const name of stagesOrder) {
-      const li = stageMap[name];
-      if (!li) continue;
-      li.className = 'pending';
-      li.textContent = `· ${name}`;
-    }
+  function groupStage(index, stage) {
+    return {
+      ...stage,
+      key: `group-${index}:${stage.name}`,
+      stageName: stage.name,
+      label: `[${index + 1}/${targets.length}] ${targets[index].name} · ${stage.label}`,
+    };
   }
 
   // 用 fetch + ReadableStream 解析 SSE（不用 EventSource 是为了带 X-WX-Token）
   try {
     const controller = new AbortController();
     _state_digest.abortController = controller;
-    const digests = [];
+    const digests = new Array(targets.length);
     const failures = [];
-    for (let i = 0; i < targets.length; i++) {
-      const target = targets[i];
-      resetGroupStages();
-      upsertStage({ name: 'fetching', label: `[${i + 1}/${targets.length}] ${target.name} · 拉取消息`, status: 'running' });
+    const prepareConcurrency = digestPrepareConcurrency(targets.length);
+    let renderQueue = Promise.resolve();
+    const enqueueRender = task => {
+      const run = renderQueue.then(task, task);
+      renderQueue = run.catch(() => {});
+      return run;
+    };
+    upsertStage({
+      key: 'batch',
+      name: 'batch',
+      stageName: 'batch',
+      label: `并行准备 ${targets.length} 个群`,
+      status: 'running',
+      detail: `准备并发 ${prepareConcurrency} 路；AI 队列按服务端限流`,
+    });
+
+    await runClientPool(targets, prepareConcurrency, async (target, i) => {
+      if (controller.signal.aborted) return;
+      upsertStage(groupStage(i, { name: 'fetching', label: '拉取消息/解析媒体', status: 'running' }));
       try {
         const digest = await runSingleDigestRequest({
           target,
@@ -1112,54 +1127,57 @@ async function generateDigest({ previewText = false } = {}) {
           previewText,
           signal: controller.signal,
           onStage: stage => upsertStage({
-            ...stage,
-            label: `[${i + 1}/${targets.length}] ${target.name} · ${stage.label}`,
+            ...groupStage(i, stage),
           }),
         });
-        digests.push(digest);
+        digests[i] = digest;
         _state_digest.lastDigest = digest;
         if (previewText) {
-          renderTextPreviews(digests);
+          renderTextPreviews(digests.filter(Boolean));
         } else {
-          document.getElementById('preview-card').classList.remove('hidden');
-          drawDigestCanvas(digest);
-          upsertStage({ name: 'saving', label: `[${i + 1}/${targets.length}] ${target.name} · 保存长图`, status: 'running' });
-          try {
-            const saved = await saveRenderedCanvas(digest);
-            _state_digest.lastSavedItem = saved.item;
-            digest.file_path = saved.item.file_path;
-            document.getElementById('btn-reveal').disabled = false;
-            document.getElementById('btn-reveal').title = '在文件夹中显示最后一张';
-            upsertStage({ name: 'saving', label: `[${i + 1}/${targets.length}] ${target.name} · 保存长图`, status: 'done', detail: saved.item.relative_path });
-            scrollDigestWorkIntoView(document.getElementById('preview-card'));
-          } catch (e) {
-            hadFailure = true;
-            failures.push({ group: target.name, error: e.message });
-            upsertStage({ name: 'saving', label: `[${i + 1}/${targets.length}] ${target.name} · 保存失败：${e.message}`, status: 'error' });
-            showProgressLogPrompt(e.message);
-          }
+          await enqueueRender(async () => {
+            document.getElementById('preview-card').classList.remove('hidden');
+            drawDigestCanvas(digest);
+            upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
+            try {
+              const saved = await saveRenderedCanvas(digest);
+              _state_digest.lastSavedItem = saved.item;
+              digest.file_path = saved.item.file_path;
+              document.getElementById('btn-reveal').disabled = false;
+              document.getElementById('btn-reveal').title = '在文件夹中显示最后一张';
+              upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'done', detail: saved.item.relative_path }));
+              scrollDigestWorkIntoView(document.getElementById('preview-card'));
+            } catch (e) {
+              failures.push({ group: target.name, error: e.message });
+              upsertStage(groupStage(i, { name: 'saving', label: `保存失败：${e.message}`, status: 'error' }));
+              showProgressLogPrompt(e.message);
+            }
+          });
         }
-        completedGroups++;
       } catch (e) {
         const aborted = e?.name === 'AbortError';
-        if (!aborted) hadFailure = true;
         failures.push({ group: target.name, error: aborted ? '已取消' : e.message });
-        upsertStage({ name: 'error', label: aborted ? '已取消' : `[${i + 1}/${targets.length}] ${target.name} · 失败：${e.message}`, status: aborted ? 'done' : 'error' });
+        upsertStage(groupStage(i, { name: 'error', label: aborted ? '已取消' : `失败：${e.message}`, status: aborted ? 'done' : 'error' }));
         if (!aborted) showProgressLogPrompt(e.message);
-        if (aborted) break;
-        completedGroups++;
       }
-    }
-    if (failures.length && digests.length) {
-      hadFailure = true;
-      upsertStage({ name: 'batch', label: `已完成 ${digests.length} 个，失败 ${failures.length} 个`, status: 'error', detail: failures.map(f => f.group).join('、') });
+    }, controller.signal);
+    await renderQueue;
+
+    const doneDigests = digests.filter(Boolean);
+    if (failures.length && doneDigests.length) {
+      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个，失败 ${failures.length} 个`, status: 'error', detail: failures.map(f => f.group).join('、') });
+      $fill.style.width = '100%';
       showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
-    } else if (digests.length === targets.length) {
-      upsertStage({ name: 'batch', label: `已完成 ${digests.length} 个群`, status: 'done' });
+    } else if (failures.length) {
+      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `全部失败 ${failures.length} 个群`, status: 'error', detail: failures.map(f => f.group).join('、') });
+      $fill.style.width = '100%';
+      if (!failures.every(f => f.error === '已取消')) showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
+    } else if (doneDigests.length === targets.length) {
+      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个群`, status: 'done' });
+      $fill.style.width = '100%';
     }
   } catch (e) {
     const aborted = e?.name === 'AbortError';
-    if (!aborted) hadFailure = true;
     upsertStage({ name: 'error', label: aborted ? '已取消' : '失败：' + e.message, status: aborted ? 'done' : 'error' });
     if (!aborted) showProgressLogPrompt(e.message);
   } finally {
@@ -1170,6 +1188,24 @@ async function generateDigest({ previewText = false } = {}) {
     if (finalGenerateButton) finalGenerateButton.disabled = _state_digest.selectedGroups.size === 0;
     if (finalPreviewButton) finalPreviewButton.disabled = _state_digest.selectedGroups.size === 0;
   }
+}
+
+function digestPrepareConcurrency(total) {
+  const cores = Number(window.navigator?.hardwareConcurrency || 4);
+  const estimated = cores >= 12 ? 4 : cores >= 8 ? 3 : cores >= 4 ? 2 : 1;
+  return Math.max(1, Math.min(Number(total || 1), estimated));
+}
+
+async function runClientPool(items, concurrency, worker, signal = null) {
+  let cursor = 0;
+  const limit = Math.max(1, Math.min(Number(concurrency) || 1, items.length || 1));
+  const workers = Array.from({ length: limit }, async () => {
+    while (cursor < items.length && !signal?.aborted) {
+      const index = cursor++;
+      await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
 }
 
 function scrollDigestWorkIntoView(element) {
