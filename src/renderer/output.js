@@ -214,15 +214,15 @@ function cleanRender(value) {
 
 function cleanTodos(value) {
   return Array.isArray(value) ? value.map(item => ({
-    owner: cleanTodoOwner(item?.owner),
+    owner: cleanTodoMeta(item?.owner),
     item: String(item?.item || ''),
-    deadline: String(item?.deadline || ''),
+    deadline: cleanTodoMeta(item?.deadline),
   })).filter(item => item.item).slice(0, 100) : [];
 }
 
-function cleanTodoOwner(value) {
+function cleanTodoMeta(value) {
   const text = String(value || '').trim();
-  return /^(待认领|未指定|无|暂无|不明确)$/.test(text) ? '' : text;
+  return /^(待认领|未指定|无|暂无|不明确|待定|未定|待确认)$/.test(text) ? '' : text;
 }
 
 function cleanHighlights(value) {

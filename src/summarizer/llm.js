@@ -2115,6 +2115,7 @@ function cleanField(value) {
 const INTERNAL_VISIBLE_ERROR_RE = /(?:_?raw_timeline|_fallback_chunk|Model returned empty content|Messages returned empty content|Encrypted content could not be decrypted|分段错误|raw timeline)/i;
 const TODO_ACTION_RE = /确认|处理|跟进|补充|整理|报名|提交|付款|测试|验证|联系|修复|发布|更新|迁移|查看|统计|安排|提醒|复盘|决定|对齐|收集|申请|注册|认领|补发|回复|开通|关闭|领取|报销|交付|检查|排查|推进|落实|回访|同步/;
 const CJK_RE = /[\u3400-\u9fff]/;
+const TODO_PLACEHOLDER_RE = /^(待认领|未指定|无|暂无|不明确|待定|未定|待确认)$/;
 
 function cleanHeadline(value) {
   const text = cleanPublicText(value).slice(0, 120);
@@ -2127,10 +2128,11 @@ function normalizeTodo(todo = {}) {
   const item = cleanPublicText(todo.item);
   if (!item || isInternalVisibleText(item) || isEnglishHeavyText(item) || looksLikeKeywordOnlyTodo(item)) return null;
   const owner = cleanPublicText(todo.owner);
+  const deadline = cleanPublicText(todo.deadline);
   return {
-    owner: isEnglishHeavyText(owner) || /^(待认领|未指定|无|暂无|不明确)$/.test(owner) ? '' : owner,
+    owner: isEnglishHeavyText(owner) || TODO_PLACEHOLDER_RE.test(owner) ? '' : owner,
     item,
-    deadline: isEnglishHeavyText(todo.deadline) ? '' : (cleanPublicText(todo.deadline) || ''),
+    deadline: isEnglishHeavyText(deadline) || TODO_PLACEHOLDER_RE.test(deadline) ? '' : deadline,
   };
 }
 

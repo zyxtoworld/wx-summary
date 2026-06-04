@@ -1553,6 +1553,11 @@ function digestDataRows(d = {}) {
   ];
 }
 
+function cleanTodoMetaForRender(value) {
+  const text = String(value || '').trim();
+  return /^(待认领|未指定|无|暂无|不明确|待定|未定|待确认)$/.test(text) ? '' : text;
+}
+
 // ---------- Canvas 长图渲染（前端预览，1080×N） ----------
 function drawDigestCanvas(d, targetCanvas = null) {
   const W = 1080;
@@ -1667,7 +1672,7 @@ function drawDigestCanvas(d, targetCanvas = null) {
             const participantTop = yy;
             const participantHeight = Math.max(s(18), participantLines.length * participantLineHeight - s(4));
             c.fillStyle = COLORS.primary;
-            c.fillRect(padding + cardInset + 2, participantTop + s(4), 3, participantHeight);
+            c.fillRect(padding + cardInset, participantTop + s(2), 3, participantHeight);
             c.fillStyle = COLORS.meta;
             for (const ln of participantLines) { c.fillText(ln, padding + metaIndent, yy); yy += participantLineHeight; }
             yy += participantSummaryGap;
@@ -1783,7 +1788,7 @@ function drawDigestCanvas(d, targetCanvas = null) {
           c.fillStyle = COLORS.text;
           c.font = font(500, 17);
           c.fillText(renderSafeText(`• ${t.item}`), padding + cardInset, yy); yy += s(34);
-          const meta = [t.owner, t.deadline].filter(Boolean).join(' · ');
+          const meta = [cleanTodoMetaForRender(t.owner), cleanTodoMetaForRender(t.deadline)].filter(Boolean).join(' · ');
           if (meta) {
             c.fillStyle = COLORS.meta;
             c.font = font(400, 14);
@@ -1869,7 +1874,11 @@ function renderTextPreviews(digests) {
       ...topicSections.map(section => `## ${section.label}\n${section.topics.map((t, i) => `${i + 1}. ${t.title}${t.need_followup ? '（需处理）' : ''}\n   ${(t.participants || []).length ? `相关成员：${(t.participants || []).join('、')}\n   ` : ''}${t.summary}`).join('\n\n')}`),
       d.links?.length ? `## 链接资料\n${d.links.map(l => `- ${l.title || l.summary || l.url}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${l.url}>` : ''}${l.from ? ` 发送人：${l.from}` : ''}${l.time ? ` 时间：${l.time}` : ''}`).join('\n')}` : '',
       quotes.length ? `## 代表说法\n${quotes.map(q => `- ${q.speaker ? `${q.speaker}：` : ''}${q.text}${q.context ? `（${q.context}）` : ''}`).join('\n')}` : '',
-      d.todos?.length ? `## 还要处理\n${d.todos.map(t => `- ${t.owner ? `${t.owner}：` : ''}${t.item}${t.deadline ? `（${t.deadline}）` : ''}`).join('\n')}` : '',
+      d.todos?.length ? `## 还要处理\n${d.todos.map(t => {
+        const owner = cleanTodoMetaForRender(t.owner);
+        const deadline = cleanTodoMetaForRender(t.deadline);
+        return `- ${owner ? `${owner}：` : ''}${t.item}${deadline ? `（${deadline}）` : ''}`;
+      }).join('\n')}` : '',
       `## 本次覆盖\n${digestDataRows(d).map(row => `- ${row}`).join('\n')}`,
     ].filter(Boolean).join('\n\n');
   }).join('\n\n---\n\n');

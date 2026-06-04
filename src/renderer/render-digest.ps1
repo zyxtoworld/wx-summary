@@ -255,6 +255,23 @@ function CountTextChars($Value) {
   return ([string]$Value).Length
 }
 
+function IsPlaceholderTodoMeta($Value) {
+  if ($null -eq $Value) { return $true }
+  $textValue = ([string]$Value).Trim()
+  if ([string]::IsNullOrWhiteSpace($textValue)) { return $true }
+  $placeholders = @(
+    '5b6F6K6k6aKG',
+    '5pyq5oyH5a6a',
+    '5peg',
+    '5pqC5peg',
+    '5LiN5piO56Gu',
+    '5b6F5a6a',
+    '5pyq5a6a',
+    '5b6F56Gu6K6k'
+  ) | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)) }
+  return $placeholders -contains $textValue
+}
+
 function Utf8Label([string]$Base64) {
   return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Base64))
 }
@@ -471,7 +488,7 @@ if ($digest.todos -and $digest.todos.Count -gt 0) {
   $innerY += (S 68)
   foreach ($todo in $digest.todos) {
     $innerY = DrawWrappedText $graphics ("- " + [string]$todo.item) $fontBodyBold $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 68)
-    $todoMeta = @($todo.owner, $todo.deadline) | Where-Object { $_ } 
+    $todoMeta = @($todo.owner, $todo.deadline) | Where-Object { -not (IsPlaceholderTodoMeta $_) }
     if ($todoMeta.Count -gt 0) { $innerY = DrawWrappedText $graphics ($todoMeta -join ' / ') $fontSmall $brushMuted ($padding + 62) $innerY ($cardWidth - 96) (S 48) }
     $innerY += (S 20)
   }
@@ -481,7 +498,7 @@ if ($digest.todos -and $digest.todos.Count -gt 0) {
   $graphics.DrawString("$labelTodosPrefix$($digest.todos.Count)$labelRightParen", $fontH2, $brushPrimary, $padding + 34, $innerY); $innerY += (S 68)
   foreach ($todo in $digest.todos) {
     $innerY = DrawWrappedText $graphics ("- " + [string]$todo.item) $fontBodyBold $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 68)
-    $todoMeta = @($todo.owner, $todo.deadline) | Where-Object { $_ }
+    $todoMeta = @($todo.owner, $todo.deadline) | Where-Object { -not (IsPlaceholderTodoMeta $_) }
     if ($todoMeta.Count -gt 0) { $innerY = DrawWrappedText $graphics ($todoMeta -join ' / ') $fontSmall $brushMuted ($padding + 62) $innerY ($cardWidth - 96) (S 48) }
     $innerY += (S 20)
   }
@@ -509,7 +526,7 @@ if ($digest.topics -and $digest.topics.Count -gt 0) {
       $participantTop = $innerY
       $innerY = DrawWrappedText $graphics ($labelParticipants + (($topic.participants | Select-Object -First 12) -join $labelListSep)) $fontParticipant $brushMeta ($padding + 62) $innerY ($cardWidth - 124) $participantLineHeight
       $participantHeight = [Math]::Max((S 36), $innerY - $participantTop - (S 8))
-      $graphics.FillRectangle($brushPrimary, $padding + 42, $participantTop + (S 8), 6, $participantHeight)
+      $graphics.FillRectangle($brushPrimary, $padding + 34, $participantTop + (S 4), 6, $participantHeight)
       $innerY += $participantSummaryGap
     } else {
       $innerY += $topicNoParticipantGap
@@ -536,7 +553,7 @@ if ($digest.topics -and $digest.topics.Count -gt 0) {
       $participantTop = $innerY
       $innerY = DrawWrappedText $graphics ($labelParticipants + (($topic.participants | Select-Object -First 12) -join $labelListSep)) $fontParticipant $brushMeta ($padding + 62) $innerY ($cardWidth - 124) $participantLineHeight
       $participantHeight = [Math]::Max((S 36), $innerY - $participantTop - (S 8))
-      $graphics.FillRectangle($brushPrimary, $padding + 42, $participantTop + (S 8), 6, $participantHeight)
+      $graphics.FillRectangle($brushPrimary, $padding + 34, $participantTop + (S 4), 6, $participantHeight)
       $innerY += $participantSummaryGap
     } else {
       $innerY += $topicNoParticipantGap
