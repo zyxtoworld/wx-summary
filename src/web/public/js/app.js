@@ -1069,6 +1069,49 @@ async function generateDigest({ previewText = false } = {}) {
 
   const stageMap = {};
   const stagesOrder = previewText ? ['fetching', 'summarizing', 'rendering'] : ['fetching', 'summarizing', 'rendering', 'saving'];
+  function stripElapsedDetail(detail = '') {
+    return String(detail || '')
+      .trim()
+      .replace(/\s*·?\s*仍在处理[，,]?\s*已用时\s*\d+分\d{1,2}秒\s*$/u, '')
+      .replace(/\s*·?\s*仍在处理[，,]?\s*已用时\s*\d+秒\s*$/u, '')
+      .replace(/\s*·?\s*已用时\s*\d+分\d{1,2}秒\s*$/u, '')
+      .replace(/\s*·?\s*已用时\s*\d+秒\s*$/u, '')
+      .trim();
+  }
+  function formatElapsedDetail(baseDetail, startedAt) {
+    const elapsedSeconds = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+    const minutes = Math.floor(elapsedSeconds / 60);
+    const seconds = elapsedSeconds % 60;
+    const elapsed = minutes ? `已用时 ${minutes}分${String(seconds).padStart(2, '0')}秒` : `已用时 ${seconds}秒`;
+    return baseDetail ? `${baseDetail} · ${elapsed}` : elapsed;
+  }
+  function writeStageText(li, stage, detail = stage.detail || '') {
+    const icon = stage.status === 'done' ? '✓' : stage.status === 'running' ? '⟳' : stage.status === 'error' ? '✗' : '·';
+    li.textContent = `${icon} ${stage.label}${detail ? ' (' + detail + ')' : ''}`;
+  }
+  function renderRunningStage(li) {
+    const stage = li._runningStage;
+    if (!stage) return;
+    writeStageText(li, stage, formatElapsedDetail(stage.baseDetail, stage.startedAt));
+  }
+  function clearRunningStage(li) {
+    if (!li?._runningStage) return;
+    if (li._runningStage.timer) clearInterval(li._runningStage.timer);
+    li._runningStage = null;
+  }
+  function clearAllRunningStages() {
+    Object.values(stageMap).forEach(clearRunningStage);
+  }
+  function markGroupRunningStages(index, status, detail) {
+    const prefix = `group-${index}:`;
+    Object.entries(stageMap).forEach(([key, li]) => {
+      if (!key.startsWith(prefix) || !li._runningStage) return;
+      const runningStage = li._runningStage;
+      clearRunningStage(li);
+      li.className = status;
+      writeStageText(li, { ...runningStage, status, detail });
+    });
+  }
   function upsertStage(s) {
     const key = s.key || s.name;
     let li = stageMap[key];
@@ -1079,8 +1122,23 @@ async function generateDigest({ previewText = false } = {}) {
     }
     li.className = s.status;
     li.dataset.stageName = s.stageName || s.name || '';
-    const icon = s.status === 'done' ? '✓' : s.status === 'running' ? '⟳' : s.status === 'error' ? '✗' : '·';
-    li.textContent = `${icon} ${s.label}${s.detail ? ' (' + s.detail + ')' : ''}`;
+    if (s.status === 'running') {
+      const previous = li._runningStage;
+      const nextDetail = stripElapsedDetail(s.detail);
+      li._runningStage = {
+        ...s,
+        startedAt: previous?.startedAt || Date.now(),
+        baseDetail: s.detail == null ? (previous?.baseDetail || '') : nextDetail,
+        timer: previous?.timer || null,
+      };
+      if (!li._runningStage.timer) {
+        li._runningStage.timer = setInterval(() => renderRunningStage(li), 1000);
+      }
+      renderRunningStage(li);
+    } else {
+      clearRunningStage(li);
+      writeStageText(li, s);
+    }
     const doneStageCount = Object.values(stageMap).filter(item => stagesOrder.includes(item.dataset.stageName) && item.classList.contains('done')).length;
     const totalSteps = Math.max(1, targets.length * stagesOrder.length);
     $fill.style.width = Math.min(100, (doneStageCount / totalSteps * 100)) + '%';
@@ -1157,6 +1215,7 @@ async function generateDigest({ previewText = false } = {}) {
       } catch (e) {
         const aborted = e?.name === 'AbortError';
         failures.push({ group: target.name, error: aborted ? '已取消' : e.message });
+        markGroupRunningStages(i, aborted ? 'done' : 'error', aborted ? '已取消' : '已失败');
         upsertStage(groupStage(i, { name: 'error', label: aborted ? '已取消' : `失败：${e.message}`, status: aborted ? 'done' : 'error' }));
         if (!aborted) showProgressLogPrompt(e.message);
       }
@@ -1181,6 +1240,7 @@ async function generateDigest({ previewText = false } = {}) {
     upsertStage({ name: 'error', label: aborted ? '已取消' : '失败：' + e.message, status: aborted ? 'done' : 'error' });
     if (!aborted) showProgressLogPrompt(e.message);
   } finally {
+    clearAllRunningStages();
     _state_digest.abortController = null;
     _state_digest.generating = false;
     const finalGenerateButton = document.getElementById('btn-generate');
