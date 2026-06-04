@@ -1484,6 +1484,57 @@ async function runSingleDigestRequest({ target, since, until, batchId, previewTe
   return digest;
 }
 
+const DIGEST_TOPIC_CATEGORIES = [
+  { id: 'tools', label: '工具分享 & 技术实战', hints: /codex|claude|gpt|api|github|repo|仓库|脚本|部署|服务器|proxy|代理|token|key|模型|工具|配置|教程|技术|代码|开发|插件|电脑|系统|esim|yubikey|passkey|office|excel|ppt/i },
+  { id: 'ideas', label: '行业观点 & 理念', hints: /观点|理念|趋势|行业|ai 时代|能力|效率|未来|世界模型|llm|职业|工作流|认知|思考|争议|看法|价值/i },
+  { id: 'hot', label: '热门话题', hints: /价格|行情|涨|跌|币|股票|mstr|btc|ipo|rwusd|token|usdc|usdt|项目|活动|薅|注册|优惠|折扣|热点|新闻|大盘/i },
+  { id: 'progress', label: '项目/任务进展', hints: /进展|安排|计划|报名|截止|待确认|跟进|修复|处理|任务|目标|goal|迁移|发布|上线|测试|排查|付款|领取|结果/i },
+  { id: 'other', label: '其他提及', hints: /./ },
+];
+
+function digestTopicCategory(topic = {}) {
+  const explicit = String(topic.category || '').trim();
+  const matched = DIGEST_TOPIC_CATEGORIES.find(item => item.label === explicit);
+  if (matched) return matched.label;
+  const haystack = `${topic.title || ''} ${topic.summary || ''}`;
+  return (DIGEST_TOPIC_CATEGORIES.find(item => item.hints.test(haystack)) || DIGEST_TOPIC_CATEGORIES[DIGEST_TOPIC_CATEGORIES.length - 1]).label;
+}
+
+function groupedDigestTopics(topics = []) {
+  const byLabel = new Map(DIGEST_TOPIC_CATEGORIES.map(item => [item.label, []]));
+  for (const topic of topics || []) {
+    const label = digestTopicCategory(topic);
+    if (!byLabel.has(label)) byLabel.set(label, []);
+    byLabel.get(label).push(topic);
+  }
+  return DIGEST_TOPIC_CATEGORIES
+    .map(item => ({ label: item.label, topics: byLabel.get(item.label) || [] }))
+    .filter(section => section.topics.length);
+}
+
+function digestQuotesForRender(d = {}) {
+  return (Array.isArray(d.quotes) ? d.quotes : [])
+    .map(item => {
+      if (typeof item === 'string') return { speaker: '', text: item, context: '' };
+      return {
+        speaker: String(item?.speaker || item?.from || item?.sender || '').trim(),
+        text: String(item?.text || item?.quote || item?.content || '').trim(),
+        context: String(item?.context || item?.reason || '').trim(),
+      };
+    })
+    .filter(item => item.text)
+    .slice(0, 8);
+}
+
+function digestDataRows(d = {}) {
+  return [
+    `时间窗：${d.since || '未知'} ~ ${d.until || 'now'}`,
+    `消息量：${d.message_count || 0} 条${d.truncated ? `；已从 ${d.scanned_message_count || d.message_count || 0} 条中截取 ${d.input_message_count || d.message_count || 0} 条` : ''}`,
+    `摘要结构：${d.topics?.length || 0} 个议题，${d.links?.length || 0} 个链接，${d.todos?.length || 0} 个后续跟进，${digestQuotesForRender(d).length} 条金句`,
+    `数据来源：${d.source_label || '本机数据'}；模型：${d.model || '未记录'}`,
+  ];
+}
+
 // ---------- Canvas 长图渲染（前端预览，1080×N） ----------
 function drawDigestCanvas(d, targetCanvas = null) {
   const W = 1080;
@@ -1548,7 +1599,7 @@ function drawDigestCanvas(d, targetCanvas = null) {
     y = drawCard(ctx, y, COLORS, dryRun, c => {
       c.fillStyle = COLORS.primary;
       c.font = font(600, 14);
-      c.fillText('一句话总览', padding + cardInset, y + s(10));
+      c.fillText('今日核心结论', padding + cardInset, y + s(10));
       const lines = wrapText(c, d.headline, W - padding * 2 - cardInset * 2, font(600, 26));
       c.fillStyle = COLORS.text;
       c.font = font(600, 26);
@@ -1558,36 +1609,13 @@ function drawDigestCanvas(d, targetCanvas = null) {
     });
     y += s(6);
 
-    // 后续跟进
-    if (d.todos?.length) {
+    // topic sections
+    const topicSections = groupedDigestTopics(d.topics || []);
+    for (const section of topicSections) {
       y = drawCard(ctx, y, COLORS, dryRun, c => {
         c.fillStyle = COLORS.primary;
         c.font = font(600, 20);
-        c.fillText(`✓ 后续跟进（${d.todos.length}）`, padding + cardInset, y + s(10));
-        let yy = y + s(44);
-        for (const t of d.todos) {
-          c.fillStyle = COLORS.text;
-          c.font = font(500, 17);
-          c.fillText(renderSafeText(`• ${t.item}`), padding + cardInset, yy); yy += s(34);
-          const meta = [t.owner, t.deadline].filter(Boolean).join(' · ');
-          if (meta) {
-            c.fillStyle = COLORS.meta;
-            c.font = font(400, 14);
-            c.fillText(renderSafeText(`  ${meta}`), padding + bodyIndent, yy); yy += s(24);
-          }
-          yy += s(10);
-        }
-        return yy - y + s(6);
-      });
-      y += s(6);
-    }
-
-    // topics
-    if (d.topics?.length) {
-      y = drawCard(ctx, y, COLORS, dryRun, c => {
-        c.fillStyle = COLORS.primary;
-        c.font = font(600, 20);
-        c.fillText(`议题（${d.topics.length}）`, padding + cardInset, y + s(10));
+        c.fillText(`${section.label}`, padding + cardInset, y + s(10));
         let yy = y + s(50);
         const topicTitleLineHeight = s(34);
         const topicTitleGap = s(10);
@@ -1597,8 +1625,8 @@ function drawDigestCanvas(d, targetCanvas = null) {
         const summaryLineHeight = s(31);
         const topicAfterSummaryGap = s(14);
         const topicSeparatorGap = s(18);
-        for (let i = 0; i < d.topics.length; i++) {
-          const t = d.topics[i];
+        for (let i = 0; i < section.topics.length; i++) {
+          const t = section.topics[i];
           c.fillStyle = COLORS.text;
           c.font = font(600, 20);
           const titleLines = wrapText(c, `${i + 1}. ${t.title}${t.need_followup ? '  🔥' : ''}`, W - padding * 2 - cardInset * 2, font(600, 20));
@@ -1620,7 +1648,7 @@ function drawDigestCanvas(d, targetCanvas = null) {
           c.font = font(400, 17);
           const lines = wrapText(c, t.summary, W - padding * 2 - cardInset * 2, font(400, 17));
           for (const ln of lines) { c.fillText(ln, padding + cardInset, yy); yy += summaryLineHeight; }
-          if (i < d.topics.length - 1) {
+          if (i < section.topics.length - 1) {
             yy += topicAfterSummaryGap;
             c.strokeStyle = COLORS.hairline;
             c.lineWidth = 1;
@@ -1643,7 +1671,7 @@ function drawDigestCanvas(d, targetCanvas = null) {
       y = drawCard(ctx, y, COLORS, dryRun, c => {
         c.fillStyle = COLORS.primary;
         c.font = font(600, 20);
-        c.fillText('🔗 重要链接', padding + cardInset, y + s(10));
+        c.fillText('有价值的链接', padding + cardInset, y + s(10));
         let yy = y + s(50);
         for (let i = 0; i < d.links.length; i++) {
           const l = d.links[i];
@@ -1689,9 +1717,76 @@ function drawDigestCanvas(d, targetCanvas = null) {
       y += s(6);
     }
 
+    const quotes = digestQuotesForRender(d);
+    if (quotes.length) {
+      y = drawCard(ctx, y, COLORS, dryRun, c => {
+        c.fillStyle = COLORS.primary;
+        c.font = font(600, 20);
+        c.fillText('今日金句', padding + cardInset, y + s(10));
+        let yy = y + s(50);
+        for (let i = 0; i < quotes.length; i++) {
+          const q = quotes[i];
+          c.fillStyle = COLORS.text;
+          c.font = font(500, 17);
+          const quoteLines = wrapText(c, `“${q.text}”`, W - padding * 2 - cardInset * 2, font(500, 17));
+          for (const ln of quoteLines) { c.fillText(renderSafeText(ln), padding + cardInset, yy); yy += s(31); }
+          const meta = [q.speaker, q.context].filter(Boolean).join(' · ');
+          if (meta) {
+            c.fillStyle = COLORS.meta;
+            c.font = font(400, 13);
+            const metaLines = wrapText(c, meta, W - padding * 2 - bodyIndent - cardInset, font(400, 13));
+            for (const ln of metaLines) { c.fillText(renderSafeText(ln), padding + bodyIndent, yy); yy += s(22); }
+          }
+          yy += i < quotes.length - 1 ? s(14) : s(4);
+        }
+        return yy - y + s(8);
+      });
+      y += s(6);
+    }
+
+    // 后续跟进
+    if (d.todos?.length) {
+      y = drawCard(ctx, y, COLORS, dryRun, c => {
+        c.fillStyle = COLORS.primary;
+        c.font = font(600, 20);
+        c.fillText(`后续跟进（${d.todos.length}）`, padding + cardInset, y + s(10));
+        let yy = y + s(44);
+        for (const t of d.todos) {
+          c.fillStyle = COLORS.text;
+          c.font = font(500, 17);
+          c.fillText(renderSafeText(`• ${t.item}`), padding + cardInset, yy); yy += s(34);
+          const meta = [t.owner, t.deadline].filter(Boolean).join(' · ');
+          if (meta) {
+            c.fillStyle = COLORS.meta;
+            c.font = font(400, 14);
+            c.fillText(renderSafeText(`  ${meta}`), padding + bodyIndent, yy); yy += s(24);
+          }
+          yy += s(10);
+        }
+        return yy - y + s(6);
+      });
+      y += s(6);
+    }
+
+    y = drawCard(ctx, y, COLORS, dryRun, c => {
+      c.fillStyle = COLORS.primary;
+      c.font = font(600, 20);
+      c.fillText('数据巡览', padding + cardInset, y + s(10));
+      let yy = y + s(50);
+      c.fillStyle = COLORS.text;
+      c.font = font(400, 16);
+      for (const row of digestDataRows(d)) {
+        const lines = wrapText(c, `• ${row}`, W - padding * 2 - cardInset * 2, font(400, 16));
+        for (const ln of lines) { c.fillText(renderSafeText(ln), padding + cardInset, yy); yy += s(29); }
+        yy += s(5);
+      }
+      return yy - y + s(8);
+    });
+    y += s(6);
+
     // 底部
     y += s(1);
-    const footer = `生成于 ${new Date(d.created_at).toLocaleString()}    模型：${d.model}    本地读取 · AI 汇总`;
+    const footer = `生成于 ${new Date(d.created_at).toLocaleString()}    本地读取 · 智能汇总`;
     const footerLines = wrapText(ctx, footer, W - padding * 2, font(400, 14));
     if (!dryRun) {
       ctx.fillStyle = COLORS.muted;
@@ -1730,19 +1825,25 @@ function renderTextPreview(d) {
 }
 
 function renderTextPreviews(digests) {
-  const markdown = (digests || []).map(d => [
-    `# ${d.group}`,
-    '',
-    `${d.since} ~ ${d.until} · ${d.message_count} 条消息 · ${d.model}`,
-    d.source_label ? `${d.source_label}${d.truncated ? ` · 已从 ${d.scanned_message_count || d.message_count} 条中截取 ${d.input_message_count || d.message_count} 条` : ''}` : '',
-    '',
-    `## 一句话总览`,
-    d.headline,
-    '',
-    d.todos?.length ? `## 后续跟进\n${d.todos.map(t => `- ${t.owner || '未指定'}：${t.item}${t.deadline ? `（${t.deadline}）` : ''}`).join('\n')}` : '',
-    d.topics?.length ? `## 议题\n${d.topics.map((t, i) => `${i + 1}. ${t.title}\n   参与：${(t.participants || []).join('、') || '未识别'}\n   ${t.summary}${t.need_followup ? '\n   需要跟进' : ''}`).join('\n\n')}` : '',
-    d.links?.length ? `## 链接\n${d.links.map(l => `- ${l.title || l.summary || l.url}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${l.url}>` : ''}${l.from ? ` 发送人：${l.from}` : ''}${l.time ? ` 时间：${l.time}` : ''}`).join('\n')}` : '',
-  ].filter(Boolean).join('\n\n')).join('\n\n---\n\n');
+  const markdown = (digests || []).map(d => {
+    const topicSections = groupedDigestTopics(d.topics || []);
+    const quotes = digestQuotesForRender(d);
+    return [
+      `# ${d.group}`,
+      '',
+      `${d.since} ~ ${d.until} · ${d.message_count} 条消息 · ${d.model}`,
+      d.source_label ? `${d.source_label}${d.truncated ? ` · 已从 ${d.scanned_message_count || d.message_count} 条中截取 ${d.input_message_count || d.message_count} 条` : ''}` : '',
+      '',
+      `## 今日核心结论`,
+      d.headline,
+      '',
+      ...topicSections.map(section => `## ${section.label}\n${section.topics.map((t, i) => `${i + 1}. ${t.title}\n   参与：${(t.participants || []).join('、') || '未识别'}\n   ${t.summary}${t.need_followup ? '\n   需要跟进' : ''}`).join('\n\n')}`),
+      d.links?.length ? `## 有价值的链接\n${d.links.map(l => `- ${l.title || l.summary || l.url}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${l.url}>` : ''}${l.from ? ` 发送人：${l.from}` : ''}${l.time ? ` 时间：${l.time}` : ''}`).join('\n')}` : '',
+      quotes.length ? `## 今日金句\n${quotes.map(q => `- ${q.speaker ? `${q.speaker}：` : ''}${q.text}${q.context ? `（${q.context}）` : ''}`).join('\n')}` : '',
+      d.todos?.length ? `## 后续跟进\n${d.todos.map(t => `- ${t.owner || '未指定'}：${t.item}${t.deadline ? `（${t.deadline}）` : ''}`).join('\n')}` : '',
+      `## 数据巡览\n${digestDataRows(d).map(row => `- ${row}`).join('\n')}`,
+    ].filter(Boolean).join('\n\n');
+  }).join('\n\n---\n\n');
   _state_digest.lastTextMarkdown = markdown;
   _state_digest.lastTextTitle = (digests || []).map(d => d.group).filter(Boolean).join('_') || '文本预览';
   paintTextPreviewMarkdown(markdown);

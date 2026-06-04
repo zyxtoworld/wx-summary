@@ -193,6 +193,7 @@ function persistedDigest(digest = {}) {
     todos: cleanTodos(digest.todos),
     topics: cleanTopics(digest.topics),
     links: cleanLinks(digest.links),
+    quotes: cleanQuotes(digest.quotes),
     __render: cleanRender(digest.__render),
     created_at: String(digest.created_at || new Date().toISOString()),
   };
@@ -221,10 +222,22 @@ function cleanTodos(value) {
 function cleanTopics(value) {
   return Array.isArray(value) ? value.map(item => ({
     title: String(item?.title || ''),
+    category: String(item?.category || ''),
     participants: Array.isArray(item?.participants) ? item.participants.map(x => String(x || '')).filter(Boolean).slice(0, 12) : [],
     summary: String(item?.summary || ''),
     need_followup: !!item?.need_followup,
   })).filter(item => item.title || item.summary).slice(0, 100) : [];
+}
+
+function cleanQuotes(value) {
+  return Array.isArray(value) ? value.map(item => {
+    if (typeof item === 'string') return { speaker: '', text: item, context: '' };
+    return {
+      speaker: String(item?.speaker || item?.from || item?.sender || ''),
+      text: String(item?.text || item?.quote || item?.content || ''),
+      context: String(item?.context || item?.reason || ''),
+    };
+  }).filter(item => item.text).slice(0, 20) : [];
 }
 
 function cleanLinks(value) {
