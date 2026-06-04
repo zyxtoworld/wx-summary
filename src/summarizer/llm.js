@@ -284,6 +284,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
 async function summarizeMessageChunks({ settings, model, groupName, since, until, chunks, signal, onProgress }) {
   const concurrency = digestChunkConcurrency(settings);
   const summaries = new Array(chunks.length);
+  const parts = new Array(chunks.length);
   let completed = 0;
   notifyProgress(onProgress, {
     phase: 'llm_chunks',
@@ -309,6 +310,7 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
       signal,
       onProgress,
     });
+    parts[index] = part;
     summaries[index] = `分段 ${index + 1}${part?._fallback_chunk ? '（原始时间线兜底）' : ''}: ${JSON.stringify(part)}`;
     completed++;
     notifyProgress(onProgress, {
@@ -322,17 +324,127 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
     label: 'AI 总结 · 合并分段',
     detail: `${chunks.length} 段摘要合并为群纪要`,
   });
-  return callJsonModel({
-    settings,
-    model: settings.llm.long_context_model || model,
-    groupName,
-    since,
-    until,
-    messageBundle: { text: summaries.join('\n\n'), images: [] },
-    mode: 'merge',
-    signal,
-    onProgress,
-  });
+  try {
+    return await callJsonModel({
+      settings,
+      model: settings.llm.long_context_model || model,
+      groupName,
+      since,
+      until,
+      messageBundle: { text: summaries.join('\n\n'), images: [] },
+      mode: 'merge',
+      signal,
+      onProgress,
+    });
+  } catch (err) {
+    if (err?.status === 499 || signal?.aborted) throw err;
+    if (!isLikelyRecoverableChunkFailure(err)) throw err;
+    notifyProgress(onProgress, {
+      phase: 'llm_merge_fallback',
+      label: 'AI 总结 · 合并兜底',
+      detail: '合并分段返回空内容，已改用本地分段结果合并',
+    });
+    return mergeChunkSummariesLocally({ parts, groupName, since, until, error: err });
+  }
+}
+
+function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
+  const validParts = arrayOf(parts).filter(part => part && typeof part === 'object');
+  const fallbackParts = validParts.filter(part => part._fallback_chunk);
+  const topics = [];
+  const seenTopics = new Set();
+  for (const part of validParts) {
+    for (const topic of arrayOf(part.topics)) {
+      const normalized = {
+        title: cleanField(topic.title) || '未命名议题',
+        participants: Array.isArray(topic.participants) ? topic.participants.map(cleanField).filter(Boolean).slice(0, 12) : [],
+        summary: cleanField(topic.summary),
+        need_followup: !!topic.need_followup,
+      };
+      if (!normalized.summary && normalized.title === '未命名议题') continue;
+      const key = `${normalized.title}\n${normalized.summary.slice(0, 120)}`;
+      if (seenTopics.has(key)) continue;
+      seenTopics.add(key);
+      topics.push(normalized);
+    }
+  }
+  if (fallbackParts.length) {
+    const fallbackMessages = fallbackParts
+      .map(part => {
+        const match = cleanField(part.topics?.[0]?.summary).match(/共\s*(\d+)\s*条消息/);
+        return match ? Number(match[1]) : 0;
+      })
+      .reduce((sum, value) => sum + value, 0);
+    const participants = [...new Set(fallbackParts.flatMap(part => arrayOf(part.topics?.[0]?.participants).map(cleanField).filter(Boolean)))].slice(0, 12);
+    topics.push({
+      title: '部分分段仅按原始时间线兜底',
+      participants,
+      summary: [
+        '待确认：部分分段的模型请求持续返回空内容，本地合并已保留这些分段的时间、发送人、文件/链接/媒体元信息。',
+        fallbackMessages ? `涉及约 ${fallbackMessages} 条消息。` : '',
+        '未被模型成功识别的图片画面或语音内容不会被编造，需要结合原聊天确认。',
+      ].filter(Boolean).join(' '),
+      need_followup: true,
+    });
+  }
+  if (!topics.length) {
+    topics.push({
+      title: '分段摘要已完成但合并需确认',
+      participants: [],
+      summary: `待确认：${groupName} 在 ${since} ~ ${until} 的分段摘要已生成，但 AI 合并阶段返回空内容；本地兜底没有提炼出明确议题。错误：${sanitizeText(error?.message || String(error))}`,
+      need_followup: true,
+    });
+  }
+
+  return {
+    headline: pickLocalMergeHeadline(validParts) || '本时间窗分段摘要已生成，合并阶段使用本地兜底。',
+    topics: topics.slice(0, 24),
+    todos: dedupeByJson(validParts.flatMap(part => arrayOf(part.todos)).map(todo => ({
+      owner: cleanField(todo.owner),
+      item: cleanField(todo.item),
+      deadline: cleanField(todo.deadline),
+    })).filter(todo => todo.item)).slice(0, 24),
+    links: dedupeLinks(validParts.flatMap(part => arrayOf(part.links))).slice(0, 30),
+  };
+}
+
+function pickLocalMergeHeadline(parts) {
+  for (const part of arrayOf(parts)) {
+    const headline = cleanField(part.headline);
+    if (!headline || /^第\s*\d+\s*段/.test(headline) || /原始时间线待合并|需按原始时间线合并/.test(headline)) continue;
+    return headline.slice(0, 120);
+  }
+  return '';
+}
+
+function dedupeByJson(items) {
+  const out = [];
+  const seen = new Set();
+  for (const item of items) {
+    const key = JSON.stringify(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function dedupeLinks(links) {
+  const out = [];
+  const seen = new Set();
+  for (const link of links) {
+    const url = normalizeHttpUrl(link.url);
+    if (!url || seen.has(url) || !isAnalyzableWebLinkUrl(url)) continue;
+    seen.add(url);
+    out.push({
+      title: cleanField(link.title),
+      url,
+      summary: cleanLinkSummary(link.summary || link.description || link.context || '该网页链接来自分段摘要；合并阶段使用本地兜底保留，请结合对应发送人、时间和上下文判断用途。'),
+      from: cleanField(link.from),
+      time: cleanField(link.time),
+    });
+  }
+  return out;
 }
 
 async function summarizeChunkWithFallback({ settings, model, groupName, since, until, chunk, index, total, signal, onProgress }) {
