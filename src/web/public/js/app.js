@@ -82,7 +82,8 @@ const routes = {
 
 async function route() {
   const routeSeq = ++_routeSeq;
-  const hash = location.hash.replace(/^#/, '') || '/digest';
+  const rawHash = location.hash.replace(/^#/, '') || '/digest';
+  const hash = rawHash.split('?')[0] || '/digest';
   const fn = routes[hash] || renderDigest;
   closeTransientOverlays();
   // 设置导航 active
@@ -524,15 +525,67 @@ const DIGEST_ACCENTS = [
   { id: 'amber', label: '琥珀色', light: '#D97706', dark: '#FBBF24' },
   { id: 'rose', label: '玫红色', light: '#E11D48', dark: '#FB7185' },
 ];
+const DIGEST_GROUP_CACHE_TTL_MS = 30 * 1000;
+const DIGEST_GROUP_CACHE = new Map();
 
-async function renderDigest() {
-  $app.appendChild(tplOf('tpl-digest'));
-  const state = _appState || await api('/api/state');
-  const digestSettings = await api('/api/settings').catch(() => ({}));
-  applyDigestRenderDefaults(digestSettings.render || {});
+function digestGroupCacheKey(accountId = selectedAccountId()) {
+  return accountId || '__default__';
+}
+
+function getDigestGroupCache(accountId = selectedAccountId()) {
+  const key = digestGroupCacheKey(accountId);
+  if (!DIGEST_GROUP_CACHE.has(key)) {
+    DIGEST_GROUP_CACHE.set(key, { groups: [], fetchedAt: 0, promise: null });
+  }
+  return DIGEST_GROUP_CACHE.get(key);
+}
+
+function digestGroupCacheFresh(cache) {
+  return !!cache?.groups?.length && Date.now() - Number(cache.fetchedAt || 0) < DIGEST_GROUP_CACHE_TTL_MS;
+}
+
+async function fetchDigestGroups(accountId = selectedAccountId(), { force = false } = {}) {
+  const cache = getDigestGroupCache(accountId);
+  if (!force && digestGroupCacheFresh(cache)) return cache.groups;
+  if (cache.promise) return cache.promise;
+  cache.promise = api(`/api/groups?account=${encodeURIComponent(accountId || '')}`)
+    .then(groups => {
+      cache.groups = Array.isArray(groups) ? groups : [];
+      cache.fetchedAt = Date.now();
+      return cache.groups;
+    })
+    .finally(() => {
+      cache.promise = null;
+    });
+  return cache.promise;
+}
+
+function decorateDigestGroups(groups, digestSettings = {}) {
   const whitelistNames = new Set(digestSettings.groups?.whitelist || []);
   const recentNames = Array.isArray(digestSettings.groups?.recent) ? digestSettings.groups.recent : [];
   const recentRank = new Map(recentNames.map((name, index) => [String(name || ''), index]));
+  return (Array.isArray(groups) ? groups : [])
+    .map(group => {
+      const rank = Math.min(
+        recentRank.has(group.name) ? recentRank.get(group.name) : Number.POSITIVE_INFINITY,
+        recentRank.has(group.id) ? recentRank.get(group.id) : Number.POSITIVE_INFINITY,
+      );
+      const starred = Number.isFinite(rank);
+      const nonWhitelist = whitelistNames.size > 0 && !whitelistNames.has(group.name) && !whitelistNames.has(group.id);
+      return { ...group, starred, non_whitelist: nonWhitelist, recent_rank: starred ? rank : 9999 };
+    })
+    .sort((a, b) => (a.recent_rank - b.recent_rank) || ((b.last_msg_at || 0) - (a.last_msg_at || 0)));
+}
+
+async function renderDigest() {
+  $app.appendChild(tplOf('tpl-digest'));
+  const routeSeq = _routeSeq;
+  const accountId = selectedAccountId();
+  const state = _appState || await api('/api/state');
+  const digestSettings = await api('/api/settings').catch(() => ({}));
+  if (routeSeq !== _routeSeq) return;
+  applyDigestRenderDefaults(digestSettings.render || {});
+  const whitelistNames = new Set(digestSettings.groups?.whitelist || []);
   const notice = document.getElementById('wechat-notice');
   if (state.data_mode !== 'wxdb' || state.wechat?.running === false) {
     const hasWxData = state.data_mode === 'wxdb';
@@ -552,20 +605,15 @@ async function renderDigest() {
 
   // 群列表
   let groups = [];
+  let groupStatusText = '';
+  const groupCache = getDigestGroupCache(accountId);
+  const hasCachedGroups = Array.isArray(groupCache.groups) && groupCache.groups.length > 0;
   try {
-    groups = await api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`);
-    groups = groups
-      .map(group => {
-        const rank = Math.min(
-          recentRank.has(group.name) ? recentRank.get(group.name) : Number.POSITIVE_INFINITY,
-          recentRank.has(group.id) ? recentRank.get(group.id) : Number.POSITIVE_INFINITY,
-        );
-        const starred = Number.isFinite(rank);
-        const nonWhitelist = whitelistNames.size > 0 && !whitelistNames.has(group.name) && !whitelistNames.has(group.id);
-        return { ...group, starred, non_whitelist: nonWhitelist, recent_rank: starred ? rank : 9999 };
-      })
-      .sort((a, b) => (a.recent_rank - b.recent_rank) || ((b.last_msg_at || 0) - (a.last_msg_at || 0)));
+    const rawGroups = hasCachedGroups ? groupCache.groups : await fetchDigestGroups(accountId, { force: true });
+    if (routeSeq !== _routeSeq) return;
+    groups = decorateDigestGroups(rawGroups, digestSettings);
   } catch (e) {
+    if (routeSeq !== _routeSeq) return;
     notice.classList.remove('hidden');
     notice.innerHTML = `
       <strong>读取群列表失败</strong>
@@ -579,6 +627,11 @@ async function renderDigest() {
     document.getElementById('wechat-manual-key').addEventListener('click', () => { location.hash = '#/settings'; });
   }
   const $list = document.getElementById('group-list');
+  const isCurrentDigestView = () => routeSeq === _routeSeq && document.getElementById('group-list') === $list;
+  function setGroupStatus(text) {
+    groupStatusText = text || '';
+    updateSelectedCount();
+  }
   function paint(filter = '') {
     const f = filter.trim().toLowerCase();
     $list.innerHTML = groups
@@ -610,13 +663,31 @@ async function renderDigest() {
     updateSelectedCount();
   }
   function updateSelectedCount() {
-    document.getElementById('selected-count').textContent = `已选 ${_state_digest.selectedGroups.size} 个`;
+    document.getElementById('selected-count').textContent = `已选 ${_state_digest.selectedGroups.size} 个${groupStatusText ? ` · ${groupStatusText}` : ''}`;
     const disabled = _state_digest.selectedGroups.size === 0 || _state_digest.generating;
     document.getElementById('btn-generate').disabled = disabled;
     document.getElementById('btn-preview-text').disabled = disabled;
   }
   paint();
   document.getElementById('group-search').addEventListener('input', e => paint(e.target.value));
+  if (hasCachedGroups && !digestGroupCacheFresh(groupCache)) {
+    setGroupStatus('刷新中');
+    fetchDigestGroups(accountId, { force: true })
+      .then(rawGroups => {
+        if (!isCurrentDigestView()) return;
+        groups = decorateDigestGroups(rawGroups, digestSettings);
+        setGroupStatus('');
+        paint(document.getElementById('group-search')?.value || '');
+      })
+      .catch(e => {
+        if (!isCurrentDigestView()) return;
+        setGroupStatus('');
+        if (!groups.length) {
+          notice.classList.remove('hidden');
+          notice.innerHTML = `<strong>读取群列表失败</strong><span>${escapeHtml(e.message || '无法读取本机微信群列表。')}</span>`;
+        }
+      });
+  }
   const whitelistButton = document.getElementById('select-whitelist');
   whitelistButton.disabled = whitelistNames.size === 0;
   whitelistButton.title = whitelistNames.size ? '选择设置页白名单里的群' : '设置页尚未配置白名单';
@@ -1028,9 +1099,11 @@ async function generateDigest({ previewText = false } = {}) {
   scrollDigestWorkIntoView($progress);
   const selectedIds = [..._state_digest.selectedGroups];
   const batchId = createDigestBatchId();
+  const accountId = selectedAccountId();
   let groups;
   try {
-    groups = await api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`);
+    const cache = getDigestGroupCache(accountId);
+    groups = cache.groups?.length ? cache.groups : await fetchDigestGroups(accountId, { force: true });
   } catch (e) {
     _state_digest.generating = false;
     if (generateButton) generateButton.disabled = false;
