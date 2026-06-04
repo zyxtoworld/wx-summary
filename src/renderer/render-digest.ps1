@@ -265,13 +265,23 @@ $labelLocalData = Utf8Label '5pys5py65pWw5o2u'
 $labelSelectedFrom = Utf8Label 'IMK3IOW3suS7jiA='
 $labelSelectedMiddle = Utf8Label 'IOadoeS4reaIquWPliA='
 $labelCountSuffix = Utf8Label 'IOadoQ=='
-$labelHeadline = Utf8Label '5LiA5Y+l6K+d5oC76KeI'
-$labelTodosPrefix = Utf8Label '5ZCO57ut6Lef6L+b77yI'
+$labelHeadline = Utf8Label '5b+r6YCf57uT6K66'
+$labelTodosPrefix = Utf8Label '6L+Y6KaB5aSE55CG77yI'
 $labelRightParen = Utf8Label '77yJ'
-$labelTopicsPrefix = Utf8Label '6K6u6aKY77yI'
-$labelParticipants = Utf8Label '5Y+C5LiO77ya'
+$labelTopicsPrefix = Utf8Label '6YeN54K55LqL6aG577yI'
+$labelParticipants = Utf8Label '55u45YWz5oiQ5ZGY77ya'
 $labelListSep = Utf8Label '44CB'
-$labelImportantLinks = Utf8Label '6YeN6KaB6ZO+5o6l'
+$labelImportantLinks = Utf8Label '6ZO+5o6l6LWE5paZ'
+$labelQuotes = Utf8Label '5Luj6KGo6K+05rOV'
+$labelCoverage = Utf8Label '5pys5qyh6KaG55uW'
+$labelTimeRow = Utf8Label '5pe26Ze077ya'
+$labelMessageRow = Utf8Label '5raI5oGv77ya'
+$labelContentRow = Utf8Label '5YaF5a6577ya'
+$labelSourceRow = Utf8Label '5p2l5rqQ77ya'
+$labelTopicCount = Utf8Label '5Liq6YeN54K55LqL6aG577yM'
+$labelLinkCount = Utf8Label '5Liq572R6aG16ZO+5o6l77yM'
+$labelTodoCount = Utf8Label '5Liq6ZyA5aSE55CG5LqL6aG577yM'
+$labelQuoteCount = Utf8Label '5p2h5Luj6KGo6K+05rOV'
 $labelMetaSep = Utf8Label 'IMK3IA=='
 $labelSender = Utf8Label '5Y+R6YCB5Lq677ya'
 $labelTime = Utf8Label '5pe26Ze077ya'
@@ -297,10 +307,37 @@ $width = 2160
 $padding = 32
 $cardWidth = $width - $padding * 2
 
+$highlightItems = @()
+if ($digest.highlights) {
+  foreach ($item in $digest.highlights) {
+    $textValue = ([string]$item).Trim()
+    if ($textValue -and $textValue -ne ([string]$digest.headline) -and -not $highlightItems.Contains($textValue)) {
+      $highlightItems += $textValue
+      if ($highlightItems.Count -ge 5) { break }
+    }
+  }
+}
+$quoteItems = @()
+if ($digest.quotes) {
+  foreach ($quote in $digest.quotes) {
+    $quoteText = ''
+    if ($quote -is [string]) { $quoteText = [string]$quote } else { $quoteText = [string]$quote.text }
+    if ($quoteText.Trim()) {
+      $quoteItems += $quote
+      if ($quoteItems.Count -ge 6) { break }
+    }
+  }
+}
+$topicTotal = if ($digest.topics) { $digest.topics.Count } else { 0 }
+$linkTotal = if ($digest.links) { $digest.links.Count } else { 0 }
+$todoTotal = if ($digest.todos) { $digest.todos.Count } else { 0 }
+$quoteTotal = $quoteItems.Count
+
 $contentChars = 0
 $contentChars += CountTextChars $digest.group
 $contentChars += CountTextChars $digest.headline
 $contentChars += CountTextChars $digest.source_label
+$contentChars += CountTextChars ($highlightItems -join ' ')
 $rowCount = 8
 if ($digest.todos) {
   foreach ($todo in $digest.todos) {
@@ -327,6 +364,16 @@ if ($digest.links) {
     $contentChars += CountTextChars $link.time
     $rowCount += 3
   }
+}
+foreach ($quote in $quoteItems) {
+  if ($quote -is [string]) {
+    $contentChars += CountTextChars $quote
+  } else {
+    $contentChars += CountTextChars $quote.text
+    $contentChars += CountTextChars $quote.speaker
+    $contentChars += CountTextChars $quote.context
+  }
+  $rowCount += 2
 }
 $estimatedLines = [Math]::Ceiling([double]([Math]::Max(1, $contentChars)) / 34)
 $estimatedHeight = [int](1400 + $estimatedLines * 104 + $rowCount * 148)
@@ -398,10 +445,24 @@ $cardY = $y
 $innerY = $cardY + (S 20)
 $innerY += (S 50)
 $innerY = DrawWrappedText $graphics ([string]$digest.headline) $fontTitle $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 84)
+if ($highlightItems.Count -gt 0) {
+  $innerY += (S 16)
+  foreach ($item in $highlightItems) {
+    $innerY = DrawWrappedText $graphics ("- " + [string]$item) $fontBody $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 62)
+    $innerY += (S 8)
+  }
+}
 $cardH = $innerY - $cardY + (S 20)
 DrawCard $graphics $padding $cardY $cardWidth $cardH $brushCard $penBorder
   $graphics.DrawString($labelHeadline, $fontSmall, $brushPrimary, $padding + 34, $cardY + (S 20))
-[void](DrawWrappedText $graphics ([string]$digest.headline) $fontTitle $brushText ($padding + 34) ($cardY + (S 70)) ($cardWidth - 68) (S 84))
+$innerY = DrawWrappedText $graphics ([string]$digest.headline) $fontTitle $brushText ($padding + 34) ($cardY + (S 70)) ($cardWidth - 68) (S 84)
+if ($highlightItems.Count -gt 0) {
+  $innerY += (S 16)
+  foreach ($item in $highlightItems) {
+    $innerY = DrawWrappedText $graphics ("- " + [string]$item) $fontBody $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 62)
+    $innerY += (S 8)
+  }
+}
 $y = $cardY + $cardH + (S 12)
 
 if ($digest.todos -and $digest.todos.Count -gt 0) {
@@ -549,6 +610,77 @@ if ($digest.links -and $digest.links.Count -gt 0) {
   }
   $y = $cardY + $cardH + (S 12)
 }
+
+if ($quoteItems.Count -gt 0) {
+  $cardY = $y
+  $innerY = $cardY + (S 20)
+  $innerY += (S 72)
+  $quoteIndex = 0
+  foreach ($quote in $quoteItems) {
+    $quoteText = ''
+    $quoteMeta = @()
+    if ($quote -is [string]) {
+      $quoteText = [string]$quote
+    } else {
+      $quoteText = [string]$quote.text
+      if ($quote.speaker) { $quoteMeta += [string]$quote.speaker }
+      if ($quote.context) { $quoteMeta += [string]$quote.context }
+    }
+    $innerY = DrawWrappedText $graphics ("`"" + $quoteText + "`"") $fontBodyBold $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 62)
+    if ($quoteMeta.Count -gt 0) {
+      $innerY = DrawWrappedText $graphics ($quoteMeta -join $labelMetaSep) $fontSmall $brushMuted ($padding + 62) $innerY ($cardWidth - 96) (S 48)
+    }
+    if ($quoteIndex -lt ($quoteItems.Count - 1)) { $innerY += (S 24) } else { $innerY += (S 12) }
+    $quoteIndex++
+  }
+  $cardH = $innerY - $cardY + (S 12)
+  DrawCard $graphics $padding $cardY $cardWidth $cardH $brushCard $penBorder
+  $innerY = $cardY + (S 20)
+  $graphics.DrawString($labelQuotes, $fontH2, $brushPrimary, $padding + 34, $innerY); $innerY += (S 72)
+  $quoteIndex = 0
+  foreach ($quote in $quoteItems) {
+    $quoteText = ''
+    $quoteMeta = @()
+    if ($quote -is [string]) {
+      $quoteText = [string]$quote
+    } else {
+      $quoteText = [string]$quote.text
+      if ($quote.speaker) { $quoteMeta += [string]$quote.speaker }
+      if ($quote.context) { $quoteMeta += [string]$quote.context }
+    }
+    $innerY = DrawWrappedText $graphics ("`"" + $quoteText + "`"") $fontBodyBold $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 62)
+    if ($quoteMeta.Count -gt 0) {
+      $innerY = DrawWrappedText $graphics ($quoteMeta -join $labelMetaSep) $fontSmall $brushMuted ($padding + 62) $innerY ($cardWidth - 96) (S 48)
+    }
+    if ($quoteIndex -lt ($quoteItems.Count - 1)) { $innerY += (S 24) } else { $innerY += (S 12) }
+    $quoteIndex++
+  }
+  $y = $cardY + $cardH + (S 12)
+}
+
+$coverageSource = if ($digest.source_label) { [string]$digest.source_label } else { $labelLocalData }
+$coverageRows = @(
+  "$labelTimeRow$($digest.since) ~ $($digest.until)",
+  "$labelMessageRow$($digest.message_count) $labelMessages",
+  "$labelContentRow$topicTotal $labelTopicCount$linkTotal $labelLinkCount$todoTotal $labelTodoCount$quoteTotal $labelQuoteCount",
+  "$labelSourceRow$coverageSource    $labelModel$($digest.model)"
+)
+$cardY = $y
+$innerY = $cardY + (S 20)
+$innerY += (S 72)
+foreach ($row in $coverageRows) {
+  $innerY = DrawWrappedText $graphics ("- " + [string]$row) $fontBody $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 58)
+  $innerY += (S 8)
+}
+$cardH = $innerY - $cardY + (S 12)
+DrawCard $graphics $padding $cardY $cardWidth $cardH $brushCard $penBorder
+$innerY = $cardY + (S 20)
+$graphics.DrawString($labelCoverage, $fontH2, $brushPrimary, $padding + 34, $innerY); $innerY += (S 72)
+foreach ($row in $coverageRows) {
+  $innerY = DrawWrappedText $graphics ("- " + [string]$row) $fontBody $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 58)
+  $innerY += (S 8)
+}
+$y = $cardY + $cardH + (S 12)
 
 $created = [DateTime]::Now
 if ($digest.created_at) {

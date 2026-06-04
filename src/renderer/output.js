@@ -189,6 +189,7 @@ function persistedDigest(digest = {}) {
     source_label: String(digest.source_label || ''),
     model: String(digest.model || ''),
     headline: String(digest.headline || ''),
+    highlights: cleanHighlights(digest.highlights),
     mentions_me: [],
     todos: cleanTodos(digest.todos),
     topics: cleanTopics(digest.topics),
@@ -213,10 +214,19 @@ function cleanRender(value) {
 
 function cleanTodos(value) {
   return Array.isArray(value) ? value.map(item => ({
-    owner: String(item?.owner || ''),
+    owner: cleanTodoOwner(item?.owner),
     item: String(item?.item || ''),
     deadline: String(item?.deadline || ''),
   })).filter(item => item.item).slice(0, 100) : [];
+}
+
+function cleanTodoOwner(value) {
+  const text = String(value || '').trim();
+  return /^(待认领|未指定|无|暂无|不明确)$/.test(text) ? '' : text;
+}
+
+function cleanHighlights(value) {
+  return Array.isArray(value) ? value.map(item => String(item || '').trim()).filter(Boolean).slice(0, 12) : [];
 }
 
 function cleanTopics(value) {
