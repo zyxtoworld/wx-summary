@@ -398,6 +398,7 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
     label: 'AI 总结 · 分段总结',
     detail: `${chunks.length} 段 · 并发 ${concurrency} 路`,
   });
+  const mediaRetryState = { forceTextOnly: false };
   await mapWithConcurrency(chunks, concurrency, async (chunk, index) => {
     throwIfAborted(signal);
     notifyProgress(onProgress, {
@@ -416,6 +417,7 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
       total: chunks.length,
       signal,
       onProgress,
+      mediaRetryState,
     });
     parts[index] = part;
     summaries[index] = `分段 ${index + 1}${part?._fallback_chunk ? '（原始时间线兜底）' : ''}: ${JSON.stringify(part)}`;
@@ -579,7 +581,7 @@ function isLowValueDigestLink(link = {}) {
   return false;
 }
 
-async function summarizeChunkWithFallback({ settings, model, groupName, since, until, chunk, index, total, signal, onProgress }) {
+async function summarizeChunkWithFallback({ settings, model, groupName, since, until, chunk, index, total, signal, onProgress, mediaRetryState = null }) {
   const mode = `chunk ${index + 1}/${total}`;
   try {
     return await callJsonModel({
@@ -592,6 +594,7 @@ async function summarizeChunkWithFallback({ settings, model, groupName, since, u
       mode,
       signal,
       onProgress,
+      mediaRetryState,
     });
   } catch (err) {
     if (err?.status === 499 || signal?.aborted) throw err;
@@ -1630,7 +1633,7 @@ function decodeHtml(text) {
     .trim();
 }
 
-async function callJsonModel({ settings, model, groupName, since, until, messageBundle, mode, signal = null, onProgress = null }) {
+async function callJsonModel({ settings, model, groupName, since, until, messageBundle, mode, signal = null, onProgress = null, mediaRetryState = null }) {
   throwIfAborted(signal);
   const messagesText = messageBundle?.text || '';
   const imageCount = messageBundle?.imageCount || 0;
@@ -1681,9 +1684,11 @@ async function callJsonModel({ settings, model, groupName, since, until, message
   ].join('\n');
 
   let lastError;
-  let activeBlocks = blocks;
+  let activeBlocks = mediaRetryState?.forceTextOnly && blocks.some(block => block.kind === 'image' || block.kind === 'audio')
+    ? withoutMediaBlocksForTextOnlyRetry(blocks)
+    : blocks;
   let audioRetryUsed = false;
-  let mediaEmptyRetryUsed = false;
+  let mediaTextRetryUsed = !!mediaRetryState?.forceTextOnly;
   let parseRetryUsed = false;
   let parseRepairUsed = false;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -1716,14 +1721,20 @@ async function callJsonModel({ settings, model, groupName, since, until, message
         audioRetryUsed = true;
         continue;
       }
-      if ((imageCount || audioCount) && !mediaEmptyRetryUsed && activeBlocks.some(block => block.kind === 'image' || block.kind === 'audio') && isModelEmptyContentError(e)) {
-        activeBlocks = withoutMediaBlocksForEmptyContentRetry(activeBlocks);
-        mediaEmptyRetryUsed = true;
+      if (
+        (imageCount || audioCount)
+        && !mediaTextRetryUsed
+        && activeBlocks.some(block => block.kind === 'image' || block.kind === 'audio')
+        && (isModelEmptyContentError(e) || isLikelyUnsupportedMediaError(e))
+      ) {
+        activeBlocks = withoutMediaBlocksForTextOnlyRetry(activeBlocks);
+        mediaTextRetryUsed = true;
         audioRetryUsed = true;
+        if (mediaRetryState && isLikelyUnsupportedMediaError(e)) mediaRetryState.forceTextOnly = true;
         notifyProgress(onProgress, {
           phase: 'llm_media_retry',
           label: 'AI 总结 · 媒体兜底',
-          detail: `任务 ${mode || 'summary'} 带媒体返回空内容，改用文本和媒体元信息重试`,
+          detail: `任务 ${mode || 'summary'} 当前模型无法直接处理媒体，改用文本和媒体元信息重试`,
         });
         continue;
       }
@@ -1827,18 +1838,18 @@ function withoutAudioBlocksForRetry(blocks = []) {
     });
 }
 
-function withoutMediaBlocksForEmptyContentRetry(blocks = []) {
+function withoutMediaBlocksForTextOnlyRetry(blocks = []) {
   return blocks.map(block => {
     if (block.kind === 'image') {
       return {
         kind: 'text',
-        text: `（${block.ref || '图片/视频关键帧'}：AI 端点带媒体请求返回空内容，已改为仅按对应消息行的时间、发送人、文件名、尺寸等元信息和上下文总结；不要编造画面细节。）`,
+        text: `（${block.ref || '图片/视频关键帧'}：当前 AI 端点无法直接处理该媒体或返回空内容，已改为仅按对应消息行的时间、发送人、文件名、尺寸等元信息和上下文总结；不要编造画面细节。）`,
       };
     }
     if (block.kind === 'audio') {
       return {
         kind: 'text',
-        text: `（${block.ref || '音频'}：AI 端点带媒体请求返回空内容，已改为仅按对应消息行的时间、发送人、文件名、时长等元信息和上下文总结；不要编造语音内容。）`,
+        text: `（${block.ref || '音频'}：当前 AI 端点无法直接处理该媒体或返回空内容，已改为仅按对应消息行的时间、发送人、文件名、时长等元信息和上下文总结；不要编造语音内容。）`,
       };
     }
     if (block.kind !== 'text') return block;
@@ -2373,7 +2384,15 @@ function isLikelyUnsupportedAudioError(err) {
   const status = Number(err?.status || 0);
   const message = String(err?.message || '').toLowerCase();
   return [400, 415, 422].includes(status)
-    || /audio|input_audio|unsupported|invalid.*content|content.*type|format/.test(message);
+    && /audio|input_audio|voice|sound|speech/.test(message)
+    && /unsupported|invalid.*content|content.*type|format|does not support/.test(message);
+}
+
+function isLikelyUnsupportedMediaError(err) {
+  const status = Number(err?.status || 0);
+  const message = String(err?.message || '').toLowerCase();
+  return [400, 415, 422].includes(status)
+    && /image|image_url|input_image|audio|input_audio|vision|multimodal|media|unsupported|invalid.*content|content.*type|format|does not support/.test(message);
 }
 
 function isJsonParseError(err) {
@@ -2417,5 +2436,6 @@ export const __llmInternals = {
   isLikelyRecoverableChunkFailure,
   isModelEmptyContentError,
   isLikelyUnsupportedAudioError,
+  isLikelyUnsupportedMediaError,
   isJsonParseError,
 };
