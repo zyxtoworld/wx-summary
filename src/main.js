@@ -29,6 +29,7 @@ const PRELAUNCH_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'prelaunch-weixin-bin
 const LAUNCHER_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'launcher-weixin-binary.json');
 const SAVE_RENDER_BODY_LIMIT = 120 * 1024 * 1024;
 const MAX_ACTIVE_DIGEST_REQUESTS = 6;
+const DIGEST_BATCH_SETTINGS_TTL_MS = 2 * 60 * 60 * 1000;
 const SERVICE_STARTED_AT = new Date();
 let ACTIVE_SERVER = null;
 let ACTIVE_PORT = null;
@@ -38,6 +39,7 @@ let WEIXIN_BINARY_PRELAUNCH_BASELINE = null;
 let WEIXIN_BINARY_LAUNCHER_BASELINE = null;
 let WEIXIN_BINARY_BASELINE = null;
 let ACTIVE_DIGEST_REQUESTS = new Map();
+const DIGEST_BATCH_SETTINGS = new Map();
 let NEXT_DIGEST_REQUEST_ID = 1;
 let ACTIVE_DEEP_KEY_STATUS = null;
 let LAST_CLIPBOARD_COPY_EVIDENCE = null;
@@ -104,6 +106,33 @@ async function writeRuntimeInfo(port) {
 
 function removeRuntimeInfo() {
   try { fs.rmSync(RUNTIME_INFO_FILE, { force: true }); } catch {}
+}
+
+function normalizeDigestBatchId(value) {
+  const id = String(value || '').trim();
+  return /^[a-zA-Z0-9_.:-]{8,80}$/.test(id) ? id : '';
+}
+
+async function loadDigestBatchSettings(batchId) {
+  const id = normalizeDigestBatchId(batchId);
+  const now = Date.now();
+  cleanupDigestBatchSettings(now);
+  if (!id) return loadSettings({ includeSecrets: true });
+  const cached = DIGEST_BATCH_SETTINGS.get(id);
+  if (cached && now - cached.created_at < DIGEST_BATCH_SETTINGS_TTL_MS) {
+    return cached.settings;
+  }
+  const settings = await loadSettings({ includeSecrets: true });
+  DIGEST_BATCH_SETTINGS.set(id, { settings, created_at: now });
+  return settings;
+}
+
+function cleanupDigestBatchSettings(now = Date.now()) {
+  for (const [id, item] of DIGEST_BATCH_SETTINGS.entries()) {
+    if (!item?.created_at || now - item.created_at > DIGEST_BATCH_SETTINGS_TTL_MS) {
+      DIGEST_BATCH_SETTINGS.delete(id);
+    }
+  }
 }
 
 async function readWeixinBaselineFile(file, { relativePath, expectedSources, fallbackSource, freshness = 'service_start' }) {
@@ -1050,13 +1079,13 @@ async function runDigestSSE(req, res, body) {
   }, 15000);
   heartbeat.unref?.();
   try {
-    const settings = await loadSettings({ includeSecrets: true });
+    const settings = await loadDigestBatchSettings(body.batch_id);
     const groupId = body.group_id || body.groups?.[0]?.id || body.groups?.[0] || '';
     const groupName = body.group_name || body.groups?.[0]?.name || '未命名会话';
     const since = body.since || '';
     const until = body.until || 'now';
     const accountId = body.account_id || '';
-    logInfo('digest_started', { account_id: accountId, group_id: groupId, group: groupName, since, until, preview_text: !!body.preview_text });
+    logInfo('digest_started', { account_id: accountId, group_id: groupId, group: groupName, since, until, preview_text: !!body.preview_text, batch_id: normalizeDigestBatchId(body.batch_id) });
 
     ensureActive();
     sendStage({ name: 'fetching', label: '拉取消息', status: 'running' });

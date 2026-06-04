@@ -754,6 +754,7 @@ async function renderDigest() {
     }
   });
 
+  restoreDigestOutputs();
   ensureKeyboardShortcuts();
 }
 
@@ -1026,6 +1027,7 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.lastTextTitle = '';
   scrollDigestWorkIntoView($progress);
   const selectedIds = [..._state_digest.selectedGroups];
+  const batchId = createDigestBatchId();
   let groups;
   try {
     groups = await api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`);
@@ -1182,6 +1184,7 @@ async function generateDigest({ previewText = false } = {}) {
           target,
           since,
           until,
+          batchId,
           previewText,
           signal: controller.signal,
           onStage: stage => upsertStage({
@@ -1194,15 +1197,19 @@ async function generateDigest({ previewText = false } = {}) {
           renderTextPreviews(digests.filter(Boolean));
         } else {
           await enqueueRender(async () => {
-            document.getElementById('preview-card').classList.remove('hidden');
-            drawDigestCanvas(digest);
+            const livePreviewCard = document.getElementById('preview-card');
+            if (livePreviewCard) livePreviewCard.classList.remove('hidden');
+            const canvas = drawDigestCanvas(digest);
             upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
             try {
-              const saved = await saveRenderedCanvas(digest);
+              const saved = await saveRenderedCanvas(digest, canvas);
               _state_digest.lastSavedItem = saved.item;
               digest.file_path = saved.item.file_path;
-              document.getElementById('btn-reveal').disabled = false;
-              document.getElementById('btn-reveal').title = '在文件夹中显示最后一张';
+              const revealButton = document.getElementById('btn-reveal');
+              if (revealButton) {
+                revealButton.disabled = false;
+                revealButton.title = '在文件夹中显示最后一张';
+              }
               upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'done', detail: saved.item.relative_path }));
               scrollDigestWorkIntoView(document.getElementById('preview-card'));
             } catch (e) {
@@ -1243,6 +1250,7 @@ async function generateDigest({ previewText = false } = {}) {
     clearAllRunningStages();
     _state_digest.abortController = null;
     _state_digest.generating = false;
+    restoreDigestOutputs();
     const finalGenerateButton = document.getElementById('btn-generate');
     const finalPreviewButton = document.getElementById('btn-preview-text');
     if (finalGenerateButton) finalGenerateButton.disabled = _state_digest.selectedGroups.size === 0;
@@ -1254,6 +1262,11 @@ function digestPrepareConcurrency(total) {
   const cores = Number(window.navigator?.hardwareConcurrency || 4);
   const estimated = cores >= 12 ? 4 : cores >= 8 ? 3 : cores >= 4 ? 2 : 1;
   return Math.max(1, Math.min(Number(total || 1), estimated));
+}
+
+function createDigestBatchId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `batch-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 async function runClientPool(items, concurrency, worker, signal = null) {
@@ -1346,7 +1359,7 @@ async function rememberRecentGroups(targets, allGroups) {
   await api('/api/settings', { method: 'PUT', body: { groups: { recent: nextRecentGroups } } });
 }
 
-async function runSingleDigestRequest({ target, since, until, previewText, signal, onStage }) {
+async function runSingleDigestRequest({ target, since, until, batchId, previewText, signal, onStage }) {
   let digest = null;
   let modelError = null;
   const resp = await fetch('/api/digest', {
@@ -1356,6 +1369,7 @@ async function runSingleDigestRequest({ target, since, until, previewText, signa
     body: JSON.stringify({
       group_id: target.id,
       group_name: target.name,
+      batch_id: batchId,
       account_id: selectedAccountId(),
       since,
       until,
@@ -1398,7 +1412,7 @@ async function runSingleDigestRequest({ target, since, until, previewText, signa
 }
 
 // ---------- Canvas 长图渲染（前端预览，1080×N） ----------
-function drawDigestCanvas(d) {
+function drawDigestCanvas(d, targetCanvas = null) {
   const W = 1080;
   const padding = 16;
   const cardInset = 16;
@@ -1416,7 +1430,7 @@ function drawDigestCanvas(d) {
   const font = (weight, size) => `${weight} ${s(size)}px ${FONT_STACK}`;
 
   // 第一遍测算，第二遍真画
-  const canvas = document.getElementById('digest-canvas');
+  const canvas = targetCanvas || document.getElementById('digest-canvas') || document.createElement('canvas');
   const dpr = 2;
 
   function measure(ctx) { return draw(ctx, true); }
@@ -1626,10 +1640,11 @@ function drawDigestCanvas(d) {
   ctx.scale(dpr, dpr);
   ctx.textBaseline = 'top';
   draw(ctx, false);
+  return canvas;
 }
 
-async function saveRenderedCanvas(digest) {
-  const canvas = document.getElementById('digest-canvas');
+async function saveRenderedCanvas(digest, renderedCanvas = null) {
+  const canvas = renderedCanvas || document.getElementById('digest-canvas') || drawDigestCanvas(digest);
   const png_data_url = canvas.toDataURL('image/png');
   return api('/api/save-render', { method: 'POST', body: { digest: { ...digest, __render: digestRenderPayload() }, png_data_url } });
 }
@@ -1639,9 +1654,6 @@ function renderTextPreview(d) {
 }
 
 function renderTextPreviews(digests) {
-  const card = document.getElementById('text-preview-card');
-  const pre = document.getElementById('text-preview');
-  card.classList.remove('hidden');
   const markdown = (digests || []).map(d => [
     `# ${d.group}`,
     '',
@@ -1655,15 +1667,45 @@ function renderTextPreviews(digests) {
     d.topics?.length ? `## 议题\n${d.topics.map((t, i) => `${i + 1}. ${t.title}\n   参与：${(t.participants || []).join('、') || '未识别'}\n   ${t.summary}${t.need_followup ? '\n   需要跟进' : ''}`).join('\n\n')}` : '',
     d.links?.length ? `## 链接\n${d.links.map(l => `- ${l.title || l.summary || l.url}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${l.url}>` : ''}${l.from ? ` by ${l.from}` : ''}${l.time ? ` @ ${l.time}` : ''}`).join('\n')}` : '',
   ].filter(Boolean).join('\n\n')).join('\n\n---\n\n');
-  pre.textContent = markdown;
   _state_digest.lastTextMarkdown = markdown;
   _state_digest.lastTextTitle = (digests || []).map(d => d.group).filter(Boolean).join('_') || '文本预览';
+  paintTextPreviewMarkdown(markdown);
+}
+
+function paintTextPreviewMarkdown(markdown = _state_digest.lastTextMarkdown || '') {
+  const card = document.getElementById('text-preview-card');
+  const pre = document.getElementById('text-preview');
+  if (!card || !pre) return;
+  card.classList.remove('hidden');
+  pre.textContent = markdown;
   const exportButton = document.getElementById('btn-export-md');
   const status = document.getElementById('text-preview-status');
   if (exportButton) exportButton.disabled = !markdown.trim();
   if (status) {
     status.className = 'status';
     status.textContent = '';
+  }
+}
+
+function restoreDigestOutputs() {
+  if (_state_digest.lastDigest) {
+    const previewCard = document.getElementById('preview-card');
+    const canvas = document.getElementById('digest-canvas');
+    if (previewCard && canvas) {
+      previewCard.classList.remove('hidden');
+      drawDigestCanvas(_state_digest.lastDigest, canvas);
+      document.getElementById('btn-download')?.removeAttribute('disabled');
+      document.getElementById('btn-copy')?.removeAttribute('disabled');
+      document.getElementById('btn-rerender')?.removeAttribute('disabled');
+      const revealButton = document.getElementById('btn-reveal');
+      if (revealButton) {
+        revealButton.disabled = !_state_digest.lastSavedItem;
+        revealButton.title = _state_digest.lastSavedItem ? '在文件夹中显示最后一张' : '保存后可用';
+      }
+    }
+  }
+  if (_state_digest.lastTextMarkdown?.trim()) {
+    paintTextPreviewMarkdown(_state_digest.lastTextMarkdown);
   }
 }
 
