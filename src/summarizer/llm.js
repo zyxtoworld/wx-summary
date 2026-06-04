@@ -19,6 +19,7 @@ const MESSAGE_CONTEXT_SNIPPET_CHARS = 90;
 const MESSAGE_CONTEXT_TOTAL_CHARS = 420;
 const DEFAULT_AI_REQUEST_CONCURRENCY = 1;
 const DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS = 15000;
+const CHUNK_RECOVERY_MAX_DEPTH = 3;
 const DEFAULT_LINK_PREVIEW = {
   enabled: true,
   ai_web_search: true,
@@ -390,7 +391,6 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
 
 async function summarizeMessageChunks({ settings, model, groupName, since, until, chunks, signal, onProgress }) {
   const concurrency = digestChunkConcurrency(settings);
-  const summaries = new Array(chunks.length);
   const parts = new Array(chunks.length);
   let completed = 0;
   notifyProgress(onProgress, {
@@ -420,7 +420,6 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
       mediaRetryState,
     });
     parts[index] = part;
-    summaries[index] = `分段 ${index + 1}${part?._fallback_chunk ? '（原始时间线兜底）' : ''}: ${JSON.stringify(part)}`;
     completed++;
     notifyProgress(onProgress, {
       phase: 'llm_chunk',
@@ -428,10 +427,23 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
       detail: `已完成 ${completed}/${chunks.length} 段 · 并发 ${concurrency} 路`,
     });
   });
+  const finalParts = await recoverFallbackChunkSummaries({
+    settings,
+    model,
+    groupName,
+    since,
+    until,
+    chunks,
+    parts,
+    signal,
+    onProgress,
+    mediaRetryState,
+  });
+  const summaries = finalParts.map((part, index) => `分段 ${index + 1}${part?._fallback_chunk ? '（原始时间线兜底）' : ''}: ${JSON.stringify(part)}`);
   notifyProgress(onProgress, {
     phase: 'llm_merge',
     label: 'AI 总结 · 合并分段',
-    detail: `${chunks.length} 段摘要合并为群纪要`,
+    detail: `${finalParts.length} 段摘要合并为群纪要`,
   });
   try {
     return await callJsonModel({
@@ -453,8 +465,115 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
       label: 'AI 总结 · 合并兜底',
       detail: '合并分段返回空内容，已改用本地分段结果合并',
     });
-    return mergeChunkSummariesLocally({ parts, groupName, since, until, error: err });
+    return mergeChunkSummariesLocally({ parts: finalParts, groupName, since, until, error: err });
   }
+}
+
+async function recoverFallbackChunkSummaries({ settings, model, groupName, since, until, chunks, parts, signal, onProgress, mediaRetryState }) {
+  const fallbackIndexes = parts
+    .map((part, index) => (part?._fallback_chunk ? index : -1))
+    .filter(index => index >= 0);
+  if (!fallbackIndexes.length) return parts.filter(Boolean);
+
+  notifyProgress(onProgress, {
+    phase: 'llm_chunk_recovery',
+    label: 'AI 总结 · 失败段重试',
+    detail: `${fallbackIndexes.length}/${parts.length} 段未返回可用摘要，正在拆小重试`,
+  });
+
+  const out = [];
+  let recovered = 0;
+  for (let index = 0; index < parts.length; index++) {
+    throwIfAborted(signal);
+    const part = parts[index];
+    if (!part?._fallback_chunk) {
+      if (part) out.push(part);
+      continue;
+    }
+    const recoveredParts = await recoverFallbackChunkPart({
+      settings,
+      model,
+      groupName,
+      since,
+      until,
+      chunk: chunks[index] || [],
+      fallback: part,
+      originalIndex: index,
+      originalTotal: chunks.length,
+      signal,
+      onProgress,
+      mediaRetryState,
+      depth: 0,
+    });
+    if (!recoveredParts.some(item => item?._fallback_chunk)) recovered++;
+    out.push(...recoveredParts.filter(Boolean));
+  }
+
+  notifyProgress(onProgress, {
+    phase: 'llm_chunk_recovery',
+    label: 'AI 总结 · 失败段重试',
+    detail: `已补回 ${recovered}/${fallbackIndexes.length} 个失败分段`,
+  });
+  return out;
+}
+
+async function recoverFallbackChunkPart({ settings, model, groupName, since, until, chunk, fallback, originalIndex, originalTotal, signal, onProgress, mediaRetryState, depth }) {
+  if (depth >= CHUNK_RECOVERY_MAX_DEPTH || !Array.isArray(chunk) || chunk.length <= 1) return [fallback];
+  const subChunks = splitChunkForRecovery(chunk);
+  if (subChunks.length <= 1) return [fallback];
+
+  notifyProgress(onProgress, {
+    phase: 'llm_chunk_recovery',
+    label: 'AI 总结 · 失败段重试',
+    detail: `第 ${originalIndex + 1}/${originalTotal} 段拆成 ${subChunks.length} 小段重试`,
+  });
+
+  const recoveredGroups = new Array(subChunks.length);
+  await mapWithConcurrency(subChunks, Math.min(2, subChunks.length), async (subChunk, subIndex) => {
+    throwIfAborted(signal);
+    const part = await summarizeChunkWithFallback({
+      settings,
+      model,
+      groupName,
+      since,
+      until,
+      chunk: subChunk,
+      index: subIndex,
+      total: subChunks.length,
+      signal,
+      onProgress,
+      mediaRetryState,
+    });
+    recoveredGroups[subIndex] = part?._fallback_chunk
+      ? await recoverFallbackChunkPart({
+        settings,
+        model,
+        groupName,
+        since,
+        until,
+        chunk: subChunk,
+        fallback: part,
+        originalIndex,
+        originalTotal,
+        signal,
+        onProgress,
+        mediaRetryState,
+        depth: depth + 1,
+      })
+      : [part];
+  });
+
+  const recoveredParts = recoveredGroups.flat().filter(Boolean);
+  return recoveredParts.length ? recoveredParts : [fallback];
+}
+
+function splitChunkForRecovery(chunk) {
+  if (!Array.isArray(chunk) || chunk.length <= 1) return [chunk];
+  const targetParts = chunk.length >= 80 ? 4 : 2;
+  const size = Math.max(1, Math.ceil(chunk.length / targetParts));
+  const out = [];
+  for (let i = 0; i < chunk.length; i += size) out.push(chunk.slice(i, i + size));
+  return out;
 }
 
 function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
