@@ -14,6 +14,9 @@ const ADAPTIVE_CHUNK_MAX_INPUT_CHARS = 80_000;
 const DEFAULT_DIGEST_CHUNK_CONCURRENCY = 2;
 const AI_LINK_RESEARCH_URLS_PER_CALL = 8;
 const DEFAULT_LINK_RESEARCH_CONCURRENCY = 2;
+const MESSAGE_CONTEXT_NEIGHBORS = 2;
+const MESSAGE_CONTEXT_SNIPPET_CHARS = 90;
+const MESSAGE_CONTEXT_TOTAL_CHARS = 420;
 const DEFAULT_AI_REQUEST_CONCURRENCY = 1;
 const DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS = 15000;
 const DEFAULT_LINK_PREVIEW = {
@@ -746,7 +749,8 @@ function formatMessageBundle(messages) {
     textBuffer = [];
   }
 
-  for (const msg of messages) {
+  for (let index = 0; index < messages.length; index++) {
+    const msg = messages[index];
     const dataUrl = msg.media?.data_url || '';
     const frameDataUrl = msg.media?.frame_data_url || '';
     const audioDataUrl = msg.media?.audio_data_url || '';
@@ -756,7 +760,8 @@ function formatMessageBundle(messages) {
     const canAttachAudio = audioDataUrl && audioFormat && (msg.type === 'voice' || isAudioLikeMedia(msg.media));
     const imageRef = canAttachImage ? `图片${imageCount + 1}` : (canAttachFrame ? `视频关键帧${imageCount + 1}` : '');
     const audioRef = canAttachAudio ? `音频${audioCount + 1}` : '';
-    const line = formatMessageLine(msg, { imageRef, audioRef });
+    const context = messageNeedsContext(msg) ? buildNearbyChatContext(messages, index) : '';
+    const line = formatMessageLine(msg, { imageRef, audioRef, context });
     lines.push(line);
     textBuffer.push(line);
     if (canAttachImage || canAttachFrame) {
@@ -806,7 +811,19 @@ function mediaPayloadChars(msg) {
   ].reduce((n, value) => n + (value ? String(value).length : 0), 0);
 }
 
-function formatMessageLine(m, { imageRef = '', audioRef = '' } = {}) {
+function messageNeedsContext(msg = {}) {
+  return !!(
+    msg.link_previews?.length
+    || msg.type === 'image'
+    || msg.type === 'video'
+    || msg.type === 'voice'
+    || msg.type === 'file'
+    || isVideoLikeMedia(msg.media)
+    || isAudioLikeMedia(msg.media)
+  );
+}
+
+function formatMessageLine(m, { imageRef = '', audioRef = '', context = '' } = {}) {
   const type = m.type && m.type !== 'text' ? `/${m.type}` : '';
   let suffix = '';
   if (m.type === 'image' && imageRef) {
@@ -824,15 +841,68 @@ function formatMessageLine(m, { imageRef = '', audioRef = '' } = {}) {
   } else if ((m.type === 'voice' || isAudioLikeMedia(m.media)) && m.media?.local_available && !m.media?.audio_data_url) {
     suffix = '（本地语音/音频已定位，但当前模型接口未拿到可用音频；不要假装听过语音内容）';
   }
+  const contextSuffix = context ? `；前后聊天上下文=${context}` : '';
   if (m.type === 'file' && m.media?.file_name) {
-    return `[${m.time}] ${m.sender}${type}: 文件名=${m.media.file_name}${m.media.size ? `，大小=${m.media.size}B` : ''}${m.media.ext ? `，扩展名=${m.media.ext}` : ''}${suffix}`;
+    return `[${m.time}] ${m.sender}${type}: 文件名=${m.media.file_name}${m.media.size ? `，大小=${m.media.size}B` : ''}${m.media.ext ? `，扩展名=${m.media.ext}` : ''}${suffix}${contextSuffix}`;
   }
   if (m.type === 'quote' && m.media?.quote) {
     const quote = m.media.quote;
     const quoted = [quote.from, quote.content].filter(Boolean).join(': ');
-    return `[${m.time}] ${m.sender}${type}: ${m.media.title || m.content}${quoted ? `；引用原文=${quoted}` : ''}`;
+    return `[${m.time}] ${m.sender}${type}: ${m.media.title || m.content}${quoted ? `；引用原文=${quoted}` : ''}${contextSuffix}`;
   }
-  return `[${m.time}] ${m.sender}${type}: ${m.content}${suffix}${formatLinkPreviewLines(m.link_previews)}`;
+  return `[${m.time}] ${m.sender}${type}: ${m.content}${suffix}${contextSuffix}${formatLinkPreviewLines(m.link_previews)}`;
+}
+
+function buildNearbyChatContext(messages = [], index = 0) {
+  const before = collectNearbyContext(messages, index, -1).reverse();
+  const after = collectNearbyContext(messages, index, 1);
+  const parts = [
+    before.length ? `前文：${before.join(' / ')}` : '',
+    after.length ? `后文：${after.join(' / ')}` : '',
+  ].filter(Boolean);
+  return truncateText(parts.join('；'), MESSAGE_CONTEXT_TOTAL_CHARS);
+}
+
+function collectNearbyContext(messages = [], index = 0, direction = 1) {
+  const out = [];
+  for (let step = 1; step <= messages.length && out.length < MESSAGE_CONTEXT_NEIGHBORS; step++) {
+    const msg = messages[index + step * direction];
+    if (!msg) break;
+    const snippet = contextMessageSnippet(msg);
+    if (snippet) out.push(snippet);
+  }
+  return out;
+}
+
+function contextMessageSnippet(msg = {}) {
+  const sender = cleanField(msg.sender) || '未知发送人';
+  const time = cleanField(msg.time);
+  const text = cleanContextText(msg.content || mediaContextText(msg.media));
+  if (!text) return '';
+  return truncateText(`${time ? `${time} ` : ''}${sender}：${text}`, MESSAGE_CONTEXT_SNIPPET_CHARS);
+}
+
+function mediaContextText(media = {}) {
+  return [
+    media?.title,
+    media?.desc,
+    media?.file_name ? `文件 ${media.file_name}` : '',
+    media?.url ? '网页链接' : '',
+  ].filter(Boolean).join('，');
+}
+
+function cleanContextText(value) {
+  return cleanField(value)
+    .replace(/https?:\/\/\S+/gi, '[链接]')
+    .replace(/data:[^;\s]+;base64,\S+/gi, '[媒体数据]')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function truncateText(value, maxChars) {
+  const text = cleanField(value);
+  const limit = Math.max(20, Number(maxChars) || 120);
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
 function isVideoLikeMedia(media = {}) {
@@ -1527,11 +1597,13 @@ async function callJsonModel({ settings, model, groupName, since, until, message
     '每个 topics.summary 的第一句必须先写清结果、现状、结论、风险或待确认项；如果聊天没有形成明确结论，第一句要直接说明“未形成结论/仍待确认”，再说明分歧或缺口。',
     'topics.summary 不要以“群内讨论了”“围绕某话题”“成员分享了”“有人提到”等过程句开头；可以写“现状：...”“结果：...”“风险：...”“待确认：...”。',
     'topics.summary 后续再补充关键依据、影响范围和下一步，不要把过程流水账当成总结。优先回答：最后怎么样了、解决了吗、谁需要做什么、还卡在哪里、对群成员有什么用。',
+    '如果议题来自链接、图片、视频、语音或文件，summary 必须把内容和发送时间、发送人、前后聊天上下文关联起来：说明它在群聊里被用来证明什么、询问什么、推进什么或引出什么结论。上下文不足时必须写“聊天上下文不足，只能确认...”，不要写成脱离群聊的网页介绍或图片说明。',
     'todos/links 没有内容时返回空数组。',
     'todos 表示“后续跟进事项”，只有明确需要继续确认、处理、验证、报名、付款、交付或由某人/全群继续推进时才写；普通信息点、关键词列表、链接清单不要写进 todos。负责人不明确但确实要跟进时，owner 写“待认领”。',
     '不要输出面向单个账号的提醒栏目；有人被点名时，只有对全群有公共价值才写进 topics 或 todos，并使用群昵称。',
     'links 每项包含 title、url、summary、from、time；summary 必须说明这个网页链接是干什么的、和聊天上下文有什么关系，不能只重复 URL。',
     'links.summary 也要结果导向：说明这个网页能提供什么结论/入口/证据，以及群里为什么需要它；不要只写“用于讨论某话题”。',
+    'links.summary 必须优先使用“前后聊天上下文”和发链接那条消息来判断用途。格式上先写群聊用途或上下文状态，再补网页本身用途；例如“群里把它作为某配置的参考文档；网页本身是...”。如果前后没有任何可判断用途的消息，写“聊天上下文不足，当前只能确认该链接本身是...”。',
     'links 只允许真实 http(s) 网页链接；不要把图片、视频、音频直链、文件名、截图内容或没有 URL 的媒体内容写进 links。',
     '如果时间线里有“链接打开结果”，那是本地服务实际访问链接后得到的页面标题、描述和正文片段；总结 links 时必须优先基于这些打开结果。',
     '如果链接打开结果里出现 403、404、超时等失败状态，只能表述为“本程序/本地服务打开链接失败”，不要写成“群内反馈访问失败”或“群友访问失败”，除非聊天原文明确有人这么说。',
@@ -1545,9 +1617,9 @@ async function callJsonModel({ settings, model, groupName, since, until, message
     `时间窗：${since} ~ ${until}`,
     `任务模式：${mode}`,
     mergeMode ? '输入内容是“分段 N: {...}”形式的中间摘要，不是原始聊天。请保留每个分段里出现过的明确待办、重要网页链接、发送人、时间、图片/文件/语音相关结论和后续跟进点；只做去重、归并和提炼，不得省略独立事项。' : '',
-    imageCount ? `多模态消息数：${imageCount} 张图片。下面内容按消息时间顺序排列；图片块紧跟它对应的消息行，请把图片与该行的时间、发送人、前后聊天上下文关联。` : '',
+    imageCount ? `多模态消息数：${imageCount} 张图片。下面内容按消息时间顺序排列；图片块紧跟它对应的消息行，请把图片与该行的时间、发送人、前后聊天上下文关联；不要只描述画面，要说明图片在聊天里承担的含义或待确认点。` : '',
     audioCount ? `音频消息数：${audioCount} 条。若后续内容包含音频块，请尝试听取；若模型接口不支持音频，仍需保留该语音消息的时间、发送人和元信息，不要编造语音内容。` : '',
-    messageBundle?.linkPreviewCount ? `链接打开结果：${messageBundle.linkPreviewCount} 个。每个结果都附在对应消息行下方，请结合页面内容、发送时间、发送人和上下文总结链接用途；失败状态只代表本程序访问该网页失败，不代表群内成员反馈。` : '',
+    messageBundle?.linkPreviewCount ? `链接打开结果：${messageBundle.linkPreviewCount} 个。每个结果都附在对应消息行下方；对应消息行可能带有“前后聊天上下文”。请优先根据前后聊天上下文判断链接为什么被发，再结合页面内容总结用途；失败状态只代表本程序访问该网页失败，不代表群内成员反馈。` : '',
     '请按公共群纪要视角提炼真正有用的信息。每个议题先给结论/结果/现状，再给必要背景；没有结论就明确写“未形成结论/仍待确认”。保留明确的待办、重要网页链接及其用途说明、需要跟进的议题。',
   ].filter(Boolean).join('\n');
   const user = [
@@ -1673,6 +1745,7 @@ async function rewriteDigestVisibleTextToChinese({ raw, settings, model, signal 
     '必须保留顶层结构 headline、topics、todos、links。',
     'headline、topics.summary、todos.item、todos.deadline、links.summary 必须尽量使用中文表达。',
     'URL、代码标识、仓库名、产品名、模型名、币种、股票代码、链接原始标题、群昵称可以保留原文；但解释句、结论句、链接用途、错误说明必须中文。',
+    '改写 links.summary 时必须保留或补足聊天上下文关系：先说明群里为什么提到它、用它解决/证明/询问什么；如果上下文不足，明确写“聊天上下文不足”。不能只写网页本身介绍。',
     '不要保留 raw_timeline、_raw_timeline、_fallback_chunk、Model returned empty content、Encrypted content could not be decrypted、error 等内部字段或英文错误原文；如确需说明，用中文写“部分消息只保留了时间、发送人和媒体/链接元信息，内容仍待人工确认”。',
     'todos 只保留明确需要继续处理/确认/验证/报名/付款/交付/联系/修复/推进的事项；普通关键词列表、链接清单、信息点不要放入 todos。',
     'links.summary 必须说明网页链接是干什么的、和聊天上下文有什么关系；不能只复述 URL 或英文网页描述。',
@@ -2045,7 +2118,7 @@ function normalizeTopic(topic = {}) {
 
 function normalizeLink(link = {}) {
   const url = cleanField(link.url);
-  const summary = cleanLinkSummary(link.summary || link.description || link.context);
+  const summary = ensureLinkSummaryHasContext(cleanLinkSummary(link.summary || link.description || link.context));
   const title = cleanPublicLinkTitle(link.title) || '网页链接';
   return {
     title,
@@ -2054,6 +2127,18 @@ function normalizeLink(link = {}) {
     from: cleanField(link.from),
     time: cleanField(link.time),
   };
+}
+
+function ensureLinkSummaryHasContext(summary) {
+  const text = cleanField(summary);
+  if (!text) return '';
+  if (hasChatContextSignal(text) || /^本程序打开该链接时返回/.test(text)) return text;
+  if (/^聊天上下文不足/.test(text)) return text;
+  return `聊天上下文不足，当前只能确认：${text}`;
+}
+
+function hasChatContextSignal(value) {
+  return /群里|群聊|聊天|上下文|前文|后文|发来|发出|发送|发这个|发该|贴出|贴了|提到|询问|回复|讨论|针对|回应|延续|承接|前面|后面/.test(String(value || ''));
 }
 
 function publicFallbackTopic() {
