@@ -367,6 +367,14 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     }
   }
 
+  raw = await ensureDigestVisibleTextChinese({
+    raw,
+    settings,
+    model: llm.long_context_model || model,
+    signal,
+    onProgress,
+  });
+
   return normalizeDigest(raw, {
     groupName,
     since,
@@ -451,12 +459,7 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
   const seenTopics = new Set();
   for (const part of validParts) {
     for (const topic of arrayOf(part.topics)) {
-      const normalized = {
-        title: cleanField(topic.title) || '未命名议题',
-        participants: Array.isArray(topic.participants) ? topic.participants.map(cleanField).filter(Boolean).slice(0, 12) : [],
-        summary: cleanField(topic.summary),
-        need_followup: !!topic.need_followup,
-      };
+      const normalized = normalizeTopic(topic);
       if (!normalized.summary && normalized.title === '未命名议题') continue;
       const key = `${normalized.title}\n${normalized.summary.slice(0, 120)}`;
       if (seenTopics.has(key)) continue;
@@ -495,11 +498,7 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
   return {
     headline: pickLocalMergeHeadline(validParts) || '本时间窗分段摘要已生成，合并阶段使用本地兜底。',
     topics: topics.slice(0, 24),
-    todos: dedupeByJson(validParts.flatMap(part => arrayOf(part.todos)).map(todo => ({
-      owner: cleanField(todo.owner),
-      item: cleanField(todo.item),
-      deadline: cleanField(todo.deadline),
-    })).filter(todo => todo.item)).slice(0, 24),
+    todos: dedupeByJson(validParts.flatMap(part => arrayOf(part.todos)).map(normalizeTodo).filter(Boolean)).slice(0, 24),
     links: dedupeLinks(validParts.flatMap(part => arrayOf(part.links))).slice(0, 30),
   };
 }
@@ -1271,7 +1270,7 @@ async function fetchAiLinkResearchBatch(urls, settings, signal = null, onProgres
     },
     input: [
       '你是链接研究助手。请用可用的联网搜索/打开能力核查下面这些聊天链接。',
-      '每个链接都要尽量返回它是做什么的、和页面/仓库/文档的核心用途。不能访问时 summary 写空字符串，accessed=false。',
+      '每个链接都要尽量返回它是做什么的、和页面/仓库/文档的核心用途。summary 必须使用简体中文；URL、仓库名、产品名可以保留原文。不能访问时 summary 写空字符串，accessed=false。',
       '只输出符合 schema 的 JSON；sources 放实际依据 URL，不要编造。',
       '',
       ...urls.map((item, index) => `${index + 1}. ${item}`),
@@ -1523,17 +1522,20 @@ async function callJsonModel({ settings, model, groupName, since, until, message
     '你是一个微信群公共纪要助手。总结给群内所有成员看，只输出严格 JSON，不要 Markdown，不要解释。',
     'JSON 字段必须包含 headline、topics、todos、links。',
     'headline 不超过 50 个中文字符；topics 每项包含 title、participants、summary、need_followup。',
+    '总结正文必须使用简体中文：headline、topics.summary、todos.item、todos.deadline、links.summary 这些解释性内容要中文表达。URL、代码标识、项目名、模型名、链接原始标题和群成员昵称可以保留原文，但不要输出英文说明句、英文连接词或英文错误原文。',
     '必须结果导向，不要只写“大家讨论了什么/分享了什么/有人说了什么”。headline 要写本时间窗最重要的结论或当前状态。',
     '每个 topics.summary 的第一句必须先写清结果、现状、结论、风险或待确认项；如果聊天没有形成明确结论，第一句要直接说明“未形成结论/仍待确认”，再说明分歧或缺口。',
     'topics.summary 不要以“群内讨论了”“围绕某话题”“成员分享了”“有人提到”等过程句开头；可以写“现状：...”“结果：...”“风险：...”“待确认：...”。',
     'topics.summary 后续再补充关键依据、影响范围和下一步，不要把过程流水账当成总结。优先回答：最后怎么样了、解决了吗、谁需要做什么、还卡在哪里、对群成员有什么用。',
     'todos/links 没有内容时返回空数组。',
+    'todos 表示“后续跟进事项”，只有明确需要继续确认、处理、验证、报名、付款、交付或由某人/全群继续推进时才写；普通信息点、关键词列表、链接清单不要写进 todos。负责人不明确但确实要跟进时，owner 写“待认领”。',
     '不要输出面向单个账号的提醒栏目；有人被点名时，只有对全群有公共价值才写进 topics 或 todos，并使用群昵称。',
     'links 每项包含 title、url、summary、from、time；summary 必须说明这个网页链接是干什么的、和聊天上下文有什么关系，不能只重复 URL。',
     'links.summary 也要结果导向：说明这个网页能提供什么结论/入口/证据，以及群里为什么需要它；不要只写“用于讨论某话题”。',
     'links 只允许真实 http(s) 网页链接；不要把图片、视频、音频直链、文件名、截图内容或没有 URL 的媒体内容写进 links。',
     '如果时间线里有“链接打开结果”，那是本地服务实际访问链接后得到的页面标题、描述和正文片段；总结 links 时必须优先基于这些打开结果。',
     '如果链接打开结果里出现 403、404、超时等失败状态，只能表述为“本程序/本地服务打开链接失败”，不要写成“群内反馈访问失败”或“群友访问失败”，除非聊天原文明确有人这么说。',
+    '不要把 raw_timeline、_raw_timeline、_fallback_chunk、Model returned empty content、Encrypted content could not be decrypted、error 等内部字段或错误原文写入任何可见字段；如需说明，只能用中文写“部分消息仅保留了时间、发送人和媒体/链接元信息，内容仍待人工确认”。',
     '如果消息附带图片或视频关键帧，请结合视觉内容进行判断；如果接口支持音频输入并收到音频块，可以结合音频内容；如果只是文件或未转写语音，只能根据文件名、扩展名、时长和上下文判断，不要假装读取或听过正文。',
     mergeMode ? '当前输入是全量请求失败后的多个分段 JSON 摘要。你正在合并分段摘要，必须综合所有分段；不要因为后段覆盖前段而丢掉链接、待办、参与人、来源时间或需要跟进议题。links/todos/topics 要从各分段去重保留，冲突时合并信息而不是删除。合并时必须把分段里的过程描述改写成全局结果、最终状态、未解决问题和下一步。' : '',
     mergeMode ? '如果某段带有 _fallback_chunk 或 _raw_timeline，表示该分段模型请求返回空内容或异常。你必须把 _raw_timeline 当作该段原始聊天时间线继续纳入总结，保留其中的时间、发送人、文件/链接/媒体元信息；但不能编造未成功识别的图片画面或语音内容。' : '',
@@ -1628,6 +1630,7 @@ async function repairJsonModelText({ settings, model, rawText, parseMessage, sig
     '不要新增事实，不要扩写总结；无法确定的字段用空字符串或空数组。',
     '顶层必须包含 headline、topics、todos、links。',
     'topics 每项包含 title、participants、summary、need_followup；todos 每项包含 owner、item、deadline；links 每项包含 title、url、summary、from、time。',
+    '修复后的总结正文继续保持简体中文；URL、项目名、链接原始标题、昵称可保留原文；不要保留 raw_timeline、_fallback_chunk、Model returned empty content、error 等内部错误原文。',
   ].join('\n');
   const intro = '修复上一次模型返回的无效 JSON。';
   const user = [
@@ -1640,6 +1643,48 @@ async function repairJsonModelText({ settings, model, rawText, parseMessage, sig
   return settings.llm.provider === 'anthropic'
     ? callAnthropic({ settings, model, system, user, intro, blocks: [], signal, onProgress, mode: 'repair' })
     : callOpenAI({ settings, model, system, user, intro, blocks: [], signal, onProgress, mode: 'repair' });
+}
+
+async function ensureDigestVisibleTextChinese({ raw, settings, model, signal = null, onProgress = null }) {
+  if (!digestNeedsChineseRewrite(raw)) return raw;
+  notifyProgress(onProgress, {
+    phase: 'llm_zh_rewrite',
+    label: 'AI 总结 · 中文改写',
+    detail: '检测到摘要正文包含英文说明，正在改写为中文',
+  });
+  try {
+    return await rewriteDigestVisibleTextToChinese({ raw, settings, model, signal, onProgress });
+  } catch (err) {
+    if (err?.status === 499 || signal?.aborted) throw err;
+    notifyProgress(onProgress, {
+      phase: 'llm_zh_rewrite_fallback',
+      label: 'AI 总结 · 中文改写兜底',
+      detail: '中文改写失败，改用本地清洗避免内部英文原文进入长图',
+    });
+    return raw;
+  }
+}
+
+async function rewriteDigestVisibleTextToChinese({ raw, settings, model, signal = null, onProgress = null }) {
+  throwIfAborted(signal);
+  const system = [
+    '你是微信群公共纪要的中文改写编辑。只输出严格 JSON，不要 Markdown，不要解释。',
+    '输入已经是摘要 JSON，不要新增事实，不要删除重要事实，只把面向读者的可见说明改写成自然简体中文。',
+    '必须保留顶层结构 headline、topics、todos、links。',
+    'headline、topics.summary、todos.item、todos.deadline、links.summary 必须尽量使用中文表达。',
+    'URL、代码标识、仓库名、产品名、模型名、币种、股票代码、链接原始标题、群昵称可以保留原文；但解释句、结论句、链接用途、错误说明必须中文。',
+    '不要保留 raw_timeline、_raw_timeline、_fallback_chunk、Model returned empty content、Encrypted content could not be decrypted、error 等内部字段或英文错误原文；如确需说明，用中文写“部分消息只保留了时间、发送人和媒体/链接元信息，内容仍待人工确认”。',
+    'todos 只保留明确需要继续处理/确认/验证/报名/付款/交付/联系/修复/推进的事项；普通关键词列表、链接清单、信息点不要放入 todos。',
+    'links.summary 必须说明网页链接是干什么的、和聊天上下文有什么关系；不能只复述 URL 或英文网页描述。',
+  ].join('\n');
+  const user = [
+    '请把下面摘要 JSON 的可见正文改写成中文，保留事实和 JSON schema：',
+    JSON.stringify(raw || {}, null, 2),
+  ].join('\n');
+  const text = settings.llm.provider === 'anthropic'
+    ? await callAnthropic({ settings, model, system, user, intro: '中文改写摘要 JSON', blocks: [], signal, onProgress, mode: 'rewrite/zh' })
+    : await callOpenAI({ settings, model, system, user, intro: '中文改写摘要 JSON', blocks: [], signal, onProgress, mode: 'rewrite/zh' });
+  return parseJsonModelText(text);
 }
 
 function withoutAudioBlocksForRetry(blocks = []) {
@@ -1924,6 +1969,11 @@ function parseJsonModelText(text) {
 
 function normalizeDigest(raw, meta) {
   const digestId = crypto.randomBytes(16).toString('hex');
+  const todos = arrayOf(raw?.todos).map(normalizeTodo).filter(Boolean);
+  const topics = dedupeTopics(arrayOf(raw?.topics).map(normalizeTopic).filter(t => t.summary || t.title !== '未命名议题'));
+  const links = arrayOf(raw?.links)
+    .map(normalizeLink)
+    .filter(l => isAnalyzableWebLinkUrl(l.url));
   return {
     digest_id: digestId,
     group: meta.groupName,
@@ -1931,28 +1981,23 @@ function normalizeDigest(raw, meta) {
     until: meta.until,
     message_count: meta.messageCount,
     model: meta.model,
-    headline: String(raw?.headline || '本时间窗没有提炼出明确结论。').slice(0, 120),
+    headline: cleanHeadline(raw?.headline),
     mentions_me: [],
-    todos: arrayOf(raw?.todos)
-      .map(t => ({ owner: cleanField(t.owner), item: cleanField(t.item), deadline: cleanField(t.deadline) }))
-      .filter(t => t.item),
-    topics: arrayOf(raw?.topics).map(t => ({
-      title: cleanField(t.title) || '未命名议题',
-      participants: Array.isArray(t.participants) ? t.participants.map(cleanField).filter(Boolean).slice(0, 12) : [],
-      summary: cleanField(t.summary),
-      need_followup: !!t.need_followup,
-    })).filter(t => t.summary || t.title !== '未命名议题'),
-    links: arrayOf(raw?.links)
-      .map(l => ({
-        title: cleanField(l.title),
-        url: cleanField(l.url),
-        summary: cleanLinkSummary(l.summary || l.description || l.context),
-        from: cleanField(l.from),
-        time: cleanField(l.time),
-      }))
-      .filter(l => isAnalyzableWebLinkUrl(l.url)),
+    todos,
+    topics,
+    links,
     created_at: new Date().toISOString(),
   };
+}
+
+function digestNeedsChineseRewrite(raw) {
+  const visibleTexts = [
+    raw?.headline,
+    ...arrayOf(raw?.topics).flatMap(item => [item?.summary]),
+    ...arrayOf(raw?.todos).flatMap(item => [item?.item, item?.deadline]),
+    ...arrayOf(raw?.links).flatMap(item => [item?.summary || item?.description || item?.context]),
+  ].map(cleanField).filter(Boolean);
+  return visibleTexts.some(text => isInternalVisibleText(text) || isEnglishHeavyText(text));
 }
 
 function arrayOf(value) {
@@ -1963,12 +2008,141 @@ function cleanField(value) {
   return String(value || '').trim();
 }
 
-function cleanLinkSummary(value) {
+const INTERNAL_VISIBLE_ERROR_RE = /(?:_?raw_timeline|_fallback_chunk|Model returned empty content|Messages returned empty content|Encrypted content could not be decrypted|分段错误|raw timeline)/i;
+const TODO_ACTION_RE = /确认|处理|跟进|补充|整理|报名|提交|付款|测试|验证|联系|修复|发布|更新|迁移|查看|统计|安排|提醒|复盘|决定|对齐|收集|申请|注册|认领|补发|回复|开通|关闭|领取|报销|交付|检查|排查|推进|落实|回访|同步/;
+const CJK_RE = /[\u3400-\u9fff]/;
+
+function cleanHeadline(value) {
+  const text = cleanPublicText(value).slice(0, 120);
+  if (!text) return '本时间窗没有提炼出明确结论。';
+  if (isEnglishHeavyText(text)) return '本时间窗重点见下方议题。';
+  return text;
+}
+
+function normalizeTodo(todo = {}) {
+  const item = cleanPublicText(todo.item);
+  if (!item || isInternalVisibleText(item) || isEnglishHeavyText(item) || looksLikeKeywordOnlyTodo(item)) return null;
+  return {
+    owner: isEnglishHeavyText(todo.owner) ? '' : (cleanPublicText(todo.owner) || ''),
+    item,
+    deadline: isEnglishHeavyText(todo.deadline) ? '' : (cleanPublicText(todo.deadline) || ''),
+  };
+}
+
+function normalizeTopic(topic = {}) {
+  if (isInternalVisibleText(`${topic.title || ''} ${topic.summary || ''}`)) return publicFallbackTopic();
+  const summary = cleanPublicSummary(
+    topic.summary,
+    '该议题包含较多英文说明，已保留标题和参与人；具体结论请结合原聊天确认。',
+  );
+  return {
+    title: cleanPublicTopicTitle(topic.title) || '未命名议题',
+    participants: Array.isArray(topic.participants) ? topic.participants.map(cleanField).filter(Boolean).slice(0, 12) : [],
+    summary,
+    need_followup: !!topic.need_followup,
+  };
+}
+
+function normalizeLink(link = {}) {
+  const url = cleanField(link.url);
+  const summary = cleanLinkSummary(link.summary || link.description || link.context);
+  const title = cleanPublicLinkTitle(link.title) || '网页链接';
+  return {
+    title,
+    url,
+    summary,
+    from: cleanField(link.from),
+    time: cleanField(link.time),
+  };
+}
+
+function publicFallbackTopic() {
+  return {
+    title: '部分消息仍待人工确认',
+    participants: [],
+    summary: '部分分段的模型请求未返回可用内容，系统只保留了这些消息的时间、发送人、文件、链接和媒体元信息；未识别出的图片画面或语音内容需要结合原聊天确认。',
+    need_followup: true,
+  };
+}
+
+function dedupeTopics(items) {
+  const out = [];
+  const seen = new Set();
+  for (const item of items) {
+    const key = `${item.title}\n${item.summary}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function cleanPublicText(value) {
   return cleanField(value)
+    .replace(/_raw_timeline/gi, '原始时间线')
+    .replace(/raw_timeline/gi, '原始时间线')
+    .replace(/_fallback_chunk/gi, '分段兜底')
+    .replace(/Model returned empty content/gi, '模型未返回可用内容')
+    .replace(/Messages returned empty content/gi, '模型未返回可用内容')
+    .replace(/Encrypted content could not be decrypted or parsed/gi, '部分加密消息未能解密或解析')
+    .replace(/Encrypted content could not be decrypted/gi, '部分加密消息未能解密')
+    .replace(/\berror\b/gi, '错误')
+    .replace(/\bby\b/g, '发送人')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanPublicTopicTitle(value) {
+  const text = cleanPublicText(value);
+  if (!text) return '';
+  if (isInternalVisibleText(text)) return '';
+  return text;
+}
+
+function cleanPublicLinkTitle(value) {
+  const text = cleanField(value);
+  if (!text || isInternalVisibleText(text)) return '';
+  return text;
+}
+
+function cleanPublicSummary(value, fallback) {
+  const text = cleanPublicText(value);
+  if (!text) return '';
+  if (isInternalVisibleText(text)) return fallback;
+  if (isEnglishHeavyText(text)) return fallback;
+  return text;
+}
+
+function isInternalVisibleText(value) {
+  return INTERNAL_VISIBLE_ERROR_RE.test(String(value || ''));
+}
+
+function looksLikeKeywordOnlyTodo(value) {
+  const text = String(value || '').trim();
+  if (!text) return true;
+  if (TODO_ACTION_RE.test(text)) return false;
+  const separatorCount = (text.match(/[|/／,，、]/g) || []).length;
+  return separatorCount >= 2 && (!CJK_RE.test(text) || !TODO_ACTION_RE.test(text));
+}
+
+function isEnglishHeavyText(value) {
+  const text = cleanField(value).replace(/https?:\/\/\S+/gi, '').replace(/[0-9\s._:/@#?=&%+\-()|[\]]/g, '');
+  if (text.length < 6) return false;
+  const asciiLetters = (text.match(/[A-Za-z]/g) || []).length;
+  const cjk = (text.match(/[\u3400-\u9fff]/g) || []).length;
+  return asciiLetters >= 6 && asciiLetters > cjk * 2;
+}
+
+function cleanLinkSummary(value) {
+  const text = cleanPublicText(value)
     .replace(/群内反馈访问时返回\s*HTTP?\s*(\d{3})/gi, '本程序打开该链接时返回 HTTP $1')
     .replace(/群内反馈访问时返回\s*(\d{3})/g, '本程序打开该链接时返回 HTTP $1')
     .replace(/群内反馈访问返回\s*HTTP?\s*(\d{3})/gi, '本程序打开该链接时返回 HTTP $1')
     .replace(/群内反馈访问返回\s*(\d{3})/g, '本程序打开该链接时返回 HTTP $1');
+  const statusOnly = text.match(/^HTTP?\s*(\d{3})$/i) || text.match(/^(\d{3})$/);
+  if (statusOnly) return `本程序打开该链接时返回 ${statusOnly[1]}，未能提取页面内容。`;
+  if (isEnglishHeavyText(text)) return '该网页链接已保留，但当前没有可靠中文摘要；请结合发送人、时间和聊天上下文判断用途。';
+  return text;
 }
 
 function httpError(status, message) {

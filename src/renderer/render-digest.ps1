@@ -266,12 +266,15 @@ $labelSelectedFrom = Utf8Label 'IMK3IOW3suS7jiA='
 $labelSelectedMiddle = Utf8Label 'IOadoeS4reaIquWPliA='
 $labelCountSuffix = Utf8Label 'IOadoQ=='
 $labelHeadline = Utf8Label '5LiA5Y+l6K+d5oC76KeI'
-$labelTodosPrefix = Utf8Label '5b6F5Yqe77yI'
+$labelTodosPrefix = Utf8Label '5ZCO57ut6Lef6L+b77yI'
 $labelRightParen = Utf8Label '77yJ'
 $labelTopicsPrefix = Utf8Label '6K6u6aKY77yI'
 $labelParticipants = Utf8Label '5Y+C5LiO77ya'
 $labelListSep = Utf8Label '44CB'
 $labelImportantLinks = Utf8Label '6YeN6KaB6ZO+5o6l'
+$labelMetaSep = Utf8Label 'IMK3IA=='
+$labelSender = Utf8Label '5Y+R6YCB5Lq677ya'
+$labelTime = Utf8Label '5pe26Ze077ya'
 $labelCreatedAt = Utf8Label '55Sf5oiQ5LqOIA=='
 $labelModel = Utf8Label 'ICAgIOaooeWei++8mg=='
 $labelLocalProcessing = Utf8Label 'ICAgIOacrOWcsOivu+WPliDCtyBBSSDmsYfmgLs='
@@ -509,8 +512,11 @@ if ($digest.links -and $digest.links.Count -gt 0) {
       $innerY = DrawWrappedText $graphics ([string]$link.summary) $fontBody $brushText ($padding + 62) $innerY ($cardWidth - 96) (S 62)
     }
     if ($link.url) { $innerY = DrawWrappedText $graphics ([string]$link.url) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
-    $by = @($link.from, $link.time) | Where-Object { $_ }
-    if ($by.Count -gt 0) { $innerY = DrawWrappedText $graphics ($by -join ' @ ') $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
+    $by = @(
+      if ($link.from) { "$labelSender$($link.from)" }
+      if ($link.time) { "$labelTime$($link.time)" }
+    ) | Where-Object { $_ }
+    if ($by.Count -gt 0) { $innerY = DrawWrappedText $graphics ($by -join $labelMetaSep) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
     if ($linkIndex -lt ($linkCount - 1)) { $innerY += (S 20) } else { $innerY += (S 16) }
     $linkIndex++
   }
@@ -533,8 +539,11 @@ if ($digest.links -and $digest.links.Count -gt 0) {
       $innerY = DrawWrappedText $graphics ([string]$link.summary) $fontBody $brushText ($padding + 62) $innerY ($cardWidth - 96) (S 62)
     }
     if ($link.url) { $innerY = DrawWrappedText $graphics ([string]$link.url) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
-    $by = @($link.from, $link.time) | Where-Object { $_ }
-    if ($by.Count -gt 0) { $innerY = DrawWrappedText $graphics ($by -join ' @ ') $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
+    $by = @(
+      if ($link.from) { "$labelSender$($link.from)" }
+      if ($link.time) { "$labelTime$($link.time)" }
+    ) | Where-Object { $_ }
+    if ($by.Count -gt 0) { $innerY = DrawWrappedText $graphics ($by -join $labelMetaSep) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
     if ($linkIndex -lt ($linkCount - 1)) { $innerY += (S 20) } else { $innerY += (S 16) }
     $linkIndex++
   }

@@ -1558,12 +1558,12 @@ function drawDigestCanvas(d, targetCanvas = null) {
     });
     y += s(6);
 
-    // todos
+    // 后续跟进
     if (d.todos?.length) {
       y = drawCard(ctx, y, COLORS, dryRun, c => {
         c.fillStyle = COLORS.primary;
         c.font = font(600, 20);
-        c.fillText(`✓ 待办（${d.todos.length}）`, padding + cardInset, y + s(10));
+        c.fillText(`✓ 后续跟进（${d.todos.length}）`, padding + cardInset, y + s(10));
         let yy = y + s(44);
         for (const t of d.todos) {
           c.fillStyle = COLORS.text;
@@ -1674,7 +1674,10 @@ function drawDigestCanvas(d, targetCanvas = null) {
             const urlLines = wrapText(c, l.url, W - padding * 2 - bodyIndent - cardInset, font(400, 12));
             for (const ln of urlLines) { c.fillText(ln, padding + bodyIndent, yy); yy += s(22); }
           }
-          const source = [l.from, l.time].filter(Boolean).join(' @ ');
+          const source = [
+            l.from ? `发送人：${l.from}` : '',
+            l.time ? `时间：${l.time}` : '',
+          ].filter(Boolean).join(' · ');
           if (source) {
             const sourceLines = wrapText(c, source, W - padding * 2 - bodyIndent - cardInset, font(400, 12));
             for (const ln of sourceLines) { c.fillText(ln, padding + bodyIndent, yy); yy += s(22); }
@@ -1736,9 +1739,9 @@ function renderTextPreviews(digests) {
     `## 一句话总览`,
     d.headline,
     '',
-    d.todos?.length ? `## 待办\n${d.todos.map(t => `- ${t.owner || '未指定'}：${t.item}${t.deadline ? `（${t.deadline}）` : ''}`).join('\n')}` : '',
+    d.todos?.length ? `## 后续跟进\n${d.todos.map(t => `- ${t.owner || '未指定'}：${t.item}${t.deadline ? `（${t.deadline}）` : ''}`).join('\n')}` : '',
     d.topics?.length ? `## 议题\n${d.topics.map((t, i) => `${i + 1}. ${t.title}\n   参与：${(t.participants || []).join('、') || '未识别'}\n   ${t.summary}${t.need_followup ? '\n   需要跟进' : ''}`).join('\n\n')}` : '',
-    d.links?.length ? `## 链接\n${d.links.map(l => `- ${l.title || l.summary || l.url}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${l.url}>` : ''}${l.from ? ` by ${l.from}` : ''}${l.time ? ` @ ${l.time}` : ''}`).join('\n')}` : '',
+    d.links?.length ? `## 链接\n${d.links.map(l => `- ${l.title || l.summary || l.url}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${l.url}>` : ''}${l.from ? ` 发送人：${l.from}` : ''}${l.time ? ` 时间：${l.time}` : ''}`).join('\n')}` : '',
   ].filter(Boolean).join('\n\n')).join('\n\n---\n\n');
   _state_digest.lastTextMarkdown = markdown;
   _state_digest.lastTextTitle = (digests || []).map(d => d.group).filter(Boolean).join('_') || '文本预览';
