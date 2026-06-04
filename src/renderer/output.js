@@ -251,13 +251,13 @@ function cleanQuotes(value) {
 }
 
 function cleanLinks(value) {
-  return Array.isArray(value) ? value.map(item => ({
+  return publicDigestLinks(Array.isArray(value) ? value.map(item => ({
     title: String(item?.title || ''),
     url: String(item?.url || ''),
     summary: cleanLinkSummary(item?.summary || ''),
     from: String(item?.from || ''),
     time: String(item?.time || ''),
-  })).filter(item => isAnalyzableWebLinkUrl(item.url)).slice(0, 100) : [];
+  })).filter(item => isAnalyzableWebLinkUrl(item.url)) : []);
 }
 
 function cleanLinkSummary(value) {
@@ -272,10 +272,44 @@ const DIRECT_MEDIA_URL_RE = /\.(?:avif|bmp|gif|heic|heif|ico|jpe?g|png|svg|tiff?
 function isAnalyzableWebLinkUrl(value) {
   try {
     const parsed = new URL(String(value || '').trim());
-    return ['http:', 'https:'].includes(parsed.protocol) && !DIRECT_MEDIA_URL_RE.test(parsed.href);
+    return ['http:', 'https:'].includes(parsed.protocol) && !DIRECT_MEDIA_URL_RE.test(parsed.href) && !isIgnoredWebLinkUrl(parsed);
   } catch {
     return false;
   }
+}
+
+function publicDigestLinks(links, limit = 12) {
+  return links
+    .filter(link => !isLowValueDigestLink(link))
+    .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
+    .slice(0, limit);
+}
+
+function digestLinkScore(link = {}) {
+  const summary = String(link.summary || '');
+  let score = 0;
+  if (/群里|群聊|聊天|上下文|前文|后文|发来|发出|发送|询问|讨论|针对|回应/.test(summary)) score += 8;
+  if (/本程序打开该链接时返回|打开超时|加载中|环境异常|没有可靠中文摘要|分段模型失败|聊天上下文不足/.test(summary)) score -= 5;
+  if (/报价|文档|官网|仓库|注册|入口|教程|新闻|快讯|公告|优惠|充值|支付|模型|API|代码|下载/.test(`${link.title || ''} ${summary}`)) score += 3;
+  if (/^https?:\/\//i.test(String(link.title || '').trim())) score -= 2;
+  return score;
+}
+
+function isLowValueDigestLink(link = {}) {
+  const summary = String(link.summary || '');
+  if (/该网页链接出现在本分段原始消息中；分段模型失败/.test(summary)) return true;
+  if (/该网页链接已保留，但当前没有可靠中文摘要/.test(summary)) return true;
+  if (/聊天上下文不足，当前只能确认：(?:环境异常|加载中|打开超时|Tip|Favorites)/.test(summary)) return true;
+  return false;
+}
+
+function isIgnoredWebLinkUrl(parsed) {
+  const host = parsed.hostname.toLowerCase();
+  const pathname = parsed.pathname.toLowerCase();
+  if (host === 'mp.weixin.qq.com' && (pathname.startsWith('/mp/wappoc_appmsgcaptcha') || pathname.startsWith('/mp/waerrpage'))) return true;
+  if (host === 'support.weixin.qq.com' && (pathname.startsWith('/cgi-bin/mmsupport-bin/readtemplate') || pathname.startsWith('/update'))) return true;
+  if (host === 'wxapp.tenpay.com' && pathname.startsWith('/mmpayhb/')) return true;
+  return false;
 }
 
 async function writeBinaryAtomic(filePath, buffer) {

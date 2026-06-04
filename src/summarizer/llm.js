@@ -458,6 +458,12 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
 function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
   const validParts = arrayOf(parts).filter(part => part && typeof part === 'object');
   const fallbackParts = validParts.filter(part => part._fallback_chunk);
+  if (fallbackParts.length) {
+    throw httpError(
+      502,
+      `AI 分段有 ${fallbackParts.length}/${Math.max(1, validParts.length)} 段未返回可用摘要，合并阶段也未能补回；为避免生成不完整或误导性的群总结，本次未保存长图。可稍后重试，或缩短时间范围再生成。`,
+    );
+  }
   const topics = [];
   const seenTopics = new Set();
   for (const part of validParts) {
@@ -470,43 +476,23 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
       topics.push(normalized);
     }
   }
-  if (fallbackParts.length) {
-    const fallbackMessages = fallbackParts
-      .map(part => {
-        const match = cleanField(part.topics?.[0]?.summary).match(/共\s*(\d+)\s*条消息/);
-        return match ? Number(match[1]) : 0;
-      })
-      .reduce((sum, value) => sum + value, 0);
-    const participants = [...new Set(fallbackParts.flatMap(part => arrayOf(part.topics?.[0]?.participants).map(cleanField).filter(Boolean)))].slice(0, 12);
-    topics.push({
-      title: '部分分段仅按原始时间线兜底',
-      category: '仍需确认',
-      participants,
-      summary: [
-        '待确认：部分分段的模型请求持续返回空内容，本地合并已保留这些分段的时间、发送人、文件/链接/媒体元信息。',
-        fallbackMessages ? `涉及约 ${fallbackMessages} 条消息。` : '',
-        '未被模型成功识别的图片画面或语音内容不会被编造，需要结合原聊天确认。',
-      ].filter(Boolean).join(' '),
-      need_followup: true,
-    });
-  }
-  if (!topics.length) {
-    topics.push({
-      title: '分段摘要已完成但合并需确认',
-      category: '仍需确认',
-      participants: [],
-      summary: `待确认：${groupName} 在 ${since} ~ ${until} 的分段摘要已生成，但 AI 合并阶段返回空内容；本地兜底没有提炼出明确议题。错误：${sanitizeText(error?.message || String(error))}`,
-      need_followup: true,
-    });
+  const todos = dedupeByJson(validParts.flatMap(part => arrayOf(part.todos)).map(normalizeTodo).filter(Boolean)).slice(0, 24);
+  const links = publicDigestLinks(dedupeLinks(validParts.flatMap(part => arrayOf(part.links))));
+  const quotes = dedupeByJson(validParts.flatMap(part => arrayOf(part.quotes)).map(normalizeQuote).filter(Boolean)).slice(0, 8);
+  if (!topics.length && !todos.length && !links.length && !quotes.length) {
+    throw httpError(
+      502,
+      `AI 分段摘要已完成，但合并阶段返回空内容，本地合并也没有提炼出可用事项；为避免生成空摘要，本次未保存长图。错误：${sanitizeText(error?.message || String(error))}`,
+    );
   }
 
   return {
-    headline: pickLocalMergeHeadline(validParts) || '本时间窗分段摘要已生成，合并阶段使用本地兜底。',
+    headline: pickLocalMergeHeadline(validParts) || '本时间窗已按分段摘要整理，重点见下方。',
     highlights: pickLocalMergeHighlights(validParts),
     topics: topics.slice(0, 24),
-    todos: dedupeByJson(validParts.flatMap(part => arrayOf(part.todos)).map(normalizeTodo).filter(Boolean)).slice(0, 24),
-    links: dedupeLinks(validParts.flatMap(part => arrayOf(part.links))).slice(0, 30),
-    quotes: dedupeByJson(validParts.flatMap(part => arrayOf(part.quotes)).map(normalizeQuote).filter(Boolean)).slice(0, 8),
+    todos,
+    links,
+    quotes,
   };
 }
 
@@ -564,6 +550,33 @@ function dedupeLinks(links) {
     });
   }
   return out;
+}
+
+function publicDigestLinks(links, limit = 12) {
+  return arrayOf(links)
+    .filter(link => !isLowValueDigestLink(link))
+    .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
+    .slice(0, limit);
+}
+
+function digestLinkScore(link = {}) {
+  const summary = cleanField(link.summary);
+  let score = 0;
+  if (hasChatContextSignal(summary)) score += 8;
+  if (/本程序打开该链接时返回|打开超时|加载中|环境异常|没有可靠中文摘要|分段模型失败|聊天上下文不足/.test(summary)) score -= 5;
+  if (/报价|文档|官网|仓库|注册|入口|教程|新闻|快讯|公告|优惠|充值|支付|模型|API|代码|下载/.test(`${link.title || ''} ${summary}`)) score += 3;
+  if (/^https?:\/\//i.test(cleanField(link.title))) score -= 2;
+  return score;
+}
+
+function isLowValueDigestLink(link = {}) {
+  const url = normalizeHttpUrl(link.url);
+  if (!url || !isAnalyzableWebLinkUrl(url)) return true;
+  const summary = cleanField(link.summary);
+  if (/该网页链接出现在本分段原始消息中；分段模型失败/.test(summary)) return true;
+  if (/该网页链接已保留，但当前没有可靠中文摘要/.test(summary)) return true;
+  if (/聊天上下文不足，当前只能确认：(?:环境异常|加载中|打开超时|Tip|Favorites)/.test(summary)) return true;
+  return false;
 }
 
 async function summarizeChunkWithFallback({ settings, model, groupName, since, until, chunk, index, total, signal, onProgress }) {
@@ -1083,7 +1096,21 @@ const DIRECT_MEDIA_URL_RE = /\.(?:avif|bmp|gif|heic|heif|ico|jpe?g|png|svg|tiff?
 
 function isAnalyzableWebLinkUrl(value) {
   const url = normalizeHttpUrl(value);
-  return !!url && !DIRECT_MEDIA_URL_RE.test(url);
+  return !!url && !DIRECT_MEDIA_URL_RE.test(url) && !isIgnoredWebLinkUrl(url);
+}
+
+function isIgnoredWebLinkUrl(value) {
+  try {
+    const parsed = new URL(String(value || '').trim());
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.toLowerCase();
+    if (host === 'mp.weixin.qq.com' && (pathname.startsWith('/mp/wappoc_appmsgcaptcha') || pathname.startsWith('/mp/waerrpage'))) return true;
+    if (host === 'support.weixin.qq.com' && (pathname.startsWith('/cgi-bin/mmsupport-bin/readtemplate') || pathname.startsWith('/update'))) return true;
+    if (host === 'wxapp.tenpay.com' && pathname.startsWith('/mmpayhb/')) return true;
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function isMediaContentType(contentType = '') {
@@ -2086,7 +2113,7 @@ function normalizeDigest(raw, meta) {
     mentions_me: [],
     todos,
     topics,
-    links,
+    links: publicDigestLinks(links),
     quotes,
     created_at: new Date().toISOString(),
   };

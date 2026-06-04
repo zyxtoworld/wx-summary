@@ -1544,11 +1544,71 @@ function digestQuotesForRender(d = {}) {
     .slice(0, 8);
 }
 
+function digestLinksForRender(d = {}) {
+  const links = Array.isArray(d.links) ? d.links : [];
+  return links
+    .filter(link => link && !isLowValueDigestLink(link) && isRenderableDigestUrl(link.url))
+    .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
+    .slice(0, 12);
+}
+
+function digestLinkScore(link = {}) {
+  const summary = String(link.summary || '');
+  let score = 0;
+  if (/群里|群聊|聊天|上下文|前文|后文|发来|发出|发送|询问|讨论|针对|回应/.test(summary)) score += 8;
+  if (/本程序打开该链接时返回|打开超时|加载中|环境异常|没有可靠中文摘要|分段模型失败|聊天上下文不足/.test(summary)) score -= 5;
+  if (/报价|文档|官网|仓库|注册|入口|教程|新闻|快讯|公告|优惠|充值|支付|模型|API|代码|下载/.test(`${link.title || ''} ${summary}`)) score += 3;
+  if (/^https?:\/\//i.test(String(link.title || '').trim())) score -= 2;
+  return score;
+}
+
+function isLowValueDigestLink(link = {}) {
+  const summary = String(link.summary || '');
+  if (/该网页链接出现在本分段原始消息中；分段模型失败/.test(summary)) return true;
+  if (/该网页链接已保留，但当前没有可靠中文摘要/.test(summary)) return true;
+  if (/聊天上下文不足，当前只能确认：(?:环境异常|加载中|打开超时|Tip|Favorites)/.test(summary)) return true;
+  return false;
+}
+
+function isRenderableDigestUrl(value) {
+  try {
+    const parsed = new URL(String(value || '').trim());
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.toLowerCase();
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    if (host === 'mp.weixin.qq.com' && (pathname.startsWith('/mp/wappoc_appmsgcaptcha') || pathname.startsWith('/mp/waerrpage'))) return false;
+    if (host === 'support.weixin.qq.com' && (pathname.startsWith('/cgi-bin/mmsupport-bin/readtemplate') || pathname.startsWith('/update'))) return false;
+    if (host === 'wxapp.tenpay.com' && pathname.startsWith('/mmpayhb/')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function compactDigestUrl(value, maxChars = 130) {
+  const text = String(value || '').trim();
+  if (text.length <= maxChars) return text;
+  try {
+    const parsed = new URL(text);
+    const short = `${parsed.origin}${parsed.pathname}${parsed.search ? '?...' : ''}`;
+    return short.length <= maxChars ? short : `${short.slice(0, maxChars - 1)}…`;
+  } catch {
+    return `${text.slice(0, maxChars - 1)}…`;
+  }
+}
+
+function digestLinkTitle(link = {}) {
+  const title = String(link.title || '').trim();
+  if (title && !/^https?:\/\//i.test(title)) return title.length > 90 ? `${title.slice(0, 89)}…` : title;
+  return compactDigestUrl(link.url || link.summary || '', 90);
+}
+
 function digestDataRows(d = {}) {
+  const renderedLinks = digestLinksForRender(d);
   return [
     `时间：${d.since || '未知'} ~ ${d.until || 'now'}`,
     `消息：${d.message_count || 0} 条${d.truncated ? `；已从 ${d.scanned_message_count || d.message_count || 0} 条中截取 ${d.input_message_count || d.message_count || 0} 条` : ''}`,
-    `内容：${d.topics?.length || 0} 个重点事项，${d.links?.length || 0} 个网页链接，${d.todos?.length || 0} 个需处理事项，${digestQuotesForRender(d).length} 条代表说法`,
+    `内容：${d.topics?.length || 0} 个重点事项，${renderedLinks.length} 个链接资料，${d.todos?.length || 0} 个需处理事项，${digestQuotesForRender(d).length} 条代表说法`,
     `来源：${d.source_label || '本机数据'}；模型：${d.model || '未记录'}`,
   ];
 }
@@ -1700,14 +1760,15 @@ function drawDigestCanvas(d, targetCanvas = null) {
     }
 
     // links
-    if (d.links?.length) {
+    const links = digestLinksForRender(d);
+    if (links.length) {
       y = drawCard(ctx, y, COLORS, dryRun, c => {
         c.fillStyle = COLORS.primary;
         c.font = font(600, 20);
         c.fillText('链接资料', padding + cardInset, y + s(10));
         let yy = y + s(50);
-        for (let i = 0; i < d.links.length; i++) {
-          const l = d.links[i];
+        for (let i = 0; i < links.length; i++) {
+          const l = links[i];
           if (i > 0) {
             yy += s(10);
             c.strokeStyle = COLORS.hairline;
@@ -1720,7 +1781,7 @@ function drawDigestCanvas(d, targetCanvas = null) {
           }
           c.fillStyle = COLORS.text;
           c.font = font(600, 17);
-          const titleLines = wrapText(c, `• ${l.title || l.summary || l.url}`, W - padding * 2 - cardInset * 2, font(600, 17));
+          const titleLines = wrapText(c, `• ${digestLinkTitle(l)}`, W - padding * 2 - cardInset * 2, font(600, 17));
           for (const ln of titleLines) { c.fillText(ln, padding + cardInset, yy); yy += s(31); }
           if (l.summary) {
             yy += s(6);
@@ -1732,7 +1793,7 @@ function drawDigestCanvas(d, targetCanvas = null) {
           c.fillStyle = COLORS.meta;
           c.font = font(400, 12);
           if (l.url) {
-            const urlLines = wrapText(c, l.url, W - padding * 2 - bodyIndent - cardInset, font(400, 12));
+            const urlLines = wrapText(c, compactDigestUrl(l.url), W - padding * 2 - bodyIndent - cardInset, font(400, 12));
             for (const ln of urlLines) { c.fillText(ln, padding + bodyIndent, yy); yy += s(22); }
           }
           const source = [
@@ -1862,6 +1923,7 @@ function renderTextPreviews(digests) {
     const topicSections = groupedDigestTopics(d.topics || []);
     const quotes = digestQuotesForRender(d);
     const highlights = digestHighlightsForRender(d);
+    const links = digestLinksForRender(d);
     return [
       `# ${d.group}`,
       '',
@@ -1872,7 +1934,7 @@ function renderTextPreviews(digests) {
       [d.headline, ...highlights.filter(item => item !== d.headline).map(item => `- ${item}`)].join('\n'),
       '',
       ...topicSections.map(section => `## ${section.label}\n${section.topics.map((t, i) => `${i + 1}. ${t.title}${t.need_followup ? '（需处理）' : ''}\n   ${(t.participants || []).length ? `相关成员：${(t.participants || []).join('、')}\n   ` : ''}${t.summary}`).join('\n\n')}`),
-      d.links?.length ? `## 链接资料\n${d.links.map(l => `- ${l.title || l.summary || l.url}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${l.url}>` : ''}${l.from ? ` 发送人：${l.from}` : ''}${l.time ? ` 时间：${l.time}` : ''}`).join('\n')}` : '',
+      links.length ? `## 链接资料\n${links.map(l => `- ${digestLinkTitle(l)}${l.summary ? `：${l.summary}` : ''}${l.url ? ` <${compactDigestUrl(l.url)}>` : ''}${l.from ? ` 发送人：${l.from}` : ''}${l.time ? ` 时间：${l.time}` : ''}`).join('\n')}` : '',
       quotes.length ? `## 代表说法\n${quotes.map(q => `- ${q.speaker ? `${q.speaker}：` : ''}${q.text}${q.context ? `（${q.context}）` : ''}`).join('\n')}` : '',
       d.todos?.length ? `## 还要处理\n${d.todos.map(t => {
         const owner = cleanTodoMetaForRender(t.owner);

@@ -272,6 +272,54 @@ function IsPlaceholderTodoMeta($Value) {
   return $placeholders -contains $textValue
 }
 
+function ContainsDecodedText([string]$Value, [string]$Base64) {
+  if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+  $needle = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Base64))
+  return $Value.Contains($needle)
+}
+
+function IsIgnoredDigestUrl([string]$Value) {
+  if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+  try {
+    $uri = [System.Uri]::new($Value)
+    $uriHost = $uri.Host.ToLowerInvariant()
+    $uriPath = $uri.AbsolutePath.ToLowerInvariant()
+    if ($uriHost -eq 'mp.weixin.qq.com' -and ($uriPath.StartsWith('/mp/wappoc_appmsgcaptcha') -or $uriPath.StartsWith('/mp/waerrpage'))) { return $true }
+    if ($uriHost -eq 'support.weixin.qq.com' -and ($uriPath.StartsWith('/cgi-bin/mmsupport-bin/readtemplate') -or $uriPath.StartsWith('/update'))) { return $true }
+    if ($uriHost -eq 'wxapp.tenpay.com' -and $uriPath.StartsWith('/mmpayhb/')) { return $true }
+    return $false
+  } catch {
+    return $true
+  }
+}
+
+function IsLowValueDigestLink($Link) {
+  if ($null -eq $Link -or (IsIgnoredDigestUrl ([string]$Link.url))) { return $true }
+  $summary = [string]$Link.summary
+  if (ContainsDecodedText -Value $summary -Base64 '6K+l572R6aG16ZO+5o6l5Ye6546w5Zyo5pys5YiG5q615Y6f5aeL5raI5oGv5Lit77yb5YiG5q615qih5Z6L5aSx6LSl') { return $true }
+  if (ContainsDecodedText -Value $summary -Base64 '6K+l572R6aG16ZO+5o6l5bey5L+d55WZ77yM5L2G5b2T5YmN5rKh5pyJ5Y+v6Z2g5Lit5paH5pGY6KaB') { return $true }
+  if ((ContainsDecodedText -Value $summary -Base64 '6IGK5aSp5LiK5LiL5paH5LiN6Laz77yM5b2T5YmN5Y+q6IO956Gu6K6k77ya') -and (
+    $summary.Contains('Tip') -or
+    $summary.Contains('Favorites') -or
+    (ContainsDecodedText -Value $summary -Base64 '546v5aKD5byC5bi4') -or
+    (ContainsDecodedText -Value $summary -Base64 '5Yqg6L295Lit') -or
+    (ContainsDecodedText -Value $summary -Base64 '5omT5byA6LaF5pe2')
+  )) { return $true }
+  return $false
+}
+
+function CompactDigestUrl([string]$Value, [int]$MaxChars = 260) {
+  $textValue = ([string]$Value).Trim()
+  if ($textValue.Length -le $MaxChars) { return $textValue }
+  try {
+    $uri = [System.Uri]::new($textValue)
+    $short = "$($uri.Scheme)://$($uri.Host)$($uri.AbsolutePath)"
+    if (-not [string]::IsNullOrWhiteSpace($uri.Query)) { $short += '?...' }
+    if ($short.Length -le $MaxChars) { return $short }
+  } catch {}
+  return $textValue.Substring(0, [Math]::Max(1, $MaxChars - 1)) + [char]0x2026
+}
+
 function Utf8Label([string]$Base64) {
   return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Base64))
 }
@@ -346,7 +394,6 @@ if ($digest.quotes) {
   }
 }
 $topicTotal = if ($digest.topics) { $digest.topics.Count } else { 0 }
-$linkTotal = if ($digest.links) { $digest.links.Count } else { 0 }
 $todoTotal = if ($digest.todos) { $digest.todos.Count } else { 0 }
 $quoteTotal = $quoteItems.Count
 
@@ -374,6 +421,7 @@ if ($digest.topics) {
 }
 if ($digest.links) {
   foreach ($link in $digest.links) {
+    if (IsLowValueDigestLink $link) { continue }
     $contentChars += CountTextChars $link.title
     $contentChars += CountTextChars $link.summary
     $contentChars += CountTextChars $link.url
@@ -382,6 +430,15 @@ if ($digest.links) {
     $rowCount += 3
   }
 }
+$renderLinks = @()
+if ($digest.links) {
+  foreach ($link in $digest.links) {
+    if (IsLowValueDigestLink $link) { continue }
+    $renderLinks += $link
+    if ($renderLinks.Count -ge 12) { break }
+  }
+}
+$linkTotal = $renderLinks.Count
 foreach ($quote in $quoteItems) {
   if ($quote -is [string]) {
     $contentChars += CountTextChars $quote
@@ -571,25 +628,26 @@ if ($digest.topics -and $digest.topics.Count -gt 0) {
   $y = $cardY + $cardH + (S 12)
 }
 
-if ($digest.links -and $digest.links.Count -gt 0) {
+if ($renderLinks.Count -gt 0) {
   $cardY = $y
   $innerY = $cardY + (S 20)
   $innerY += (S 72)
   $linkIndex = 0
-  $linkCount = $digest.links.Count
-  foreach ($link in $digest.links) {
+  $linkCount = $renderLinks.Count
+  foreach ($link in $renderLinks) {
     if ($linkIndex -gt 0) {
       $innerY += (S 20)
       $graphics.DrawLine($penSeparator, $padding + 62, $innerY, $padding + $cardWidth - 62, $innerY)
       $innerY += (S 32)
     }
-    $title = if ($link.title) { [string]$link.title } elseif ($link.summary) { [string]$link.summary } else { [string]$link.url }
+    $title = if ($link.title -and -not ([string]$link.title).StartsWith('http')) { [string]$link.title } elseif ($link.summary) { [string]$link.summary } else { CompactDigestUrl ([string]$link.url) }
+    if ($title.Length -gt 180) { $title = $title.Substring(0, 179) + [char]0x2026 }
     $innerY = DrawWrappedText $graphics ("- " + $title) $fontBodyBold $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 62)
     $innerY += (S 12)
     if ($link.summary) {
       $innerY = DrawWrappedText $graphics ([string]$link.summary) $fontBody $brushText ($padding + 62) $innerY ($cardWidth - 96) (S 62)
     }
-    if ($link.url) { $innerY = DrawWrappedText $graphics ([string]$link.url) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
+    if ($link.url) { $innerY = DrawWrappedText $graphics (CompactDigestUrl ([string]$link.url)) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
     $by = @(
       if ($link.from) { "$labelSender$($link.from)" }
       if ($link.time) { "$labelTime$($link.time)" }
@@ -603,20 +661,21 @@ if ($digest.links -and $digest.links.Count -gt 0) {
   $innerY = $cardY + (S 20)
   $graphics.DrawString($labelImportantLinks, $fontH2, $brushPrimary, $padding + 34, $innerY); $innerY += (S 72)
   $linkIndex = 0
-  $linkCount = $digest.links.Count
-  foreach ($link in $digest.links) {
+  $linkCount = $renderLinks.Count
+  foreach ($link in $renderLinks) {
     if ($linkIndex -gt 0) {
       $innerY += (S 20)
       $graphics.DrawLine($penSeparator, $padding + 62, $innerY, $padding + $cardWidth - 62, $innerY)
       $innerY += (S 32)
     }
-    $title = if ($link.title) { [string]$link.title } elseif ($link.summary) { [string]$link.summary } else { [string]$link.url }
+    $title = if ($link.title -and -not ([string]$link.title).StartsWith('http')) { [string]$link.title } elseif ($link.summary) { [string]$link.summary } else { CompactDigestUrl ([string]$link.url) }
+    if ($title.Length -gt 180) { $title = $title.Substring(0, 179) + [char]0x2026 }
     $innerY = DrawWrappedText $graphics ("- " + $title) $fontBodyBold $brushText ($padding + 34) $innerY ($cardWidth - 68) (S 62)
     $innerY += (S 12)
     if ($link.summary) {
       $innerY = DrawWrappedText $graphics ([string]$link.summary) $fontBody $brushText ($padding + 62) $innerY ($cardWidth - 96) (S 62)
     }
-    if ($link.url) { $innerY = DrawWrappedText $graphics ([string]$link.url) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
+    if ($link.url) { $innerY = DrawWrappedText $graphics (CompactDigestUrl ([string]$link.url)) $fontMeta $brushMeta ($padding + 62) $innerY ($cardWidth - 96) (S 44) }
     $by = @(
       if ($link.from) { "$labelSender$($link.from)" }
       if ($link.time) { "$labelTime$($link.time)" }
