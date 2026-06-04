@@ -15,6 +15,7 @@ const DEFAULT_DIGEST_CHUNK_CONCURRENCY = 2;
 const AI_LINK_RESEARCH_URLS_PER_CALL = 8;
 const DEFAULT_LINK_RESEARCH_CONCURRENCY = 2;
 const DEFAULT_AI_REQUEST_CONCURRENCY = 1;
+const DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS = 15000;
 const DEFAULT_LINK_PREVIEW = {
   enabled: true,
   ai_web_search: true,
@@ -164,6 +165,101 @@ export async function listModels({ provider, base_url, api_key, refresh = false,
   MODEL_CACHE.set(cacheKey, { at: Date.now(), models });
   if (persist) await rememberModels({ provider, base_url: normalizedBase, models }).catch(() => {});
   return { ok: true, models, cached: false };
+}
+
+export async function testLlmConnectivity({ provider, base_url, api_key, model, timeout_ms = DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS }) {
+  const normalizedBase = normalizeBaseUrl(base_url);
+  if (!['openai', 'anthropic'].includes(provider)) throw httpError(400, 'Unsupported provider');
+  if (!normalizedBase) throw httpError(400, 'Missing base_url');
+  if (!api_key) throw httpError(400, 'Missing api_key');
+  if (!model) throw httpError(400, 'Missing model');
+  const cappedTimeout = Math.max(3000, Math.min(Number(timeout_ms) || DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS, DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS));
+  const tests = provider === 'openai'
+    ? [
+        ['chat', () => testOpenAiChat({ base_url: normalizedBase, api_key, model, timeout_ms: cappedTimeout })],
+        ['responses', () => testOpenAiResponses({ base_url: normalizedBase, api_key, model, timeout_ms: cappedTimeout })],
+      ]
+    : [
+        ['messages', () => testAnthropicMessages({ base_url: normalizedBase, api_key, model, timeout_ms: cappedTimeout })],
+      ];
+  const results = await Promise.all(tests.map(([name, action]) => timedCapabilityTest(name, action, api_key)));
+  return {
+    ok: results.some(item => item.ok),
+    provider,
+    base_url: normalizedBase,
+    model,
+    latency_ms: Math.max(...results.map(item => item.latency_ms || 0)),
+    capabilities: results,
+  };
+}
+
+async function timedCapabilityTest(name, action, apiKey) {
+  const started = Date.now();
+  try {
+    const sample = await action();
+    return { name, ok: true, latency_ms: Date.now() - started, sample: cleanField(sample).slice(0, 40) };
+  } catch (e) {
+    return {
+      name,
+      ok: false,
+      latency_ms: Date.now() - started,
+      error: sanitizeText(e?.message || String(e), apiKey),
+    };
+  }
+}
+
+async function testOpenAiChat({ base_url, api_key, model, timeout_ms }) {
+  const json = await fetchJson(`${base_url}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${api_key}` },
+    body: {
+      model,
+      temperature: 0,
+      messages: [{ role: 'user', content: 'Reply with exactly OK.' }],
+    },
+    timeout_ms,
+    api_key,
+  });
+  const text = json?.choices?.[0]?.message?.content;
+  if (!text) throw httpError(502, 'Chat returned empty content');
+  return text;
+}
+
+async function testOpenAiResponses({ base_url, api_key, model, timeout_ms }) {
+  const json = await fetchJson(`${base_url}/responses`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${api_key}` },
+    body: {
+      model,
+      temperature: 0,
+      input: 'Reply with exactly OK.',
+    },
+    timeout_ms,
+    api_key,
+  });
+  const text = extractResponsesText(json);
+  if (!text) throw httpError(502, 'Responses returned empty content');
+  return text;
+}
+
+async function testAnthropicMessages({ base_url, api_key, model, timeout_ms }) {
+  const json = await fetchJson(`${base_url}/messages`, {
+    method: 'POST',
+    headers: { 'x-api-key': api_key, 'anthropic-version': '2023-06-01' },
+    body: {
+      model,
+      max_tokens: 16,
+      temperature: 0,
+      messages: [{ role: 'user', content: 'Reply with exactly OK.' }],
+    },
+    timeout_ms,
+    api_key,
+  });
+  const text = Array.isArray(json?.content)
+    ? json.content.map(part => part.text || '').join('\n').trim()
+    : '';
+  if (!text) throw httpError(502, 'Messages returned empty content');
+  return text;
 }
 
 function normalizeModelList(json) {

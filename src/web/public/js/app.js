@@ -2133,18 +2133,20 @@ async function renderSettings() {
     const inp = document.getElementById('s-apikey');
     inp.type = inp.type === 'password' ? 'text' : 'password';
   });
-  document.getElementById('s-list-models').addEventListener('click', async () => {
+  document.getElementById('s-list-models').addEventListener('click', async e => {
     const $st = document.getElementById('s-model-status');
-    $st.className = 'status'; $st.textContent = '获取中...';
+    const refresh = !!e.shiftKey;
+    $st.className = 'status';
+    $st.textContent = refresh ? '刷新中...' : '获取中（优先使用缓存）...';
     try {
       const key = document.getElementById('s-apikey').value.trim();
-      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, refresh: true, persist: true };
+      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, refresh, persist: true };
       if (key) payload.api_key = key;
-      const r = await api('/api/list-models?refresh=true', { method: 'POST', body: payload });
+      const r = await api(refresh ? '/api/list-models?refresh=true' : '/api/list-models', { method: 'POST', body: payload });
       availableModels = r.models || [];
       fillModelSelects();
       $st.className = 'status ok';
-      $st.textContent = `✓ 已获取 ${availableModels.length} 个模型`;
+      $st.textContent = `✓ 已获取 ${availableModels.length} 个模型${r.cached ? '（缓存）' : ''}${r.persisted ? '；按住 Shift 点击可强制刷新' : ''}`;
     } catch (e) {
       $st.className = 'status err';
       $st.textContent = '✗ ' + e.message;
@@ -2155,14 +2157,18 @@ async function renderSettings() {
     $st.className = 'status'; $st.textContent = '测试中...';
     try {
       const key = document.getElementById('s-apikey').value.trim();
-      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value };
+      const customModel = document.getElementById('s-model-custom').checked;
+      const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
+      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, model };
       if (key) payload.api_key = key;
       const r = await api('/api/test-llm', {
         method: 'POST',
         body: payload,
       });
-      $st.className = 'status ok';
-      $st.textContent = `✓ 连通成功 (${r.latency_ms}ms)，可用模型：${r.models_sample.join(', ')}`;
+      const okItems = (r.capabilities || []).filter(item => item.ok).map(formatCapabilityStatus);
+      const badItems = (r.capabilities || []).filter(item => !item.ok).map(formatCapabilityStatus);
+      $st.className = r.ok ? (badItems.length ? 'status warn' : 'status ok') : 'status err';
+      $st.textContent = `${r.ok ? '✓' : '✗'} 连通测试 ${r.latency_ms}ms：${[...okItems, ...badItems].join('；') || '无结果'}`;
     } catch (e) {
       $st.className = 'status err'; $st.textContent = '✗ 失败：' + e.message;
     }
@@ -2587,6 +2593,15 @@ async function renderSettings() {
   // 关于
   document.getElementById('s-platform').textContent = state.platform;
   document.getElementById('s-projroot').textContent = state.project_root;
+}
+
+function formatCapabilityStatus(item = {}) {
+  const name = item.name === 'responses' ? 'Responses'
+    : item.name === 'chat' ? 'Chat'
+      : item.name === 'messages' ? 'Messages'
+        : (item.name || '能力');
+  if (item.ok) return `${name} OK (${item.latency_ms}ms)`;
+  return `${name} 失败：${item.error || '未知错误'}`;
 }
 
 // ---------- 首次启动向导 ----------

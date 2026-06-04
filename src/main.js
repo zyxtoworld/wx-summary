@@ -6,11 +6,11 @@ import url from 'node:url';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { collectMessages, detectWeixin, listAccounts, listGroups } from './collector/index.js';
-import { clearTmpDir, ensureRuntimeDirs, loadSettings, publicSettings, saveSettingsPatch } from './config/settings.js';
+import { clearTmpDir, ensureRuntimeDirs, loadSettings, normalizeBaseUrl, publicSettings, saveSettingsPatch } from './config/settings.js';
 import { getSchedulerStatus, restartScheduler, runSchedulerOnce, startScheduler, stopScheduler } from './daemon/scheduler.js';
 import { DATA_DIR, DEFAULT_DIGESTS_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, isInside, outputDirFromSettings, resolveInsideTmp } from './lib/paths.js';
 import { configureLogger, logError, logInfo, logWarn, readLogTail } from './lib/logger.js';
-import { listModels, redactContent, sanitizeText, summarizeDigest } from './summarizer/llm.js';
+import { listModels, redactContent, sanitizeText, summarizeDigest, testLlmConnectivity } from './summarizer/llm.js';
 import { assertRevealable, cleanupOldDigests, findHistoryItem, listHistory, overwriteRenderedPng, readHistoryDigest, savePreviewMarkdown, saveRenderedPng } from './renderer/output.js';
 import { renderDigestPngDataUrl } from './renderer/server-png.js';
 import { renderDigestThumbnailPng } from './renderer/thumbnail.js';
@@ -505,28 +505,13 @@ async function postSaveSettingsWarnings(patch) {
     warnings.push({ code: 'llm_api_key_missing', message: 'AI 设置已保存，但 API Key 为空，生成摘要前需要补齐。' });
     return warnings;
   }
-  try {
-    const result = await listModels({
-      provider: saved.llm.provider,
-      base_url: saved.llm.base_url,
-      api_key: saved.llm.api_key,
-      refresh: true,
-      timeout_ms: saved.llm.timeout_ms,
-      persist: true,
-    });
-    const ids = new Set((result.models || []).map(model => model.id));
-    const modelMissing = saved.llm.model && ids.size > 0 && !saved.llm.custom_model && !ids.has(saved.llm.model);
-    const longModelMissing = saved.llm.long_context_model && ids.size > 0 && !saved.llm.custom_long_context_model && !ids.has(saved.llm.long_context_model);
-    if (modelMissing || longModelMissing) {
-      warnings.push({
-        code: 'llm_model_not_listed',
-        message: 'AI 设置已保存，但所选模型不在端点返回的模型列表里；如确认可用，请开启自定义模型后保存。',
-      });
-    }
-  } catch (e) {
+  const ids = new Set((saved.llm.available_models || []).map(model => model.id));
+  const modelMissing = saved.llm.model && ids.size > 0 && !saved.llm.custom_model && !ids.has(saved.llm.model);
+  const longModelMissing = saved.llm.long_context_model && ids.size > 0 && !saved.llm.custom_long_context_model && !ids.has(saved.llm.long_context_model);
+  if (modelMissing || longModelMissing) {
     warnings.push({
-      code: 'llm_connectivity_failed',
-      message: `AI 设置已保存，但模型连通探测失败：${sanitizeText(e?.message || String(e))}`,
+      code: 'llm_model_not_listed',
+      message: 'AI 设置已保存，但所选模型不在已缓存的模型列表里；如确认可用，请开启自定义模型后保存，或刷新模型列表。',
     });
   }
   return warnings;
@@ -603,14 +588,28 @@ async function handleApi(req, res, parsedUrl) {
     const body = await readBody(req);
     const current = await loadSettings({ includeSecrets: true });
     const provider = body.provider || current.llm.provider;
-    const baseUrl = body.base_url || current.llm.base_url;
+    const baseUrl = normalizeBaseUrl(body.base_url || current.llm.base_url);
     const apiKey = body.api_key || current.llm.api_key;
+    const refresh = parsedUrl.searchParams.get('refresh') === 'true' || body.refresh === true;
+    if (!refresh
+      && !body.api_key
+      && provider === current.llm.provider
+      && baseUrl === current.llm.base_url
+      && Array.isArray(current.llm.available_models)
+      && current.llm.available_models.length) {
+      return sendJson(res, 200, {
+        ok: true,
+        models: current.llm.available_models,
+        cached: true,
+        persisted: true,
+      });
+    }
     const result = await listModels({
       provider,
       base_url: baseUrl,
       api_key: apiKey,
-      refresh: parsedUrl.searchParams.get('refresh') === 'true' || body.refresh === true,
-      timeout_ms: current.llm.timeout_ms,
+      refresh,
+      timeout_ms: Math.min(Number(current.llm.timeout_ms || 30000), 20000),
       persist: body.persist !== false,
     });
     logInfo('models_listed', { provider, base_url: baseUrl, ok: result.ok, count: result.models?.length || 0, cached: !!result.cached });
@@ -621,12 +620,26 @@ async function handleApi(req, res, parsedUrl) {
     const body = await readBody(req);
     const current = await loadSettings({ includeSecrets: true });
     const provider = body.provider || current.llm.provider;
-    const baseUrl = body.base_url || current.llm.base_url;
+    const baseUrl = normalizeBaseUrl(body.base_url || current.llm.base_url);
     const apiKey = body.api_key || current.llm.api_key;
+    const model = body.model || current.llm.model || current.llm.available_models?.[0]?.id || '';
     const started = Date.now();
-    const result = await listModels({ provider, base_url: baseUrl, api_key: apiKey, refresh: true, timeout_ms: current.llm.timeout_ms });
-    logInfo('llm_connectivity_checked', { provider, base_url: baseUrl, count: result.models?.length || 0, latency_ms: Date.now() - started });
-    return sendJson(res, 200, { ok: true, latency_ms: Date.now() - started, models_sample: result.models.slice(0, 8).map(m => m.id) });
+    const result = await testLlmConnectivity({
+      provider,
+      base_url: baseUrl,
+      api_key: apiKey,
+      model,
+      timeout_ms: Math.min(Number(current.llm.timeout_ms || 15000), 15000),
+    });
+    logInfo('llm_connectivity_checked', {
+      provider,
+      base_url: baseUrl,
+      model,
+      ok: result.ok,
+      latency_ms: Date.now() - started,
+      capabilities: result.capabilities?.map(item => ({ name: item.name, ok: item.ok, latency_ms: item.latency_ms })),
+    });
+    return sendJson(res, 200, { ...result, latency_ms: Date.now() - started });
   }
 
   if (pathname === '/api/wechat/status' && req.method === 'GET') {
