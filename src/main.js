@@ -1004,10 +1004,22 @@ async function runDigestSSE(req, res, body) {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
   let currentStage = '';
+  let currentStageLabel = '';
+  let currentStageDetail = '';
   let stageStartedAt = 0;
   const sendStage = (data) => {
-    currentStage = data?.status === 'running' ? (data?.name || currentStage) : (currentStage === data?.name ? '' : currentStage);
-    stageStartedAt = data?.status === 'running' ? Date.now() : (currentStage ? stageStartedAt : 0);
+    if (data?.status === 'running') {
+      const nextStage = data?.name || currentStage;
+      if (currentStage !== nextStage || !stageStartedAt) stageStartedAt = Date.now();
+      currentStage = nextStage;
+      currentStageLabel = data?.label || currentStageLabel;
+      currentStageDetail = data?.detail || '';
+    } else if (currentStage === data?.name) {
+      currentStage = '';
+      currentStageLabel = '';
+      currentStageDetail = '';
+      stageStartedAt = 0;
+    }
     sendEvent('stage', data);
   };
   const progressDetail = () => {
@@ -1015,7 +1027,8 @@ async function runDigestSSE(req, res, body) {
     const elapsedSeconds = Math.max(1, Math.round((Date.now() - stageStartedAt) / 1000));
     const minutes = Math.floor(elapsedSeconds / 60);
     const seconds = elapsedSeconds % 60;
-    return minutes ? `仍在处理，已用时 ${minutes}分${String(seconds).padStart(2, '0')}秒` : `仍在处理，已用时 ${seconds}秒`;
+    const elapsed = minutes ? `仍在处理，已用时 ${minutes}分${String(seconds).padStart(2, '0')}秒` : `仍在处理，已用时 ${seconds}秒`;
+    return currentStageDetail ? `${currentStageDetail} · ${elapsed}` : elapsed;
   };
   const heartbeat = setInterval(() => {
     if (controller.signal.aborted || res.destroyed || res.writableEnded) return;
@@ -1023,7 +1036,7 @@ async function runDigestSSE(req, res, body) {
     if (currentStage) {
       sendEvent('stage', {
         name: currentStage,
-        label: currentStage === 'summarizing' ? 'AI 总结' : (currentStage === 'fetching' ? '拉取消息' : '处理中'),
+        label: currentStageLabel || (currentStage === 'summarizing' ? 'AI 总结' : (currentStage === 'fetching' ? '拉取消息' : '处理中')),
         status: 'running',
         detail: progressDetail(),
       });
@@ -1079,6 +1092,14 @@ async function runDigestSSE(req, res, body) {
       until: collection.until,
       messages: collection.messages,
       signal: controller.signal,
+      onProgress: progress => {
+        sendStage({
+          name: 'summarizing',
+          label: progress?.label || 'AI 总结',
+          status: 'running',
+          detail: progress?.detail || '',
+        });
+      },
     });
     ensureActive();
     digest.input_message_count = collection.message_count;

@@ -6,6 +6,14 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL = 800;
 const DEFAULT_FALLBACK_MAX_INPUT_CHARS = 60_000;
 const DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL = 300_000;
+const ADAPTIVE_CHUNK_MESSAGE_THRESHOLD = 700;
+const ADAPTIVE_CHUNK_TEXT_THRESHOLD = 120_000;
+const ADAPTIVE_CHUNK_MEDIA_THRESHOLD = 900_000;
+const ADAPTIVE_CHUNK_MAX_MESSAGES = 450;
+const ADAPTIVE_CHUNK_MAX_INPUT_CHARS = 80_000;
+const DEFAULT_DIGEST_CHUNK_CONCURRENCY = 2;
+const AI_LINK_RESEARCH_URLS_PER_CALL = 8;
+const DEFAULT_LINK_RESEARCH_CONCURRENCY = 2;
 const DEFAULT_LINK_PREVIEW = {
   enabled: true,
   ai_web_search: true,
@@ -30,6 +38,11 @@ function linkAbortSignal(controller, signal) {
   if (signal.aborted) controller.abort();
   else signal.addEventListener('abort', onAbort, { once: true });
   return () => signal.removeEventListener('abort', onAbort);
+}
+
+function notifyProgress(onProgress, data) {
+  if (typeof onProgress !== 'function') return;
+  try { onProgress(data); } catch {}
 }
 
 export function sanitizeText(text, knownSecret = '') {
@@ -107,7 +120,7 @@ function normalizeModelList(json) {
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
-export async function summarizeDigest({ settings, groupName, since, until, messages, signal }) {
+export async function summarizeDigest({ settings, groupName, since, until, messages, signal, onProgress }) {
   throwIfAborted(signal);
   const llm = settings.llm;
   const apiKey = llm.api_key;
@@ -116,60 +129,82 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   const model = llm.model || llm.available_models?.[0]?.id;
   if (!model) throw httpError(400, 'Model is not configured');
 
+  notifyProgress(onProgress, {
+    phase: 'prepare',
+    label: 'AI 总结 · 准备输入',
+    detail: `${messages.length} 条消息`,
+  });
   const normalized = messages.map(m => redactStructuredValue(m, settings.privacy));
-  const enriched = await enrichMessagesWithLinkPreviews(normalized, settings.link_preview, settings, signal);
+  const enriched = await enrichMessagesWithLinkPreviews(normalized, settings.link_preview, settings, signal, onProgress);
   throwIfAborted(signal);
+  const plan = buildDigestChunkPlan(enriched, llm);
   let raw;
-  try {
-    raw = await callJsonModel({
-      settings,
-      model,
-      groupName,
-      since,
-      until,
-      messageBundle: formatMessageBundle(enriched),
-      mode: 'final/full',
-      signal,
+  if (plan.useChunks) {
+    notifyProgress(onProgress, {
+      phase: 'llm_chunk_plan',
+      label: 'AI 总结 · 自动分段',
+      detail: `${plan.chunks.length} 段 · ${plan.reason}`,
     });
-  } catch (firstError) {
-    const chunks = splitMessages(
-      enriched,
-      llm.max_messages_per_call || DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL,
-      llm.max_input_chars || DEFAULT_FALLBACK_MAX_INPUT_CHARS,
-      llm.max_image_chars_per_call || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
-    );
-    if (!isLikelyChunkableFailure(firstError) || chunks.length <= 1) throw firstError;
-
-    const summaries = [];
     try {
-      for (let i = 0; i < chunks.length; i++) {
-        const part = await callJsonModel({
+      raw = await summarizeMessageChunks({
+        settings,
+        model,
+        groupName,
+        since,
+        until,
+        chunks: plan.chunks,
+        signal,
+        onProgress,
+      });
+    } catch (chunkError) {
+      throw httpError(
+        chunkError.status || 502,
+        `已因输入较大自动分段；分段失败：${chunkError.message || String(chunkError)}`,
+      );
+    }
+  } else {
+    try {
+      notifyProgress(onProgress, {
+        phase: 'llm_full',
+        label: 'AI 总结 · 全量请求',
+        detail: `${messages.length} 条消息一次发送`,
+      });
+      raw = await callJsonModel({
+        settings,
+        model,
+        groupName,
+        since,
+        until,
+        messageBundle: formatMessageBundle(enriched),
+        mode: 'final/full',
+        signal,
+      });
+    } catch (firstError) {
+      const chunks = splitMessages(
+        enriched,
+        llm.max_messages_per_call || DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL,
+        llm.max_input_chars || DEFAULT_FALLBACK_MAX_INPUT_CHARS,
+        llm.max_image_chars_per_call || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
+      );
+      if (!isLikelyChunkableFailure(firstError) || chunks.length <= 1) throw firstError;
+
+      try {
+        raw = await summarizeMessageChunks({
           settings,
           model,
           groupName,
           since,
           until,
-          messageBundle: formatMessageBundle(chunks[i]),
-          mode: `chunk ${i + 1}/${chunks.length}`,
+          chunks,
           signal,
+          onProgress,
         });
-        summaries.push(`分段 ${i + 1}: ${JSON.stringify(part)}`);
+      } catch (fallbackError) {
+        throw httpError(
+          fallbackError.status || firstError.status || 502,
+          `已尝试一次全量发送，失败后自动分段；分段也失败：${fallbackError.message || String(fallbackError)}`,
+        );
       }
-      raw = await callJsonModel({
-        settings,
-        model: llm.long_context_model || model,
-        groupName,
-        since,
-        until,
-        messageBundle: { text: summaries.join('\n\n'), images: [] },
-        mode: 'merge',
-        signal,
-      });
-    } catch (fallbackError) {
-      throw httpError(
-        fallbackError.status || firstError.status || 502,
-        `已尝试一次全量发送，失败后自动分段；分段也失败：${fallbackError.message || String(fallbackError)}`,
-      );
     }
   }
 
@@ -181,6 +216,115 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     model,
     linkPreviewCount: enriched.reduce((n, msg) => n + (msg.link_previews?.length || 0), 0),
   });
+}
+
+async function summarizeMessageChunks({ settings, model, groupName, since, until, chunks, signal, onProgress }) {
+  const concurrency = digestChunkConcurrency(settings);
+  const summaries = new Array(chunks.length);
+  let completed = 0;
+  notifyProgress(onProgress, {
+    phase: 'llm_chunks',
+    label: 'AI 总结 · 分段总结',
+    detail: `${chunks.length} 段 · 并发 ${concurrency} 路`,
+  });
+  await mapWithConcurrency(chunks, concurrency, async (chunk, index) => {
+    throwIfAborted(signal);
+    notifyProgress(onProgress, {
+      phase: 'llm_chunk',
+      label: 'AI 总结 · 分段总结',
+      detail: `正在处理第 ${index + 1}/${chunks.length} 段 · 已完成 ${completed}/${chunks.length}`,
+    });
+    const part = await callJsonModel({
+      settings,
+      model,
+      groupName,
+      since,
+      until,
+      messageBundle: formatMessageBundle(chunk),
+      mode: `chunk ${index + 1}/${chunks.length}`,
+      signal,
+    });
+    summaries[index] = `分段 ${index + 1}: ${JSON.stringify(part)}`;
+    completed++;
+    notifyProgress(onProgress, {
+      phase: 'llm_chunk',
+      label: 'AI 总结 · 分段总结',
+      detail: `已完成 ${completed}/${chunks.length} 段 · 并发 ${concurrency} 路`,
+    });
+  });
+  notifyProgress(onProgress, {
+    phase: 'llm_merge',
+    label: 'AI 总结 · 合并分段',
+    detail: `${chunks.length} 段摘要合并为群纪要`,
+  });
+  return callJsonModel({
+    settings,
+    model: settings.llm.long_context_model || model,
+    groupName,
+    since,
+    until,
+    messageBundle: { text: summaries.join('\n\n'), images: [] },
+    mode: 'merge',
+    signal,
+  });
+}
+
+function buildDigestChunkPlan(messages, llm = {}) {
+  const stats = {
+    messages: messages.length,
+    textChars: estimateMessageTextChars(messages),
+    mediaChars: estimateMediaPayloadChars(messages),
+  };
+  const reasons = [];
+  if (stats.messages > ADAPTIVE_CHUNK_MESSAGE_THRESHOLD) reasons.push(`${stats.messages} 条消息`);
+  if (stats.textChars > ADAPTIVE_CHUNK_TEXT_THRESHOLD) reasons.push(`约 ${stats.textChars} 字符输入`);
+  if (stats.mediaChars > ADAPTIVE_CHUNK_MEDIA_THRESHOLD) reasons.push(`约 ${Math.round(stats.mediaChars / 1024)}KB 媒体附件`);
+  if (!reasons.length) return { useChunks: false, chunks: [messages], stats, reason: '' };
+
+  const maxMessages = Math.min(
+    Math.max(1, Number(llm.max_messages_per_call || DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL)),
+    ADAPTIVE_CHUNK_MAX_MESSAGES,
+  );
+  const maxChars = Math.min(
+    Math.max(1000, Number(llm.max_input_chars || DEFAULT_FALLBACK_MAX_INPUT_CHARS)),
+    ADAPTIVE_CHUNK_MAX_INPUT_CHARS,
+  );
+  const maxImageChars = Math.min(
+    Math.max(100000, Number(llm.max_image_chars_per_call || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL)),
+    DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
+  );
+  const chunks = splitMessages(messages, maxMessages, maxChars, maxImageChars);
+  return {
+    useChunks: chunks.length > 1,
+    chunks,
+    stats,
+    reason: reasons.join('，'),
+  };
+}
+
+function estimateMessageTextChars(messages) {
+  return messages.reduce((n, msg) => n + formatMessageLine(msg).length + 1, 0);
+}
+
+function estimateMediaPayloadChars(messages) {
+  return messages.reduce((n, msg) => n + mediaPayloadChars(msg), 0);
+}
+
+function digestChunkConcurrency(settings = {}) {
+  const value = Number(settings?.llm?.chunk_concurrency || DEFAULT_DIGEST_CHUNK_CONCURRENCY);
+  return Math.max(1, Math.min(3, Number.isFinite(value) ? Math.floor(value) : DEFAULT_DIGEST_CHUNK_CONCURRENCY));
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  let cursor = 0;
+  const limit = Math.max(1, Math.min(Number(concurrency) || 1, items.length || 1));
+  const workers = Array.from({ length: limit }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
 }
 
 function splitMessages(messages, maxMessages, maxChars, maxImageChars = DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL) {
@@ -354,7 +498,7 @@ function formatLinkPreviewLines(previews) {
   }).join('');
 }
 
-export async function enrichMessagesWithLinkPreviews(messages, options = {}, settings = null, signal = null) {
+export async function enrichMessagesWithLinkPreviews(messages, options = {}, settings = null, signal = null, onProgress = null) {
   const cfg = { ...DEFAULT_LINK_PREVIEW, ...(options || {}) };
   if (cfg.enabled === false) return messages;
   throwIfAborted(signal);
@@ -363,8 +507,14 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
   if (!targets.length) return messages;
 
   const uniqueUrls = [...new Set(targets.map(t => t.url))];
+  notifyProgress(onProgress, {
+    phase: 'link_preview',
+    label: 'AI 总结 · 打开网页',
+    detail: `${uniqueUrls.length} 个网页链接`,
+  });
   const previewByUrl = new Map();
   let cursor = 0;
+  let completed = 0;
   const workers = Array.from({ length: Math.min(4, uniqueUrls.length) }, async () => {
     while (cursor < uniqueUrls.length) {
       throwIfAborted(signal);
@@ -381,6 +531,14 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
         };
       }
       previewByUrl.set(url, preview);
+      completed++;
+      if (completed === uniqueUrls.length || completed % 5 === 0) {
+        notifyProgress(onProgress, {
+          phase: 'link_preview',
+          label: 'AI 总结 · 打开网页',
+          detail: `已打开 ${completed}/${uniqueUrls.length} 个网页链接`,
+        });
+      }
     }
   });
   await Promise.all(workers);
@@ -388,7 +546,7 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
   const researchUrls = uniqueUrls.filter(url => isAnalyzableLinkPreview(previewByUrl.get(url)));
   let aiResearch = new Map();
   try {
-    aiResearch = await fetchAiLinkResearchForUrls(researchUrls, settings, cfg, signal);
+    aiResearch = await fetchAiLinkResearchForUrls(researchUrls, settings, cfg, signal, onProgress);
   } catch (err) {
     if (err?.status === 499 || signal?.aborted) throw err;
   }
@@ -665,8 +823,44 @@ function markdownToPlainText(text) {
     .trim();
 }
 
-async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null) {
+async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null, onProgress = null) {
   if (!shouldUseAiLinkResearch(urls, settings, cfg)) return new Map();
+  throwIfAborted(signal);
+  const uniqueUrls = [...new Set(urls.map(normalizeHttpUrl).filter(Boolean))];
+  const chunks = chunkArray(uniqueUrls, AI_LINK_RESEARCH_URLS_PER_CALL);
+  const concurrency = Math.min(DEFAULT_LINK_RESEARCH_CONCURRENCY, chunks.length || 1);
+  const out = new Map();
+  let completed = 0;
+  notifyProgress(onProgress, {
+    phase: 'ai_link_research',
+    label: 'AI 总结 · AI 查链接',
+    detail: `${uniqueUrls.length} 个网页链接${chunks.length > 1 ? ` · ${chunks.length} 批` : ''}`,
+  });
+  await mapWithConcurrency(chunks, concurrency, async (chunk, index) => {
+    throwIfAborted(signal);
+    notifyProgress(onProgress, {
+      phase: 'ai_link_research',
+      label: 'AI 总结 · AI 查链接',
+      detail: `正在核查第 ${index + 1}/${chunks.length} 批链接`,
+    });
+    try {
+      const batch = await fetchAiLinkResearchBatch(chunk, settings, signal);
+      for (const [url, research] of batch.entries()) out.set(url, research);
+    } catch (err) {
+      if (err?.status === 499 || signal?.aborted) throw err;
+      // Local link previews remain attached to the timeline if web-search research fails.
+    }
+    completed++;
+    notifyProgress(onProgress, {
+      phase: 'ai_link_research',
+      label: 'AI 总结 · AI 查链接',
+      detail: `已完成 ${completed}/${chunks.length} 批链接核查`,
+    });
+  });
+  return out;
+}
+
+async function fetchAiLinkResearchBatch(urls, settings, signal = null) {
   throwIfAborted(signal);
   const body = {
     model: settings.llm.long_context_model || settings.llm.model,
@@ -730,6 +924,13 @@ async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null) {
       sources: Array.isArray(item.sources) ? item.sources.map(cleanField).filter(Boolean).slice(0, 6) : [],
     });
   }
+  return out;
+}
+
+function chunkArray(items, size) {
+  const out = [];
+  const limit = Math.max(1, Number(size) || 1);
+  for (let i = 0; i < items.length; i += limit) out.push(items.slice(i, i + limit));
   return out;
 }
 
@@ -1368,6 +1569,7 @@ function sleep(ms, signal = null) {
 export const __llmInternals = {
   formatMessageBundle,
   splitMessages,
+  buildDigestChunkPlan,
   openAiUserContent,
   anthropicUserContent,
   chatAudioFormatForModel,
