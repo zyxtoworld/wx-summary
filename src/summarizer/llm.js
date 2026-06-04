@@ -297,18 +297,19 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
       label: 'AI 总结 · 分段总结',
       detail: `正在处理第 ${index + 1}/${chunks.length} 段 · 已完成 ${completed}/${chunks.length}`,
     });
-    const part = await callJsonModel({
+    const part = await summarizeChunkWithFallback({
       settings,
       model,
       groupName,
       since,
       until,
-      messageBundle: formatMessageBundle(chunk),
-      mode: `chunk ${index + 1}/${chunks.length}`,
+      chunk,
+      index,
+      total: chunks.length,
       signal,
       onProgress,
     });
-    summaries[index] = `分段 ${index + 1}: ${JSON.stringify(part)}`;
+    summaries[index] = `分段 ${index + 1}${part?._fallback_chunk ? '（原始时间线兜底）' : ''}: ${JSON.stringify(part)}`;
     completed++;
     notifyProgress(onProgress, {
       phase: 'llm_chunk',
@@ -332,6 +333,106 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
     signal,
     onProgress,
   });
+}
+
+async function summarizeChunkWithFallback({ settings, model, groupName, since, until, chunk, index, total, signal, onProgress }) {
+  const mode = `chunk ${index + 1}/${total}`;
+  try {
+    return await callJsonModel({
+      settings,
+      model,
+      groupName,
+      since,
+      until,
+      messageBundle: formatMessageBundle(chunk),
+      mode,
+      signal,
+      onProgress,
+    });
+  } catch (err) {
+    if (err?.status === 499 || signal?.aborted) throw err;
+    if (!isLikelyRecoverableChunkFailure(err)) throw err;
+    const fallback = buildFallbackChunkDigest({ chunk, index, error: err });
+    notifyProgress(onProgress, {
+      phase: 'llm_chunk_fallback',
+      label: 'AI 总结 · 分段兜底',
+      detail: `第 ${index + 1}/${total} 段模型返回异常，已把原始时间线交给合并阶段`,
+    });
+    return fallback;
+  }
+}
+
+function buildFallbackChunkDigest({ chunk, index, error }) {
+  const bundle = formatMessageBundle(chunk);
+  const media = chunkMediaStats(bundle);
+  const participants = [...new Set(chunk.map(msg => cleanField(msg.sender)).filter(Boolean))].slice(0, 20);
+  const firstTime = chunk[0]?.time || '';
+  const lastTime = chunk[chunk.length - 1]?.time || firstTime;
+  const mediaText = [
+    media.images ? `${media.images} 张图片/视频关键帧` : '',
+    media.audio ? `${media.audio} 条音频` : '',
+  ].filter(Boolean).join('、') || '无可直接附加的媒体块';
+  return {
+    headline: `第 ${index + 1} 段需按原始时间线合并`,
+    topics: [{
+      title: `第 ${index + 1} 段原始时间线待合并`,
+      participants,
+      summary: [
+        '待确认：该分段的模型请求返回空内容或异常，最终合并阶段必须直接读取 _raw_timeline 中的原始消息文本、时间、发送人、文件名、链接打开结果和媒体元信息。',
+        `范围：${firstTime || '未知时间'} ~ ${lastTime || '未知时间'}，共 ${chunk.length} 条消息，包含 ${mediaText}。`,
+        '图片/视频/音频如果没有被模型成功识别，只能说明已保留元信息，不能编造画面或语音内容。',
+        `分段错误：${sanitizeText(error?.message || String(error))}`,
+      ].join(' '),
+      need_followup: true,
+    }],
+    todos: [],
+    links: fallbackLinksFromChunk(chunk),
+    _fallback_chunk: true,
+    _fallback_error: sanitizeText(error?.message || String(error)),
+    _raw_timeline: bundle.text,
+  };
+}
+
+function chunkMediaStats(bundle = {}) {
+  return {
+    images: Number(bundle.imageCount || 0),
+    audio: Number(bundle.audioCount || 0),
+  };
+}
+
+function fallbackLinksFromChunk(chunk = []) {
+  const out = [];
+  const seen = new Set();
+  for (const msg of chunk) {
+    for (const preview of arrayOf(msg.link_previews)) {
+      const url = normalizeHttpUrl(preview.final_url || preview.url);
+      if (!url || seen.has(url) || !isAnalyzableWebLinkUrl(url)) continue;
+      seen.add(url);
+      out.push({
+        title: cleanField(preview.ai_title || preview.title || url).slice(0, 200),
+        url,
+        summary: cleanLinkSummary(preview.ai_summary || preview.description || preview.excerpt || preview.error || '该网页链接出现在本分段原始消息中；分段模型失败，最终合并需结合上下文判断用途。').slice(0, 1000),
+        from: cleanField(msg.sender),
+        time: cleanField(msg.time),
+      });
+    }
+    const urls = [
+      ...extractUrlsFromText(msg.content),
+      ...extractUrlsFromText(msg.media?.url),
+    ];
+    for (const url of urls) {
+      if (!url || seen.has(url) || !isAnalyzableWebLinkUrl(url)) continue;
+      seen.add(url);
+      out.push({
+        title: url,
+        url,
+        summary: '该网页链接出现在本分段原始消息中；分段模型失败，最终合并需结合上下文判断用途。',
+        from: cleanField(msg.sender),
+        time: cleanField(msg.time),
+      });
+    }
+  }
+  return out;
 }
 
 function buildDigestChunkPlan(messages, llm = {}) {
@@ -1227,6 +1328,7 @@ async function callJsonModel({ settings, model, groupName, since, until, message
     '如果链接打开结果里出现 403、404、超时等失败状态，只能表述为“本程序/本地服务打开链接失败”，不要写成“群内反馈访问失败”或“群友访问失败”，除非聊天原文明确有人这么说。',
     '如果消息附带图片或视频关键帧，请结合视觉内容进行判断；如果接口支持音频输入并收到音频块，可以结合音频内容；如果只是文件或未转写语音，只能根据文件名、扩展名、时长和上下文判断，不要假装读取或听过正文。',
     mergeMode ? '当前输入是全量请求失败后的多个分段 JSON 摘要。你正在合并分段摘要，必须综合所有分段；不要因为后段覆盖前段而丢掉链接、待办、参与人、来源时间或需要跟进议题。links/todos/topics 要从各分段去重保留，冲突时合并信息而不是删除。合并时必须把分段里的过程描述改写成全局结果、最终状态、未解决问题和下一步。' : '',
+    mergeMode ? '如果某段带有 _fallback_chunk 或 _raw_timeline，表示该分段模型请求返回空内容或异常。你必须把 _raw_timeline 当作该段原始聊天时间线继续纳入总结，保留其中的时间、发送人、文件/链接/媒体元信息；但不能编造未成功识别的图片画面或语音内容。' : '',
   ].join('\n');
   const intro = [
     `群名：${groupName}`,
@@ -1247,6 +1349,7 @@ async function callJsonModel({ settings, model, groupName, since, until, message
   let lastError;
   let activeBlocks = blocks;
   let audioRetryUsed = false;
+  let mediaEmptyRetryUsed = false;
   let parseRetryUsed = false;
   let parseRepairUsed = false;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -1277,6 +1380,17 @@ async function callJsonModel({ settings, model, groupName, since, until, message
       if (audioCount && !audioRetryUsed && activeBlocks.some(block => block.kind === 'audio') && isLikelyUnsupportedAudioError(e)) {
         activeBlocks = withoutAudioBlocksForRetry(activeBlocks);
         audioRetryUsed = true;
+        continue;
+      }
+      if ((imageCount || audioCount) && !mediaEmptyRetryUsed && activeBlocks.some(block => block.kind === 'image' || block.kind === 'audio') && isModelEmptyContentError(e)) {
+        activeBlocks = withoutMediaBlocksForEmptyContentRetry(activeBlocks);
+        mediaEmptyRetryUsed = true;
+        audioRetryUsed = true;
+        notifyProgress(onProgress, {
+          phase: 'llm_media_retry',
+          label: 'AI 总结 · 媒体兜底',
+          detail: `任务 ${mode || 'summary'} 带媒体返回空内容，改用文本和媒体元信息重试`,
+        });
         continue;
       }
       if (!parseRetryUsed && isJsonParseError(e)) {
@@ -1333,6 +1447,31 @@ function withoutAudioBlocksForRetry(blocks = []) {
         ),
       };
     });
+}
+
+function withoutMediaBlocksForEmptyContentRetry(blocks = []) {
+  return blocks.map(block => {
+    if (block.kind === 'image') {
+      return {
+        kind: 'text',
+        text: `（${block.ref || '图片/视频关键帧'}：AI 端点带媒体请求返回空内容，已改为仅按对应消息行的时间、发送人、文件名、尺寸等元信息和上下文总结；不要编造画面细节。）`,
+      };
+    }
+    if (block.kind === 'audio') {
+      return {
+        kind: 'text',
+        text: `（${block.ref || '音频'}：AI 端点带媒体请求返回空内容，已改为仅按对应消息行的时间、发送人、文件名、时长等元信息和上下文总结；不要编造语音内容。）`,
+      };
+    }
+    if (block.kind !== 'text') return block;
+    return {
+      ...block,
+      text: String(block.text || '')
+        .replace(/（下一块就是这条消息对应的图片\d+）/g, '（对应图片块触发模型空响应，已改为仅按元信息和上下文总结，不要编造画面细节）')
+        .replace(/（下一块就是这条视频\/文件对应的视频关键帧\d+）/g, '（对应视频关键帧触发模型空响应，已改为仅按元信息和上下文总结，不要编造画面细节）')
+        .replace(/（下一块尝试附上这条消息对应的音频\d+；如果模型不支持音频，仍按本行元信息总结）/g, '（对应音频块触发模型空响应，已改为仅按元信息和上下文总结，不要编造语音内容）'),
+    };
+  });
 }
 
 async function callOpenAI({ settings, model, system, user, intro, blocks = [], signal = null, onProgress = null, mode = '' }) {
@@ -1641,6 +1780,17 @@ function isLikelyChunkableFailure(err) {
   return /context|token|too large|payload|request entity|timeout|timed out|length|maximum|max|rate|overload|capacity|网络请求失败/.test(message);
 }
 
+function isLikelyRecoverableChunkFailure(err) {
+  if (isModelEmptyContentError(err)) return true;
+  if (isJsonParseError(err)) return true;
+  return isLikelyChunkableFailure(err);
+}
+
+function isModelEmptyContentError(err) {
+  const message = String(err?.message || '').toLowerCase();
+  return /empty content|空内容|空响应/.test(message);
+}
+
 function isLikelyUnsupportedAudioError(err) {
   const status = Number(err?.status || 0);
   const message = String(err?.message || '').toLowerCase();
@@ -1686,6 +1836,8 @@ export const __llmInternals = {
   extractMessageLinkTargets,
   enrichMessagesWithLinkPreviews,
   isLikelyChunkableFailure,
+  isLikelyRecoverableChunkFailure,
+  isModelEmptyContentError,
   isLikelyUnsupportedAudioError,
   isJsonParseError,
 };
