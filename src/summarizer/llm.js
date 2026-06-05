@@ -20,6 +20,8 @@ const MESSAGE_CONTEXT_TOTAL_CHARS = 420;
 const DEFAULT_AI_REQUEST_CONCURRENCY = 1;
 const DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS = 15000;
 const CHUNK_RECOVERY_MAX_DEPTH = 3;
+const MERGE_PARTS_PER_CALL = 10;
+const MERGE_RECOVERY_MAX_DEPTH = 2;
 const DEFAULT_LINK_PREVIEW = {
   enabled: true,
   ai_web_search: true,
@@ -439,33 +441,87 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
     onProgress,
     mediaRetryState,
   });
+  return mergeDigestParts({
+    settings,
+    model: settings.llm.long_context_model || model,
+    groupName,
+    since,
+    until,
+    parts: finalParts,
+    signal,
+    onProgress,
+    depth: 0,
+  });
+}
+
+async function mergeDigestParts({ settings, model, groupName, since, until, parts, signal, onProgress, depth = 0 }) {
+  const finalParts = arrayOf(parts).filter(Boolean);
   const summaries = finalParts.map((part, index) => `分段 ${index + 1}${part?._fallback_chunk ? '（原始时间线兜底）' : ''}: ${JSON.stringify(part)}`);
   notifyProgress(onProgress, {
     phase: 'llm_merge',
     label: 'AI 总结 · 合并分段',
-    detail: `${finalParts.length} 段摘要合并为群纪要`,
+    detail: depth ? `${finalParts.length} 段中间摘要继续合并` : `${finalParts.length} 段摘要合并为群纪要`,
   });
   try {
     return await callJsonModel({
       settings,
-      model: settings.llm.long_context_model || model,
+      model,
       groupName,
       since,
       until,
       messageBundle: { text: summaries.join('\n\n'), images: [] },
-      mode: 'merge',
+      mode: depth ? `merge/${depth}` : 'merge',
       signal,
       onProgress,
     });
   } catch (err) {
     if (err?.status === 499 || signal?.aborted) throw err;
     if (!isLikelyRecoverableChunkFailure(err)) throw err;
+    if (finalParts.length > MERGE_PARTS_PER_CALL && depth < MERGE_RECOVERY_MAX_DEPTH) {
+      const groups = chunkArray(finalParts, MERGE_PARTS_PER_CALL);
+      notifyProgress(onProgress, {
+        phase: 'llm_merge_recovery',
+        label: 'AI 总结 · 合并分组重试',
+        detail: `最终合并返回异常，改为 ${groups.length} 组小合并`,
+      });
+      const groupParts = [];
+      for (let index = 0; index < groups.length; index++) {
+        throwIfAborted(signal);
+        notifyProgress(onProgress, {
+          phase: 'llm_merge_recovery',
+          label: 'AI 总结 · 合并分组重试',
+          detail: `正在合并第 ${index + 1}/${groups.length} 组`,
+        });
+        groupParts.push(await mergeDigestParts({
+          settings,
+          model,
+          groupName,
+          since,
+          until,
+          parts: groups[index],
+          signal,
+          onProgress,
+          depth: depth + 1,
+        }));
+      }
+      return mergeDigestParts({
+        settings,
+        model,
+        groupName,
+        since,
+        until,
+        parts: groupParts,
+        signal,
+        onProgress,
+        depth: depth + 1,
+      });
+    }
     notifyProgress(onProgress, {
       phase: 'llm_merge_fallback',
       label: 'AI 总结 · 合并兜底',
       detail: '合并分段返回空内容，已改用本地分段结果合并',
     });
-    return mergeChunkSummariesLocally({ parts: finalParts, groupName, since, until, error: err });
+    return mergeChunkSummariesLocally({ parts: finalParts, groupName, since, until, error: err, allowFallbackParts: true });
   }
 }
 
@@ -576,10 +632,10 @@ function splitChunkForRecovery(chunk) {
   return out;
 }
 
-function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
+function mergeChunkSummariesLocally({ parts, groupName, since, until, error, allowFallbackParts = false }) {
   const validParts = arrayOf(parts).filter(part => part && typeof part === 'object');
   const fallbackParts = validParts.filter(part => part._fallback_chunk);
-  if (fallbackParts.length) {
+  if (fallbackParts.length && !allowFallbackParts) {
     throw httpError(
       502,
       `AI 分段有 ${fallbackParts.length}/${Math.max(1, validParts.length)} 段未返回可用摘要，合并阶段也未能补回；为避免生成不完整或误导性的群总结，本次未保存长图。可稍后重试，或缩短时间范围再生成。`,
@@ -588,6 +644,7 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
   const topics = [];
   const seenTopics = new Set();
   for (const part of validParts) {
+    if (part._fallback_chunk) continue;
     for (const topic of arrayOf(part.topics)) {
       const normalized = normalizeTopic(topic);
       if (!normalized.summary && normalized.title === '未命名议题') continue;
@@ -596,6 +653,14 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
       seenTopics.add(key);
       topics.push(normalized);
     }
+  }
+  for (const part of fallbackParts) {
+    const fallbackTopic = fallbackTopicFromPart(part);
+    if (!fallbackTopic) continue;
+    const key = `${fallbackTopic.title}\n${fallbackTopic.summary.slice(0, 120)}`;
+    if (seenTopics.has(key)) continue;
+    seenTopics.add(key);
+    topics.push(fallbackTopic);
   }
   const todos = dedupeByJson(validParts.flatMap(part => arrayOf(part.todos)).map(normalizeTodo).filter(Boolean)).slice(0, 24);
   const links = publicDigestLinks(dedupeLinks(validParts.flatMap(part => arrayOf(part.links))));
@@ -615,6 +680,43 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error }) {
     links,
     quotes,
   };
+}
+
+function fallbackTopicFromPart(part = {}) {
+  const rawTimeline = cleanFallbackTimeline(part._raw_timeline);
+  const sourceTopic = arrayOf(part.topics)[0] || {};
+  const participants = arrayOf(sourceTopic.participants).map(cleanField).filter(Boolean).slice(0, 12);
+  const scope = cleanField(sourceTopic.summary).match(/范围：([^。]+)。/)?.[1] || '';
+  const media = cleanField(sourceTopic.summary).match(/包含\s*([^。]+)。/)?.[1] || '';
+  const visibleLines = rawTimeline.slice(0, 6);
+  const details = [
+    scope ? `时间范围：${scope}` : '',
+    media ? `涉及内容：${media}` : '',
+    visibleLines.length ? `可见文字线索：${visibleLines.join('；')}` : '',
+    '这小段聊天未被模型稳定提炼，已保留可见文字、发送人、时间、链接和媒体元信息；图片、视频或语音未成功识别时不会编造内容。',
+  ].filter(Boolean).join(' ');
+  if (!details) return null;
+  return {
+    title: '少量消息仅保留元信息',
+    category: '聊天主线',
+    participants,
+    summary: details,
+    need_followup: false,
+  };
+}
+
+function cleanFallbackTimeline(value) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map(line => cleanPublicText(line)
+      .replace(/（对应图片块触发模型空响应[^）]*）/g, '')
+      .replace(/（对应视频关键帧触发模型空响应[^）]*）/g, '')
+      .replace(/（对应音频块触发模型空响应[^）]*）/g, '')
+      .replace(/（下一块[^）]+）/g, '')
+      .trim())
+    .filter(line => line && !/链接打开结果|_raw_timeline|_fallback_chunk|分段错误|Model returned empty content/i.test(line))
+    .filter(line => !/^[-–—\s]*$/.test(line))
+    .slice(0, 12);
 }
 
 function pickLocalMergeHeadline(parts) {
@@ -1758,7 +1860,7 @@ async function callJsonModel({ settings, model, groupName, since, until, message
   const imageCount = messageBundle?.imageCount || 0;
   const audioCount = messageBundle?.audioCount || 0;
   const blocks = (imageCount || audioCount) ? (messageBundle?.blocks || []) : [];
-  const mergeMode = mode === 'merge';
+  const mergeMode = String(mode || '').startsWith('merge');
   const system = [
     '你是一个微信群聊日报助手。总结给群内所有成员看，只输出严格 JSON，不要 Markdown，不要解释。',
     'JSON 字段必须包含 headline、highlights、topics、todos、links、quotes。',
