@@ -380,6 +380,13 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     signal,
     onProgress,
   });
+  raw = await ensureDigestHumanGroupChatStyle({
+    raw,
+    settings,
+    model: llm.long_context_model || model,
+    signal,
+    onProgress,
+  });
 
   return normalizeDigest(raw, {
     groupName,
@@ -2044,6 +2051,119 @@ async function rewriteDigestVisibleTextToChinese({ raw, settings, model, signal 
   return parseJsonModelText(text);
 }
 
+async function ensureDigestHumanGroupChatStyle({ raw, settings, model, signal = null, onProgress = null }) {
+  const locallyCleaned = cleanupDigestStyleLocally(raw);
+  if (!digestNeedsHumanGroupChatStyle(locallyCleaned)) return locallyCleaned;
+  notifyProgress(onProgress, {
+    phase: 'llm_style_polish',
+    label: 'AI 总结 · 成稿自检',
+    detail: '检测到摘要仍像工作汇报，正在改成群聊日报口吻',
+  });
+  try {
+    const polished = await rewriteDigestToHumanGroupChatStyle({ raw: locallyCleaned, settings, model, signal, onProgress });
+    return cleanupDigestStyleLocally(polished);
+  } catch (err) {
+    if (err?.status === 499 || signal?.aborted) throw err;
+    notifyProgress(onProgress, {
+      phase: 'llm_style_polish_fallback',
+      label: 'AI 总结 · 成稿润色兜底',
+      detail: '润色请求失败，改用本地规则去掉模板化表达',
+    });
+    return locallyCleaned;
+  }
+}
+
+async function rewriteDigestToHumanGroupChatStyle({ raw, settings, model, signal = null, onProgress = null }) {
+  throwIfAborted(signal);
+  const system = [
+    '你是微信群聊日报的成稿编辑。只输出严格 JSON，不要 Markdown，不要解释。',
+    '输入已经是摘要 JSON。你的任务不是重新总结，不新增事实，不删除重要话题、链接、金句，只把可见正文改成像群友手工整理的群聊总结。',
+    '必须保留顶层结构 headline、highlights、topics、todos、links、quotes；每个数组元素结构不变。允许把不明确的泛泛待办从 todos 删除，因为普通“验证/排查/持续关注”应该写在 topics 里，不要像工作清单。',
+    '去掉 AI 味和模板味：不要出现“根据聊天记录、以下是、总结如下、整体来看、值得注意的是、该议题、本时间窗、主要围绕、综合来看、从内容看、可以看出、需处理、待确认、仍待验证、持续关注、风险：、结果：、结论：、现状：”这类套话。URL、产品名、模型名和群昵称可保留原文。',
+    '语气要像群里真人整理给大家看的日报：自然、具体、短句优先；可以写“大家聊到/群里主要聊/这条线索/这个话题/后面还没定”，但不要油腻、不要营销、不要装熟。',
+    'headline/highlights 写“大家都聊了什么和有什么有用信息”，不要写成 OKR、项目状态或行动计划。',
+    'topics.summary 保留信息密度，但不要每条都强行写结果、风险和下一步；没有明确结论时自然写“还没聊出统一说法/这块还没定”。',
+    'links.summary 仍要说明链接是干什么的以及群里为什么发它；如果上下文不足，写“前后聊天没给出更多信息，只能看出...”。',
+    'quotes 必须保持原话，不要改写 quote.text；只可清理 context 的模板味。',
+  ].join('\n');
+  const user = [
+    '请把下面摘要 JSON 润色成自然群聊日报，保留事实和 JSON schema：',
+    JSON.stringify(raw || {}, null, 2),
+  ].join('\n');
+  const text = settings.llm.provider === 'anthropic'
+    ? await callAnthropic({ settings, model, system, user, intro: '群聊日报成稿润色', blocks: [], signal, onProgress, mode: 'rewrite/style' })
+    : await callOpenAI({ settings, model, system, user, intro: '群聊日报成稿润色', blocks: [], signal, onProgress, mode: 'rewrite/style' });
+  return parseJsonModelText(text);
+}
+
+function cleanupDigestStyleLocally(raw = {}) {
+  const next = clonePlainObject(raw);
+  next.headline = cleanupAiStyleText(next.headline);
+  next.highlights = arrayOf(next.highlights).map(cleanupAiStyleText).filter(Boolean);
+  next.topics = arrayOf(next.topics).map(topic => ({
+    ...topic,
+    title: cleanupAiStyleText(topic?.title),
+    category: cleanupAiStyleText(topic?.category),
+    summary: cleanupAiStyleText(topic?.summary),
+    participants: arrayOf(topic?.participants).map(cleanField).filter(Boolean),
+  }));
+  next.todos = arrayOf(next.todos)
+    .map(todo => ({
+      ...todo,
+      owner: cleanupAiStyleText(todo?.owner),
+      item: cleanupAiStyleText(todo?.item),
+      deadline: cleanupAiStyleText(todo?.deadline),
+    }))
+    .filter(todo => isStrongGroupFollowup(todo.item, todo.owner, todo.deadline));
+  next.links = arrayOf(next.links).map(link => ({
+    ...link,
+    title: cleanupAiStyleText(link?.title),
+    summary: cleanupAiStyleText(link?.summary || link?.description || link?.context),
+    from: cleanField(link?.from),
+    time: cleanField(link?.time),
+  }));
+  next.quotes = arrayOf(next.quotes).map(quote => {
+    if (typeof quote === 'string') return quote;
+    return {
+      ...quote,
+      speaker: cleanField(quote?.speaker),
+      text: cleanField(quote?.text),
+      context: cleanupAiStyleText(quote?.context),
+    };
+  });
+  return next;
+}
+
+function clonePlainObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? JSON.parse(JSON.stringify(value)) : {};
+}
+
+function cleanupAiStyleText(value) {
+  let text = cleanPublicText(value);
+  if (!text) return '';
+  text = text
+    .replace(/^(?:根据聊天记录|根据群聊内容|以下是(?:本次)?(?:群聊)?总结|总结如下|整体来看|综合来看|从聊天(?:内容)?看|从内容看)[：:，,\s]*/g, '')
+    .replace(/本时间窗/g, '这段时间')
+    .replace(/该议题/g, '这个话题')
+    .replace(/主要围绕/g, '主要聊')
+    .replace(/值得注意的是[，,：:]?/g, '')
+    .replace(/可以看出[，,：:]?/g, '')
+    .replace(/群内成员/g, '群友')
+    .replace(/^进展跟踪$/g, '后续讨论')
+    .replace(/^仍需确认$/g, '未确认')
+    .replace(/^工具运维问题$/g, '工具使用')
+    .replace(/需处理事项/g, '后续关注')
+    .replace(/需处理/g, '后面可以看下')
+    .replace(/仍待验证/g, '还没完全定')
+    .replace(/待验证/g, '还没完全定')
+    .replace(/仍待确认/g, '还没定')
+    .replace(/待确认/g, '还没定')
+    .replace(/持续关注/g, '后面再看')
+    .replace(/聊天上下文不足，当前只能确认[:：]?/g, '前后聊天没给出更多信息，只能看出')
+    .replace(/^(结果|结论|现状|风险|待确认|后续)[:：]\s*/g, '');
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 function withoutAudioBlocksForRetry(blocks = []) {
   return blocks
     .filter(block => block.kind !== 'audio')
@@ -2363,6 +2483,42 @@ function digestNeedsChineseRewrite(raw) {
   return visibleTexts.some(text => isInternalVisibleText(text) || isEnglishHeavyText(text));
 }
 
+function digestNeedsHumanGroupChatStyle(raw) {
+  const visibleTexts = digestStyleVisibleTexts(raw);
+  if (!visibleTexts.length) return false;
+  let score = 0;
+  for (const text of visibleTexts) {
+    if (DIGEST_WORK_REPORT_RE.test(text)) score += 2;
+    if (/^(?:结果|结论|现状|风险|待确认|后续)[:：]\s*/.test(text)) score += 2;
+    if (/(?:下一步|行动项|责任人|处理进度|任务清单|工作汇报|OKR)/i.test(text)) score += 1;
+    if (text.length >= 160 && /(?:风险|结果|结论|待确认|需处理|下一步|follow[- ]?up)/i.test(text)) score += 1;
+  }
+
+  const topics = arrayOf(raw?.topics);
+  const todos = arrayOf(raw?.todos);
+  const followupTopics = topics.filter(topic => !!topic?.need_followup).length;
+  const weakTodos = todos.filter(todo => !isStrongGroupFollowup(todo?.item, todo?.owner, todo?.deadline)).length;
+  if (todos.length >= 5) score += 2;
+  else if (todos.length >= 3) score += 1;
+  if (weakTodos >= 2) score += 2;
+  else if (weakTodos === 1) score += 1;
+  if (topics.length >= 4 && followupTopics >= Math.ceil(topics.length * 0.6)) score += 2;
+  else if (followupTopics >= 3) score += 1;
+
+  return score >= 2;
+}
+
+function digestStyleVisibleTexts(raw) {
+  return [
+    raw?.headline,
+    ...arrayOf(raw?.highlights),
+    ...arrayOf(raw?.topics).flatMap(item => [item?.title, item?.category, item?.summary]),
+    ...arrayOf(raw?.todos).flatMap(item => [item?.owner, item?.item, item?.deadline]),
+    ...arrayOf(raw?.links).flatMap(item => [item?.title, item?.summary || item?.description || item?.context]),
+    ...arrayOf(raw?.quotes).flatMap(item => (typeof item === 'string' ? [] : [item?.context])),
+  ].map(cleanField).filter(Boolean);
+}
+
 function arrayOf(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -2372,6 +2528,7 @@ function cleanField(value) {
 }
 
 const INTERNAL_VISIBLE_ERROR_RE = /(?:_?raw_timeline|_fallback_chunk|Model returned empty content|Messages returned empty content|Encrypted content could not be decrypted|分段错误|raw timeline)/i;
+const DIGEST_WORK_REPORT_RE = /(?:根据聊天记录|根据群聊内容|以下是|总结如下|整体来看|综合来看|从聊天(?:内容)?看|从内容看|值得注意的是|可以看出|本时间窗|该议题|主要围绕|需处理|待确认|仍待确认|待验证|仍待验证|持续关注|继续关注|保持关注|风险[:：]|结果[:：]|结论[:：]|现状[:：]|行动清单|工作汇报|任务清单|处理事项|进展跟踪|仍需确认|工具运维问题)/i;
 const TODO_ACTION_RE = /确认|处理|跟进|补充|整理|报名|提交|付款|测试|验证|联系|修复|发布|更新|迁移|查看|统计|安排|提醒|复盘|决定|对齐|收集|申请|注册|认领|补发|回复|开通|关闭|领取|报销|交付|检查|排查|推进|落实|回访|同步/;
 const CJK_RE = /[\u3400-\u9fff]/;
 const TODO_PLACEHOLDER_RE = /^(待认领|未指定|无|暂无|不明确|待定|未定|待确认)$/;
@@ -2444,7 +2601,7 @@ function normalizeTopicCategory(value, topic = {}) {
   const haystack = `${topic.title || ''} ${topic.summary || ''}`.toLowerCase();
   if (/github|文档|教程|链接|仓库|资料|入口|官网|下载/.test(haystack)) return '资源分享';
   if (/观点|理念|趋势|行业|能力|效率|未来|职业|工作流|认知|思考|争议|看法/.test(haystack)) return '观点讨论';
-  if (/确认|跟进|修复|处理|任务|目标|goal|迁移|发布|上线|测试|排查|付款|领取|结果|待确认/.test(haystack)) return '进展跟踪';
+  if (/确认|跟进|修复|处理|任务|目标|goal|迁移|发布|上线|测试|排查|付款|领取|结果|待确认/.test(haystack)) return '后续讨论';
   return '聊天主线';
 }
 
@@ -2490,7 +2647,7 @@ function hasChatContextSignal(value) {
 function publicFallbackTopic() {
   return {
     title: '部分消息仍待人工确认',
-    category: '仍需确认',
+    category: '未识别消息',
     participants: [],
     summary: '部分分段的模型请求未返回可用内容，系统只保留了这些消息的时间、发送人、文件、链接和媒体元信息；未识别出的图片画面或语音内容需要结合原聊天确认。',
     need_followup: true,
@@ -2670,4 +2827,7 @@ export const __llmInternals = {
   isLikelyUnsupportedAudioError,
   isLikelyUnsupportedMediaError,
   isJsonParseError,
+  cleanupAiStyleText,
+  cleanupDigestStyleLocally,
+  digestNeedsHumanGroupChatStyle,
 };
