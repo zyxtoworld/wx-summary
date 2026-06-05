@@ -217,12 +217,21 @@ function cleanTodos(value) {
     owner: cleanTodoMeta(item?.owner),
     item: String(item?.item || ''),
     deadline: cleanTodoMeta(item?.deadline),
-  })).filter(item => item.item).slice(0, 100) : [];
+  })).filter(item => item.item && isStrongTodoForRender(item)).slice(0, 20) : [];
 }
 
 function cleanTodoMeta(value) {
   const text = String(value || '').trim();
   return /^(待认领|未指定|无|暂无|不明确|待定|未定|待确认)$/.test(text) ? '' : text;
+}
+
+function isStrongTodoForRender(todo = {}) {
+  const item = String(todo.item || '').trim();
+  if (!item) return false;
+  if (/持续关注|继续关注|保持关注|观察|对比|评估|确认是否|验证.*稳定性|排查.*原因|优化.*速度|准备.*方案|确定.*路线/.test(item)) return false;
+  if (todo.owner || todo.deadline) return true;
+  return /报名|付款|提交|联系|交付|报销|补发|回复|注册|开通|关闭|领取|上传|发布|更新|迁移|修复|整理|收集|安排/.test(item)
+    && /请|需要|要|待|明天|今天|今晚|本周|下周|尽快|继续|统一|群里|大家|管理员|负责人/.test(item);
 }
 
 function cleanHighlights(value) {

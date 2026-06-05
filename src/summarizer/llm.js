@@ -1760,20 +1760,20 @@ async function callJsonModel({ settings, model, groupName, since, until, message
   const blocks = (imageCount || audioCount) ? (messageBundle?.blocks || []) : [];
   const mergeMode = mode === 'merge';
   const system = [
-    '你是一个微信群公共纪要助手。总结给群内所有成员看，只输出严格 JSON，不要 Markdown，不要解释。',
+    '你是一个微信群聊日报助手。总结给群内所有成员看，只输出严格 JSON，不要 Markdown，不要解释。',
     'JSON 字段必须包含 headline、highlights、topics、todos、links、quotes。',
-    'headline 不超过 50 个中文字符；highlights 返回 3-6 条给只看第一屏的人看的关键结论，每条 15-60 个中文字符，按重要性排序。highlights 要写“发生了什么、结果是什么、还差什么”，不要写“大家讨论了/有人分享了”。',
-    'topics 每项包含 title、category、participants、summary、need_followup。category 是你根据当天内容自拟的中文分组标题，4-12 个字，像写给群友看的小标题；不要套固定模板，不要照搬参考日报栏目，不要为了分类而分类。',
+    '这不是项目周报、工作汇报、行动清单或复盘材料。首要目标是让没爬楼的群友快速知道大家都聊了什么、哪些信息有用、哪些观点有意思、哪些链接/图片/文件引发了讨论。',
+    'headline 不超过 50 个中文字符；highlights 返回 3-6 条给只看第一屏的人看的聊天速览，每条 15-60 个中文字符，按群友最关心的聊天线索排序。写清主要话题和有用信息；有明确结果才写结果，不要把每条都写成“待确认/仍需处理”。',
+    'topics 每项包含 title、category、participants、summary、need_followup。category 是你根据当天内容自拟的中文分组标题，4-12 个字，像群聊栏目名，例如“工具踩坑”“资源分享”“观点争论”“账号支付”“轻松闲聊”；不要套工作汇报模板。',
     '总结正文必须使用简体中文：headline、topics.summary、todos.item、todos.deadline、links.summary 这些解释性内容要中文表达。URL、代码标识、项目名、模型名、链接原始标题和群成员昵称可以保留原文，但不要输出英文说明句、英文连接词或英文错误原文。',
-    '必须结果导向，不要只写“大家讨论了什么/分享了什么/有人说了什么”。headline 要写本时间窗最重要的结论或当前状态。',
-    '每个 topics.summary 的第一句必须先写清结果、现状、结论、风险或待确认项；如果聊天没有形成明确结论，第一句要直接说明“未形成结论/仍待确认”，再说明分歧或缺口。',
-    'topics.summary 不要以“群内讨论了”“围绕某话题”“成员分享了”“有人提到”等过程句开头；可以写“现状：...”“结果：...”“风险：...”“待确认：...”。',
-    'topics.summary 后续再补充关键依据、影响范围和下一步，不要把过程流水账当成总结。优先回答：最后怎么样了、解决了吗、谁需要做什么、还卡在哪里、对群成员有什么用。',
+    'summary 要像自然的群聊总结：先说明这条聊天主线里大家在聊什么、争论点或有用信息是什么，再补充明确结论、分歧或未定点。不要强行把普通聊天改写成“结果/风险/待确认/下一步”。',
+    '可以写“大家主要聊了...”“这个话题集中在...”“群里有人分享...”，但必须合并提炼，不要按消息流水账照抄。只有真的形成明确结论时，才写“结论/结果”；只有真的需要继续做事时，才写“后续”。',
+    '不要把每个议题都写成工作状态报告；少用“受阻、待验证、仍待确认、需处理、尚未恢复、持续排查”这类汇报腔，除非聊天核心就是问题处理。',
     '不要按消息顺序逐条照抄；相同事项必须合并成一个议题。title 要是“群友读完就知道这条讲什么”的事项标题，不要只写关键词。',
     '如果议题来自链接、图片、视频、语音或文件，summary 必须把内容和发送时间、发送人、前后聊天上下文关联起来：说明它在群聊里被用来证明什么、询问什么、推进什么或引出什么结论。上下文不足时必须写“聊天上下文不足，只能确认...”，不要写成脱离群聊的网页介绍或图片说明。',
     'todos/links 没有内容时返回空数组。',
     'quotes 表示“代表性说法”，从聊天原文中挑 0-5 条对群成员有公共价值、能代表情绪或观点的短句；每项包含 speaker、text、context。不要编造原话，不要摘取隐私或只对单个人有意义的话。',
-    'todos 表示“还要处理”的事项，只有明确需要继续确认、处理、验证、报名、付款、交付或由某人/全群继续推进时才写；普通信息点、关键词列表、链接清单不要写进 todos。负责人不明确但确实要跟进时，owner 留空，不要写“待认领”。',
+    'todos 表示“后续关注”，不是待办清单。只有聊天里明确有人要做、明确要报名/付款/提交/联系/交付，或全群明确约定下一步时才写，通常 0-3 条，最多 5 条。普通信息点、猜测、可再验证、链接清单、工具状态、泛泛的“持续关注/排查/优化/确认”不要写进 todos，而应写在 topics 里。',
     '不要输出面向单个账号的提醒栏目；有人被点名时，只有对全群有公共价值才写进 topics 或 todos，并使用群昵称。',
     'links 每项包含 title、url、summary、from、time；summary 必须说明这个网页链接是干什么的、和聊天上下文有什么关系，不能只重复 URL。',
     'links.summary 也要结果导向：说明这个网页能提供什么结论/入口/证据，以及群里为什么需要它；不要只写“用于讨论某话题”。',
@@ -1783,18 +1783,18 @@ async function callJsonModel({ settings, model, groupName, since, until, message
     '如果链接打开结果里出现 403、404、超时等失败状态，只能表述为“本程序/本地服务打开链接失败”，不要写成“群内反馈访问失败”或“群友访问失败”，除非聊天原文明确有人这么说。',
     '不要把 raw_timeline、_raw_timeline、_fallback_chunk、Model returned empty content、Encrypted content could not be decrypted、error 等内部字段或错误原文写入任何可见字段；如需说明，只能用中文写“部分消息仅保留了时间、发送人和媒体/链接元信息，内容仍待人工确认”。',
     '如果消息附带图片或视频关键帧，请结合视觉内容进行判断；如果接口支持音频输入并收到音频块，可以结合音频内容；如果只是文件或未转写语音，只能根据文件名、扩展名、时长和上下文判断，不要假装读取或听过正文。',
-    mergeMode ? '当前输入是全量请求失败后的多个分段 JSON 摘要。你正在合并分段摘要，必须综合所有分段；不要因为后段覆盖前段而丢掉链接、后续处理事项、参与人、来源时间、代表性说法或需要跟进议题。links/todos/topics/quotes 要从各分段去重保留，冲突时合并信息而不是删除。合并时必须把分段里的过程描述改写成全局结果、最终状态、未解决问题和下一步。' : '',
+    mergeMode ? '当前输入是全量请求失败后的多个分段 JSON 摘要。你正在合并分段摘要，必须综合所有分段；不要因为后段覆盖前段而丢掉链接、参与人、来源时间、代表性说法或有公共价值的聊天主线。links/topics/quotes 要从各分段去重保留，冲突时合并信息而不是删除。合并时把分段里的工作汇报腔改成自然的群聊日报口吻；todos 只保留明确行动，不要把每个未定点都变成待办。' : '',
     mergeMode ? '如果某段带有 _fallback_chunk 或 _raw_timeline，表示该分段模型请求返回空内容或异常。你必须把 _raw_timeline 当作该段原始聊天时间线继续纳入总结，保留其中的时间、发送人、文件/链接/媒体元信息；但不能编造未成功识别的图片画面或语音内容。' : '',
   ].join('\n');
   const intro = [
     `群名：${groupName}`,
     `时间窗：${since} ~ ${until}`,
     `任务模式：${mode}`,
-    mergeMode ? '输入内容是“分段 N: {...}”形式的中间摘要，不是原始聊天。请保留每个分段里出现过的明确后续处理事项、重要网页链接、发送人、时间、图片/文件/语音相关结论和后续跟进点；只做去重、归并和提炼，不得省略独立事项。' : '',
+    mergeMode ? '输入内容是“分段 N: {...}”形式的中间摘要，不是原始聊天。请保留每个分段里出现过的重要聊天主线、网页链接、发送人、时间、图片/文件/语音相关信息；只做去重、归并和提炼，不得省略独立话题。明确行动才进 todos，普通未定点写进 topics。' : '',
     imageCount ? `多模态消息数：${imageCount} 张图片。下面内容按消息时间顺序排列；图片块紧跟它对应的消息行，请把图片与该行的时间、发送人、前后聊天上下文关联；不要只描述画面，要说明图片在聊天里承担的含义或待确认点。` : '',
     audioCount ? `音频消息数：${audioCount} 条。若后续内容包含音频块，请尝试听取；若模型接口不支持音频，仍需保留该语音消息的时间、发送人和元信息，不要编造语音内容。` : '',
     messageBundle?.linkPreviewCount ? `链接打开结果：${messageBundle.linkPreviewCount} 个。每个结果都附在对应消息行下方；对应消息行可能带有“前后聊天上下文”。请优先根据前后聊天上下文判断链接为什么被发，再结合页面内容总结用途；失败状态只代表本程序访问该网页失败，不代表群内成员反馈。` : '',
-    '请按公共群纪要视角提炼真正有用的信息，写给没爬楼但需要快速跟上的群成员。每个议题先给结论/结果/现状，再给必要背景；没有结论就明确写“未形成结论/仍待确认”。保留明确的后续处理事项、重要网页链接及其用途说明、需要跟进的议题。',
+    '请按群聊日报视角提炼真正有用的信息，写给没爬楼但想快速跟上大家聊了什么的群成员。优先保留聊天主线、观点、资源、吐槽、经验和有趣说法；有明确结论就写结论，没有结论就自然说明分歧或还没定，不要强行制造待办。',
   ].filter(Boolean).join('\n');
   const user = [
     intro,
@@ -2286,11 +2286,22 @@ function normalizeTodo(todo = {}) {
   if (!item || isInternalVisibleText(item) || isEnglishHeavyText(item) || looksLikeKeywordOnlyTodo(item)) return null;
   const owner = cleanPublicText(todo.owner);
   const deadline = cleanPublicText(todo.deadline);
+  if (!isStrongGroupFollowup(item, owner, deadline)) return null;
   return {
     owner: isEnglishHeavyText(owner) || TODO_PLACEHOLDER_RE.test(owner) ? '' : owner,
     item,
     deadline: isEnglishHeavyText(deadline) || TODO_PLACEHOLDER_RE.test(deadline) ? '' : deadline,
   };
+}
+
+function isStrongGroupFollowup(item, owner = '', deadline = '') {
+  const text = cleanField(item);
+  if (!text) return false;
+  if (/持续关注|继续关注|保持关注|观察|对比|评估|确认是否|验证.*稳定性|排查.*原因|优化.*速度|准备.*方案|确定.*路线/.test(text)) return false;
+  if (cleanField(owner) && !TODO_PLACEHOLDER_RE.test(cleanField(owner))) return true;
+  if (cleanField(deadline) && !TODO_PLACEHOLDER_RE.test(cleanField(deadline))) return true;
+  return /报名|付款|提交|联系|交付|报销|补发|回复|注册|开通|关闭|领取|上传|发布|更新|迁移|修复|整理|收集|安排/.test(text)
+    && /请|需要|要|待|明天|今天|今晚|本周|下周|尽快|继续|统一|群里|大家|管理员|负责人/.test(text);
 }
 
 function normalizeHighlights(raw = {}) {
@@ -2329,10 +2340,10 @@ function normalizeTopicCategory(value, topic = {}) {
   const text = cleanField(value);
   if (text && !isInternalVisibleText(text) && text.length <= 16) return text;
   const haystack = `${topic.title || ''} ${topic.summary || ''}`.toLowerCase();
-  if (/确认|跟进|修复|处理|任务|目标|goal|迁移|发布|上线|测试|排查|付款|领取|结果|待确认/.test(haystack)) return '仍需确认';
-  if (/github|文档|教程|链接|仓库|资料|入口|官网|下载/.test(haystack)) return '资料依据';
-  if (/观点|理念|趋势|行业|能力|效率|未来|职业|工作流|认知|思考|争议|看法/.test(haystack)) return '观点判断';
-  return '重点事项';
+  if (/github|文档|教程|链接|仓库|资料|入口|官网|下载/.test(haystack)) return '资源分享';
+  if (/观点|理念|趋势|行业|能力|效率|未来|职业|工作流|认知|思考|争议|看法/.test(haystack)) return '观点讨论';
+  if (/确认|跟进|修复|处理|任务|目标|goal|迁移|发布|上线|测试|排查|付款|领取|结果|待确认/.test(haystack)) return '进展跟踪';
+  return '聊天主线';
 }
 
 function normalizeQuote(value = {}) {
