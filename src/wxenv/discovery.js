@@ -2370,9 +2370,11 @@ function parseHexRva(value) {
 
 export function pickAccount(accounts, accountId = '') {
   if (!accounts?.length) return null;
-  if (accountId) {
-    const found = accounts.find(a => a.id === accountId || a.wxid === accountId);
+  const requested = String(accountId || '').trim();
+  if (requested) {
+    const found = accounts.find(a => a.id === requested || a.wxid === requested || a.account_id === requested);
     if (found) return found;
+    return null;
   }
   return accounts[0];
 }

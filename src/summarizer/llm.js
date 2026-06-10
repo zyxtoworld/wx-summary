@@ -25,6 +25,7 @@ const DEFAULT_LINK_PREVIEW = {
   enabled: true,
   ai_web_search: true,
   max_links: 0,
+  allow_private_networks: false,
   timeout_ms: 8000,
   max_bytes: 256 * 1024,
   max_chars_per_link: 2000,
@@ -333,6 +334,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   });
   const normalized = sourceMessages.map(m => redactStructuredValue(m, settings.privacy));
   const enriched = await enrichMessagesWithLinkPreviews(normalized, settings.link_preview, settings, signal, onProgress);
+  const linkPolicy = { allow_private_networks: linkPreviewAllowsPrivateNetworks(settings.link_preview) };
   throwIfAborted(signal);
   const contextualMessages = attachGlobalNearbyContexts(enriched);
   const chunkableMessages = prepareMessagesForChunking(contextualMessages, llm);
@@ -418,7 +420,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     signal,
     onProgress,
   });
-  assertDigestPublishable(raw, { messageCount: sourceMessages.length });
+  assertDigestPublishable(raw, { messageCount: sourceMessages.length, ...linkPolicy });
 
   return normalizeDigest(raw, {
     groupName,
@@ -427,6 +429,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     messageCount: sourceMessages.length,
     model,
     linkPreviewCount: enriched.reduce((n, msg) => n + (msg.link_previews?.length || 0), 0),
+    ...linkPolicy,
   });
 }
 
@@ -846,9 +849,9 @@ function dedupeLinks(links) {
   return out;
 }
 
-function publicDigestLinks(links, limit = 12) {
+function publicDigestLinks(links, limit = 12, cfg = {}) {
   return arrayOf(links)
-    .filter(link => isAnalyzableWebLinkUrl(link?.url))
+    .filter(link => isAnalyzableWebLinkUrl(link?.url, cfg))
     .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
     .slice(0, limit);
 }
@@ -1601,7 +1604,7 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
   if (cfg.enabled === false) return messages;
   throwIfAborted(signal);
 
-  const targets = extractMessageLinkTargets(messages);
+  const targets = extractMessageLinkTargets(messages, cfg);
   if (!targets.length) return messages;
 
   const uniqueUrls = [...new Set(targets.map(t => t.url))];
@@ -1641,7 +1644,7 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
   });
   await Promise.all(workers);
 
-  const researchUrls = uniqueUrls.filter(url => isAnalyzableLinkPreview(previewByUrl.get(url)));
+  const researchUrls = uniqueUrls.filter(url => isAnalyzableLinkPreview(previewByUrl.get(url), cfg));
   let aiResearch = new Map();
   try {
     aiResearch = await fetchAiLinkResearchForUrls(researchUrls, settings, cfg, signal, onProgress);
@@ -1668,31 +1671,31 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
   return messages.map((msg, index) => {
     const urls = urlsByMessage.get(index);
     if (!urls?.length) return msg;
-    const previews = urls.map(url => previewByUrl.get(url)).filter(isAnalyzableLinkPreview);
+    const previews = urls.map(url => previewByUrl.get(url)).filter(preview => isAnalyzableLinkPreview(preview, cfg));
     return previews.length ? { ...msg, link_previews: previews } : msg;
   });
 }
 
-function extractMessageLinkTargets(messages) {
+function extractMessageLinkTargets(messages, cfg = {}) {
   const targets = [];
   for (let index = 0; index < messages.length; index++) {
     const msg = messages[index];
     const urls = new Set([
-      ...extractUrlsFromText(msg.content),
-      ...extractUrlsFromText(msg.media?.url),
+      ...extractUrlsFromText(msg.content, cfg),
+      ...extractUrlsFromText(msg.media?.url, cfg),
     ]);
     for (const url of urls) targets.push({ index, url, time: msg.time, sender: msg.sender });
   }
   return targets;
 }
 
-function extractUrlsFromText(text) {
+function extractUrlsFromText(text, cfg = {}) {
   const value = String(text || '');
   const matches = value.match(/https?:\/\/[^\s<>"'`]+/gi) || [];
   return matches
     .map(cleanUrlCandidate)
     .map(normalizeHttpUrl)
-    .filter(url => url && isAnalyzableWebLinkUrl(url));
+    .filter(url => url && isAnalyzableWebLinkUrl(url, cfg));
 }
 
 function cleanUrlCandidate(value) {
@@ -1714,17 +1717,21 @@ function normalizeHttpUrl(value) {
 
 const DIRECT_MEDIA_URL_RE = /\.(?:avif|bmp|gif|heic|heif|ico|jpe?g|png|svg|tiff?|webp|mp4|m4v|mov|avi|mkv|webm|3gp|mp3|wav|m4a|aac|oga?|flac|amr|silk)(?:$|[?#])/i;
 
-function isAnalyzableWebLinkUrl(value) {
-  const url = normalizeHttpUrl(value);
-  return !!url && !DIRECT_MEDIA_URL_RE.test(url) && !isIgnoredWebLinkUrl(url);
+function linkPreviewAllowsPrivateNetworks(cfg = {}) {
+  return cfg.allow_private_networks === true || cfg.allow_private_networks === 'true';
 }
 
-function isIgnoredWebLinkUrl(value) {
+function isAnalyzableWebLinkUrl(value, cfg = {}) {
+  const url = normalizeHttpUrl(value);
+  return !!url && !DIRECT_MEDIA_URL_RE.test(url) && !isIgnoredWebLinkUrl(url, cfg);
+}
+
+function isIgnoredWebLinkUrl(value, cfg = {}) {
   try {
     const parsed = new URL(String(value || '').trim());
     const host = parsed.hostname.toLowerCase();
     const pathname = parsed.pathname.toLowerCase();
-    if (isPrivateOrLocalHost(host)) return true;
+    if (!linkPreviewAllowsPrivateNetworks(cfg) && isPrivateOrLocalHost(host)) return true;
     if (host === 'mp.weixin.qq.com' && (pathname.startsWith('/mp/wappoc_appmsgcaptcha') || pathname.startsWith('/mp/waerrpage'))) return true;
     if (host === 'support.weixin.qq.com' && (pathname.startsWith('/cgi-bin/mmsupport-bin/readtemplate') || pathname.startsWith('/update'))) return true;
     if (host === 'wxapp.tenpay.com' && pathname.startsWith('/mmpayhb/')) return true;
@@ -1767,16 +1774,16 @@ function isMediaContentType(contentType = '') {
   return /^(?:image|audio|video)\//i.test(String(contentType || '').trim());
 }
 
-function isAnalyzableLinkPreview(preview) {
+function isAnalyzableLinkPreview(preview, cfg = {}) {
   if (!preview || preview.status === 'skipped_media') return false;
-  return isAnalyzableWebLinkUrl(preview.url) && (!preview.final_url || isAnalyzableWebLinkUrl(preview.final_url));
+  return isAnalyzableWebLinkUrl(preview.url, cfg) && (!preview.final_url || isAnalyzableWebLinkUrl(preview.final_url, cfg));
 }
 
 async function fetchLinkPreview(targetUrl, cfg, signal = null) {
   throwIfAborted(signal);
   const url = normalizeHttpUrl(targetUrl);
   if (!url) return { url: targetUrl, status: 'skipped', error: '不是 http(s) 链接' };
-  if (!isAnalyzableWebLinkUrl(url)) {
+  if (!isAnalyzableWebLinkUrl(url, cfg)) {
     return { url, status: 'skipped_media', error: '图片/音视频直链不做网页摘要' };
   }
 
@@ -2661,21 +2668,26 @@ function digestPublishabilityReport(raw = {}, context = {}) {
   const links = arrayOf(raw?.links);
   const quotes = arrayOf(raw?.quotes);
   const highlights = arrayOf(raw?.highlights).map(cleanField).filter(Boolean);
+  const effectiveTodos = arrayOf(raw?.todos).map(normalizeTodo).filter(Boolean);
   const messageCount = Number(context.messageCount || 0);
   const visibleTexts = digestQualityVisibleTexts(raw);
   const leakCount = visibleTexts.filter(text => DIGEST_FALLBACK_LEAK_RE.test(text)).length;
   const fallbackTopicCount = topics.filter(topic => DIGEST_FALLBACK_TOPIC_RE.test(`${topic?.title || ''} ${topic?.category || ''} ${topic?.summary || ''}`)).length;
   const badHeadline = DIGEST_BAD_HEADLINE_RE.test(cleanField(raw?.headline));
   const effectiveTopics = topics.filter(topic => cleanField(topic?.title).length >= 2 && cleanField(topic?.summary).length >= 12);
-  const effectiveLinks = links.filter(link => isAnalyzableWebLinkUrl(link?.url));
+  const effectiveLinks = links.filter(link => isAnalyzableWebLinkUrl(link?.url, context));
   const effectiveQuotes = quotes.filter(quote => cleanField(typeof quote === 'string' ? quote : quote?.text).length >= 4);
   const sparse = messageCount >= 5
     && effectiveTopics.length === 0
     && effectiveLinks.length === 0
     && effectiveQuotes.length === 0
+    && effectiveTodos.length === 0
     && highlights.length === 0;
   const veryThin = messageCount >= 20
     && effectiveTopics.length === 0
+    && effectiveLinks.length === 0
+    && effectiveQuotes.length === 0
+    && effectiveTodos.length === 0
     && highlights.length < 2;
   const repeatedFallback = fallbackTopicCount >= 3 || (fallbackTopicCount >= 2 && fallbackTopicCount >= Math.ceil(Math.max(1, topics.length) * 0.25));
   const blocked = sparse || veryThin || (badHeadline && leakCount > 0) || repeatedFallback || leakCount >= 4;
@@ -2998,7 +3010,7 @@ function normalizeDigest(raw, meta) {
   const topics = dedupeTopics(arrayOf(raw?.topics).map(normalizeTopic).filter(t => t.summary || t.title !== '未命名议题'));
   const links = arrayOf(raw?.links)
     .map(normalizeLink)
-    .filter(l => isAnalyzableWebLinkUrl(l.url));
+    .filter(l => isAnalyzableWebLinkUrl(l.url, meta));
   const quotes = arrayOf(raw?.quotes).map(normalizeQuote).filter(Boolean).slice(0, 8);
   return {
     digest_id: digestId,
@@ -3012,7 +3024,7 @@ function normalizeDigest(raw, meta) {
     mentions_me: [],
     todos,
     topics,
-    links: publicDigestLinks(links),
+    links: publicDigestLinks(links, 12, meta),
     quotes,
     created_at: new Date().toISOString(),
   };
@@ -3109,6 +3121,7 @@ function isStrongGroupFollowup(item, owner = '', deadline = '') {
   if (/持续关注|继续关注|保持关注|观察|对比|评估|确认是否|验证.*稳定性|排查.*原因|优化.*速度|准备.*方案|确定.*路线/.test(text)) return false;
   if (cleanField(owner) && !TODO_PLACEHOLDER_RE.test(cleanField(owner))) return true;
   if (cleanField(deadline) && !TODO_PLACEHOLDER_RE.test(cleanField(deadline))) return true;
+  if (/(?:跟进|确认|查看|处理|同步|回复|联系).{0,8}(?:报价|订单|进度|结果|问题|客户|供应商|合同|发票|报名|付款|交付|资料|链接|需求)|(?:报价|订单|进度|结果|问题|客户|供应商|合同|发票|报名|付款|交付|资料|链接|需求).{0,8}(?:跟进|确认|查看|处理|同步|回复|联系)/.test(text)) return true;
   return /报名|付款|提交|联系|交付|报销|补发|回复|注册|开通|关闭|领取|上传|发布|更新|迁移|修复|整理|收集|安排/.test(text)
     && /请|需要|要|待|明天|今天|今晚|本周|下周|尽快|继续|统一|群里|大家|管理员|负责人/.test(text);
 }

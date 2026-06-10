@@ -3457,7 +3457,7 @@ async function renderSettings() {
     $st.className = 'status';
     $st.textContent = '保存中...';
     try {
-      await api('/api/settings', {
+      const r = await api('/api/settings', {
         method: 'PUT',
         body: {
           privacy: {
@@ -3469,10 +3469,19 @@ async function renderSettings() {
           wechat: wechatPatch,
         },
       });
+      if (r.settings?.wechat) s.wechat = r.settings.wechat;
       document.getElementById('s-manual-key').value = '';
       $st.className = 'status ok';
       const savedManualCount = keyMode === 'manual' ? manualKeys.keys.length : 0;
-      $st.textContent = savedManualCount ? `✓ 已保存隐私设置（${savedManualCount} 条手动密钥）` : '✓ 已保存隐私设置';
+      if (savedManualCount) {
+        $st.textContent = `✓ 已保存隐私设置（${savedManualCount} 条手动密钥）`;
+      } else if (keyMode === 'manual' && s.wechat.manual_key_set) {
+        $st.textContent = '✓ 已保存隐私设置；未填写新手动密钥，已保留原密钥';
+      } else if (keyMode === 'manual') {
+        $st.textContent = '✓ 已保存隐私设置；未填写手动密钥';
+      } else {
+        $st.textContent = '✓ 已保存隐私设置；已切回自动模式并清除手动密钥';
+      }
     } catch (e) {
       $st.className = 'status err';
       $st.textContent = '✗ 保存失败：' + e.message;

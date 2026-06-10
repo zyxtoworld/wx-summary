@@ -5,7 +5,7 @@ import path from 'node:path';
 import url from 'node:url';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
-import { collectMessages, detectWeixin, listAccounts, listGroups } from './collector/index.js';
+import { clearDbKeyRuntimeCache, collectMessages, detectWeixin, listAccounts, listGroups } from './collector/index.js';
 import { clearTmpDir, ensureRuntimeDirs, loadSettings, normalizeBaseUrl, publicSettings, saveSettingsPatch } from './config/settings.js';
 import { getSchedulerStatus, restartScheduler, runSchedulerOnce, startScheduler, stopScheduler } from './daemon/scheduler.js';
 import { DATA_DIR, DEFAULT_DIGESTS_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, isInside, outputDirFromSettings, resolveInsideTmp } from './lib/paths.js';
@@ -645,6 +645,11 @@ function settingsPatchNeedsSchedulerRestart(patch = {}) {
   return Object.hasOwn(patch.groups, 'whitelist') || Object.hasOwn(patch.groups, 'overrides');
 }
 
+function settingsPatchTouchesManualKey(patch = {}) {
+  return !!patch?.wechat
+    && (Object.hasOwn(patch.wechat, 'manual_key') || Object.hasOwn(patch.wechat, 'clear_manual_key'));
+}
+
 async function handleApi(req, res, parsedUrl) {
   const pathname = parsedUrl.pathname;
 
@@ -698,6 +703,10 @@ async function handleApi(req, res, parsedUrl) {
     const body = await readBody(req);
     const saved = await saveSettingsPatch(body);
     configureLogger(saved.logging);
+    if (settingsPatchTouchesManualKey(body)) {
+      clearDbKeyRuntimeCache({ clearVerified: true });
+      logInfo('db_key_runtime_cache_cleared', { reason: 'manual_key_settings_changed' });
+    }
     const warnings = await postSaveSettingsWarnings(body);
     logInfo('settings_saved', { sections: Object.keys(body || {}) });
     if (settingsPatchNeedsSchedulerRestart(body)) {

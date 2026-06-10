@@ -55,6 +55,12 @@ export async function listAccounts() {
   return [];
 }
 
+export function clearDbKeyRuntimeCache({ clearVerified = true } = {}) {
+  REAL_GROUP_CACHE = null;
+  DB_KEY_CANDIDATE_CACHE = null;
+  if (clearVerified) VERIFIED_RAW_KEY_CACHE = [];
+}
+
 export async function listGroups({ account_id = '' } = {}) {
   const env = await detectWeixin();
   if (!env.accounts?.length) {
@@ -358,6 +364,7 @@ function uniqueStrings(items) {
 
 export const __collectorInternals = {
   applyFilters,
+  clearDbKeyRuntimeCache,
   dbRawKeyCandidateBundle,
   dbRawKeyCandidates,
   messageSearchText,

@@ -30,7 +30,7 @@ export function defaultSettings() {
       custom_long_context_model: false,
     },
     privacy: { redact_phone: true, redact_id_card: true, redact_bank_card: true, redact_email: false },
-    link_preview: { enabled: true, ai_web_search: true, max_links: 0, timeout_ms: 8000, max_bytes: 262144, max_chars_per_link: 2000, max_related_links: 3, max_related_bytes: 98304, max_related_chars: 800 },
+    link_preview: { enabled: true, ai_web_search: true, max_links: 0, allow_private_networks: false, timeout_ms: 8000, max_bytes: 262144, max_chars_per_link: 2000, max_related_links: 3, max_related_bytes: 98304, max_related_chars: 800 },
     groups: { whitelist: [], overrides: [], recent: [] },
     scheduler: { enabled: false, default_interval: '30m', digest_window: '4h', min_messages_per_digest: 30, per_group: [] },
     output: { dir: './outputs/digests', retention_days: 0, filename_pattern: '{group}__{since}_{until}__{id8}.png' },
@@ -188,6 +188,7 @@ export function normalizeSettings(settings) {
   s.link_preview.enabled = true;
   s.link_preview.ai_web_search = s.link_preview.ai_web_search !== false;
   s.link_preview.max_links = 0;
+  s.link_preview.allow_private_networks = s.link_preview.allow_private_networks === true;
   s.link_preview.timeout_ms = finiteInteger(s.link_preview.timeout_ms, 8000, 1000, 60000);
   s.link_preview.max_bytes = finiteInteger(s.link_preview.max_bytes, 262144, 8192, 2 * 1024 * 1024);
   s.link_preview.max_chars_per_link = finiteInteger(s.link_preview.max_chars_per_link, 2000, 200, 10000);
@@ -265,7 +266,13 @@ function normalizeGroupRef(item) {
   const groupId = String(item.group_id || item.id || '').trim();
   const groupName = String(item.group_name || item.name || '').trim();
   const legacyGroup = String(item.group || '').trim();
-  if (!groupId && !groupName && legacyGroup) return legacyGroup;
+  if (!groupId && !groupName && legacyGroup) {
+    if (!accountId) return legacyGroup;
+    return {
+      account_id: accountId.slice(0, 200),
+      group_name: legacyGroup.slice(0, 300),
+    };
+  }
   if (!groupId && !groupName) return null;
   const ref = {};
   if (accountId) ref.account_id = accountId.slice(0, 200);
