@@ -19,6 +19,7 @@ export function defaultSettings() {
       long_context_model: '',
       available_models: [],
       models_fetched_at: null,
+      capabilities: {},
       temperature: 0.3,
       timeout_ms: 120000,
       max_input_chars: 60000,
@@ -181,6 +182,7 @@ export function normalizeSettings(settings) {
   s.llm.max_messages_per_call = finiteInteger(s.llm.max_messages_per_call, 800, 1, 20000);
   s.llm.max_image_chars_per_call = finiteInteger(s.llm.max_image_chars_per_call, 300000, 100000, 2 * 1024 * 1024);
   s.llm.ai_concurrency = finiteInteger(s.llm.ai_concurrency, 2, 1, Number.MAX_SAFE_INTEGER);
+  s.llm.capabilities = normalizeLlmCapabilities(s.llm.capabilities);
   s.link_preview = s.link_preview && typeof s.link_preview === 'object' ? s.link_preview : {};
   s.link_preview.enabled = true;
   s.link_preview.ai_web_search = s.link_preview.ai_web_search !== false;
@@ -246,6 +248,30 @@ function normalizePerGroupOverrides(value) {
     })
     .filter(item => item && (item.keywords.length || item.min_messages > 0))
     .slice(0, 200);
+}
+
+function normalizeLlmCapabilities(value) {
+  if (!plainObject(value)) return {};
+  const out = {};
+  const provider = String(value.provider || '').trim();
+  if (['openai', 'anthropic'].includes(provider)) out.provider = provider;
+  const baseUrl = normalizeBaseUrl(value.base_url || '');
+  if (baseUrl) out.base_url = baseUrl;
+  const model = String(value.model || '').trim();
+  if (model) out.model = model.slice(0, 200);
+  const checkedAt = String(value.checked_at || '').trim();
+  if (checkedAt && !Number.isNaN(Date.parse(checkedAt))) out.checked_at = new Date(checkedAt).toISOString();
+  for (const key of ['chat', 'responses', 'responses_web_search', 'messages']) {
+    const item = value[key];
+    if (!plainObject(item) || typeof item.ok !== 'boolean') continue;
+    out[key] = {
+      ok: !!item.ok,
+      latency_ms: finiteInteger(item.latency_ms, 0, 0, 600000),
+    };
+    const error = String(item.error || '').trim();
+    if (error && !item.ok) out[key].error = error.slice(0, 300);
+  }
+  return out;
 }
 
 function finiteNumber(value, fallback, min, max) {

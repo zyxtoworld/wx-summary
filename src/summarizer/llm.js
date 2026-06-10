@@ -38,6 +38,7 @@ const ATTACHMENT_DATA_KEYS = new Set(['data_url', 'frame_data_url', 'audio_data_
 let ACTIVE_AI_REQUESTS = 0;
 let CONFIGURED_AI_REQUEST_CONCURRENCY = DEFAULT_AI_REQUEST_CONCURRENCY;
 const AI_WAIT_QUEUE = [];
+const AI_WEB_SEARCH_CAPABILITY_CACHE = new Map();
 
 function throwIfAborted(signal) {
   if (!signal?.aborted) return;
@@ -192,6 +193,7 @@ export async function testLlmConnectivity({ provider, base_url, api_key, model, 
     ? [
         ['chat', () => testOpenAiChat({ base_url: normalizedBase, api_key, model, timeout_ms: cappedTimeout })],
         ['responses', () => testOpenAiResponses({ base_url: normalizedBase, api_key, model, timeout_ms: cappedTimeout })],
+        ['responses_web_search', () => testOpenAiResponsesWebSearch({ base_url: normalizedBase, api_key, model, timeout_ms: cappedTimeout })],
       ]
     : [
         ['messages', () => testAnthropicMessages({ base_url: normalizedBase, api_key, model, timeout_ms: cappedTimeout })],
@@ -202,6 +204,7 @@ export async function testLlmConnectivity({ provider, base_url, api_key, model, 
     provider,
     base_url: normalizedBase,
     model,
+    checked_at: new Date().toISOString(),
     latency_ms: Math.max(...results.map(item => item.latency_ms || 0)),
     capabilities: results,
   };
@@ -258,6 +261,24 @@ async function testOpenAiResponses({ base_url, api_key, model, timeout_ms }) {
   });
   const text = extractResponsesText(json);
   if (!text) throw httpError(502, 'Responses returned empty content');
+  return text;
+}
+
+async function testOpenAiResponsesWebSearch({ base_url, api_key, model, timeout_ms }) {
+  const json = await fetchJson(`${base_url}/responses`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${api_key}` },
+    body: {
+      model,
+      temperature: 0,
+      tools: [{ type: 'web_search_preview' }],
+      input: '请使用可用的网页搜索/打开工具查看 https://example.com/ ，用一句简体中文回答它是什么页面。无法访问也要用中文说明。',
+    },
+    timeout_ms,
+    api_key,
+  });
+  const text = extractResponsesText(json);
+  if (!text) throw httpError(502, 'Responses web_search returned empty content');
   return text;
 }
 
@@ -1703,6 +1724,14 @@ async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null, on
       for (const [url, research] of batch.entries()) out.set(url, research);
     } catch (err) {
       if (err?.status === 499 || signal?.aborted) throw err;
+      if (isLikelyUnsupportedWebSearchError(err)) {
+        rememberAiWebSearchSupport(settings, false);
+        notifyProgress(onProgress, {
+          phase: 'ai_link_research_skip',
+          label: 'AI 总结 · AI 查链接',
+          detail: '当前 AI 端点不支持 Responses 联网工具，本次后续链接只使用本地打开结果',
+        });
+      }
       // Local link previews remain attached to the timeline if web-search research fails.
     }
     completed++;
@@ -1804,7 +1833,46 @@ function shouldUseAiLinkResearch(urls, settings, cfg) {
   } catch {
     return false;
   }
+  const runtimeSupport = aiWebSearchRuntimeSupport(settings);
+  if (runtimeSupport === false) return false;
+  const savedSupport = savedAiWebSearchSupport(settings);
+  if (savedSupport === false) return false;
   return true;
+}
+
+function aiWebSearchCapabilityKey(settings = {}) {
+  return [
+    settings?.llm?.provider || '',
+    normalizeBaseUrl(settings?.llm?.base_url || ''),
+    settings?.llm?.long_context_model || settings?.llm?.model || '',
+  ].join('|');
+}
+
+function aiWebSearchRuntimeSupport(settings = {}) {
+  const key = aiWebSearchCapabilityKey(settings);
+  return key ? AI_WEB_SEARCH_CAPABILITY_CACHE.get(key) : undefined;
+}
+
+function rememberAiWebSearchSupport(settings = {}, supported) {
+  const key = aiWebSearchCapabilityKey(settings);
+  if (key) AI_WEB_SEARCH_CAPABILITY_CACHE.set(key, !!supported);
+}
+
+function savedAiWebSearchSupport(settings = {}) {
+  const cap = settings?.llm?.capabilities;
+  if (!cap || typeof cap !== 'object') return undefined;
+  const model = settings?.llm?.long_context_model || settings?.llm?.model || '';
+  const baseModel = settings?.llm?.model || '';
+  const longModel = settings?.llm?.long_context_model || '';
+  const modelMatches = cap.model === model
+    || (cap.model === baseModel && (!longModel || longModel === baseModel));
+  const sameIdentity = cap.provider === settings?.llm?.provider
+    && normalizeBaseUrl(cap.base_url || '') === normalizeBaseUrl(settings?.llm?.base_url || '')
+    && (!cap.model || modelMatches);
+  if (!sameIdentity) return undefined;
+  const item = cap.responses_web_search || cap.web_search_preview || cap.web_search;
+  if (!item || typeof item !== 'object' || typeof item.ok !== 'boolean') return undefined;
+  return item.ok;
 }
 
 function extractResponsesText(json) {
@@ -3001,6 +3069,13 @@ function isLikelyUnsupportedMediaError(err) {
     && /image|image_url|input_image|audio|input_audio|vision|multimodal|media|unsupported|invalid.*content|content.*type|format|does not support/.test(message);
 }
 
+function isLikelyUnsupportedWebSearchError(err) {
+  const status = Number(err?.status || 0);
+  const message = String(err?.message || '').toLowerCase();
+  return [400, 404, 405, 415, 422, 501].includes(status)
+    && /responses|web[_ -]?search|web_search_preview|tool|tools|unsupported|not supported|unknown parameter|invalid.*tool|not found|no such endpoint/.test(message);
+}
+
 function isLikelyModelWideUnsupportedMediaError(err) {
   if (!isLikelyUnsupportedMediaError(err)) return false;
   const message = String(err?.message || '').toLowerCase();
@@ -3053,7 +3128,9 @@ export const __llmInternals = {
   isModelEmptyContentError,
   isLikelyUnsupportedAudioError,
   isLikelyUnsupportedMediaError,
+  isLikelyUnsupportedWebSearchError,
   isJsonParseError,
+  shouldUseAiLinkResearch,
   cleanupAiStyleText,
   cleanupDigestStyleLocally,
   digestNeedsHumanGroupChatStyle,

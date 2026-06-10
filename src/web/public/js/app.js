@@ -2456,6 +2456,7 @@ async function renderSettings() {
   // AI
   let availableModels = Array.isArray(s.llm.available_models) ? s.llm.available_models : [];
   let pendingUnlistedModelConfirm = '';
+  let lastLlmCapabilitySnapshot = null;
   document.querySelectorAll('input[name="s-provider"]').forEach(r => {
     r.checked = r.value === (s.llm.provider || 'openai');
   });
@@ -2468,6 +2469,44 @@ async function renderSettings() {
 
   function selectedProvider() {
     return document.querySelector('input[name="s-provider"]:checked')?.value || 'openai';
+  }
+  function normalizeSettingsBaseUrl(value) {
+    return String(value || '').trim().replace(/\/+$/, '');
+  }
+  function currentLlmIdentity() {
+    const customModel = document.getElementById('s-model-custom')?.checked;
+    const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
+    return {
+      provider: selectedProvider(),
+      base_url: normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value),
+      model,
+    };
+  }
+  function capabilitySnapshotMatches(snapshot, identity = currentLlmIdentity()) {
+    return !!snapshot
+      && snapshot.provider === identity.provider
+      && normalizeSettingsBaseUrl(snapshot.base_url) === identity.base_url
+      && snapshot.model === identity.model;
+  }
+  function capabilitySnapshotFromTest(result = {}) {
+    const snapshot = {
+      provider: result.provider || selectedProvider(),
+      base_url: normalizeSettingsBaseUrl(result.base_url || document.getElementById('s-baseurl').value),
+      model: result.model || currentLlmIdentity().model,
+      checked_at: result.checked_at || new Date().toISOString(),
+    };
+    for (const item of Array.isArray(result.capabilities) ? result.capabilities : []) {
+      if (!item?.name) continue;
+      snapshot[item.name] = {
+        ok: !!item.ok,
+        latency_ms: Number(item.latency_ms || 0) || 0,
+      };
+      if (!item.ok && item.error) snapshot[item.name].error = String(item.error).slice(0, 300);
+    }
+    return snapshot;
+  }
+  function currentCapabilitySnapshotForSave() {
+    return capabilitySnapshotMatches(lastLlmCapabilitySnapshot) ? lastLlmCapabilitySnapshot : null;
   }
   function fillModelSelects() {
     const modelIds = new Set(availableModels.map(m => m.id));
@@ -2553,6 +2592,7 @@ async function renderSettings() {
         method: 'POST',
         body: payload,
       });
+      lastLlmCapabilitySnapshot = capabilitySnapshotFromTest(r);
       const okItems = (r.capabilities || []).filter(item => item.ok).map(formatCapabilityStatus);
       const badItems = (r.capabilities || []).filter(item => !item.ok).map(formatCapabilityStatus);
       $st.className = r.ok ? (badItems.length ? 'status warn' : 'status ok') : 'status err';
@@ -2609,6 +2649,8 @@ async function renderSettings() {
         available_models: availableModels,
       },
     };
+    const capabilities = currentCapabilitySnapshotForSave();
+    if (capabilities) payload.llm.capabilities = capabilities;
     if (apiKey) payload.llm.api_key = apiKey;
     $st.className = 'status';
     $st.textContent = '保存中...';
@@ -2621,7 +2663,7 @@ async function renderSettings() {
         $st.textContent = '⚠ 已保存；' + warnings.map(w => w.message || w).join('；');
       } else {
         $st.className = 'status ok';
-        $st.textContent = '✓ 已保存';
+        $st.textContent = capabilities ? '✓ 已保存，已记录连通能力' : '✓ 已保存';
         refreshAppStateSilently();
       }
     } catch (e) {
@@ -2990,10 +3032,11 @@ async function renderSettings() {
 }
 
 function formatCapabilityStatus(item = {}) {
-  const name = item.name === 'responses' ? 'Responses'
-    : item.name === 'chat' ? 'Chat'
-      : item.name === 'messages' ? 'Messages'
-        : (item.name || '能力');
+  const name = item.name === 'responses_web_search' ? 'Responses 联网查链接'
+    : item.name === 'responses' ? 'Responses'
+      : item.name === 'chat' ? 'Chat'
+        : item.name === 'messages' ? 'Messages'
+          : (item.name || '能力');
   if (item.ok) return `${name} OK (${item.latency_ms}ms)`;
   return `${name} 失败：${item.error || '未知错误'}`;
 }
