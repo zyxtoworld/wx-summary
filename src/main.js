@@ -547,6 +547,12 @@ async function postSaveSettingsWarnings(patch) {
   return warnings;
 }
 
+function settingsPatchNeedsSchedulerRestart(patch = {}) {
+  if (patch?.scheduler) return true;
+  if (!patch?.groups || typeof patch.groups !== 'object') return false;
+  return Object.hasOwn(patch.groups, 'whitelist') || Object.hasOwn(patch.groups, 'overrides');
+}
+
 async function handleApi(req, res, parsedUrl) {
   const pathname = parsedUrl.pathname;
 
@@ -602,16 +608,10 @@ async function handleApi(req, res, parsedUrl) {
     configureLogger(saved.logging);
     const warnings = await postSaveSettingsWarnings(body);
     logInfo('settings_saved', { sections: Object.keys(body || {}) });
-    if (body?.scheduler || body?.groups) {
+    if (settingsPatchNeedsSchedulerRestart(body)) {
       await restartScheduler().catch(e => {
         logWarn('scheduler_restart_after_settings_failed', { error: sanitizeText(e?.message || String(e)) });
       });
-    } else {
-      setTimeout(() => {
-        restartScheduler().catch(e => {
-          logWarn('scheduler_restart_after_settings_failed', { error: sanitizeText(e?.message || String(e)) });
-        });
-      }, 0).unref();
     }
     return sendJson(res, 200, { ok: true, settings: saved, warnings });
   }
@@ -1324,3 +1324,7 @@ if (entry === url.fileURLToPath(import.meta.url)) {
     process.exit(1);
   });
 }
+
+export const __mainInternals = {
+  settingsPatchNeedsSchedulerRestart,
+};
