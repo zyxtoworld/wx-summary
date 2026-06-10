@@ -2478,20 +2478,19 @@ async function renderSettings() {
     const inp = document.getElementById('s-apikey');
     inp.type = inp.type === 'password' ? 'text' : 'password';
   });
-  document.getElementById('s-list-models').addEventListener('click', async e => {
+  document.getElementById('s-list-models').addEventListener('click', async () => {
     const $st = document.getElementById('s-model-status');
-    const refresh = !!e.shiftKey;
     $st.className = 'status';
-    $st.textContent = refresh ? '刷新中...' : '获取中（优先使用缓存）...';
+    $st.textContent = '获取中...';
     try {
       const key = document.getElementById('s-apikey').value.trim();
-      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, refresh, persist: true };
+      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, persist: true };
       if (key) payload.api_key = key;
-      const r = await api(refresh ? '/api/list-models?refresh=true' : '/api/list-models', { method: 'POST', body: payload });
+      const r = await api('/api/list-models', { method: 'POST', body: payload });
       availableModels = r.models || [];
       fillModelSelects();
       $st.className = 'status ok';
-      $st.textContent = `✓ 已获取 ${availableModels.length} 个模型${r.cached ? '（缓存）' : ''}${r.persisted ? '；按住 Shift 点击可强制刷新' : ''}`;
+      $st.textContent = `✓ 已获取 ${availableModels.length} 个模型`;
     } catch (e) {
       $st.className = 'status err';
       $st.textContent = '✗ ' + e.message;

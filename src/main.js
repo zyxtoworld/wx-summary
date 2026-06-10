@@ -591,25 +591,11 @@ async function handleApi(req, res, parsedUrl) {
     const provider = body.provider || current.llm.provider;
     const baseUrl = normalizeBaseUrl(body.base_url || current.llm.base_url);
     const apiKey = body.api_key || current.llm.api_key;
-    const refresh = parsedUrl.searchParams.get('refresh') === 'true' || body.refresh === true;
-    if (!refresh
-      && !body.api_key
-      && provider === current.llm.provider
-      && baseUrl === current.llm.base_url
-      && Array.isArray(current.llm.available_models)
-      && current.llm.available_models.length) {
-      return sendJson(res, 200, {
-        ok: true,
-        models: current.llm.available_models,
-        cached: true,
-        persisted: true,
-      });
-    }
     const result = await listModels({
       provider,
       base_url: baseUrl,
       api_key: apiKey,
-      refresh,
+      refresh: true,
       timeout_ms: Math.min(Number(current.llm.timeout_ms || 30000), 20000),
       persist: body.persist !== false,
     });
