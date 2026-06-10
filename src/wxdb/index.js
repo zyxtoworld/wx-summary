@@ -1621,21 +1621,54 @@ function deriveWeixinV4PassphrasePageKey(keyHex, salt) {
 }
 
 async function decryptWeixinV4DbToPlaintext(dbPath, keyHex) {
-  const source = await fsp.readFile(dbPath);
-  if (source.length < WEIXIN_V4_PAGE_SIZE) throw new Error('database file is too small for Weixin v4 page decrypt');
-  const salt = source.subarray(0, WEIXIN_V4_SALT_BYTES);
+  const st = await fsp.stat(dbPath);
+  if (st.size < WEIXIN_V4_PAGE_SIZE) throw new Error('database file is too small for Weixin v4 page decrypt');
+  const firstPage = await readFirstPage(dbPath);
+  if (firstPage.length < WEIXIN_V4_PAGE_SIZE) throw new Error('database file is too small for Weixin v4 page decrypt');
+  const salt = firstPage.subarray(0, WEIXIN_V4_SALT_BYTES);
   const material = deriveWeixinV4PageKeys(keyHex, salt);
-  const pages = [];
-  const pageCount = Math.floor(source.length / WEIXIN_V4_PAGE_SIZE);
-  for (let i = 0; i < pageCount; i++) {
-    const page = source.subarray(i * WEIXIN_V4_PAGE_SIZE, (i + 1) * WEIXIN_V4_PAGE_SIZE);
-    pages.push(decryptWeixinV4Page(page, material, i + 1));
-  }
-  const remainder = source.subarray(pageCount * WEIXIN_V4_PAGE_SIZE);
-  if (remainder.length) pages.push(remainder);
   const target = `${dbPath}.weixin-v4-plain.db`;
-  await fsp.writeFile(target, Buffer.concat(pages));
+  const input = await fsp.open(dbPath, 'r');
+  const output = await fsp.open(target, 'w');
+  const page = Buffer.allocUnsafe(WEIXIN_V4_PAGE_SIZE);
+  let position = 0;
+  let pageNumber = 1;
+  let failed = false;
+  try {
+    while (position + WEIXIN_V4_PAGE_SIZE <= st.size) {
+      const bytesRead = await readExactly(input, page, 0, WEIXIN_V4_PAGE_SIZE, position);
+      if (bytesRead !== WEIXIN_V4_PAGE_SIZE) throw new Error('database file changed while decrypting');
+      const plainPage = decryptWeixinV4Page(page, material, pageNumber);
+      await output.write(plainPage, 0, plainPage.length);
+      position += WEIXIN_V4_PAGE_SIZE;
+      pageNumber++;
+    }
+    const remainderBytes = st.size - position;
+    if (remainderBytes > 0) {
+      const remainder = Buffer.allocUnsafe(remainderBytes);
+      const bytesRead = await readExactly(input, remainder, 0, remainderBytes, position);
+      if (bytesRead !== remainderBytes) throw new Error('database file changed while decrypting');
+      await output.write(remainder, 0, remainder.length);
+    }
+  } catch (e) {
+    failed = true;
+    throw e;
+  } finally {
+    await input.close().catch(() => {});
+    await output.close().catch(() => {});
+    if (failed) await fsp.rm(target, { force: true }).catch(() => {});
+  }
   return target;
+}
+
+async function readExactly(handle, buffer, offset, length, position) {
+  let total = 0;
+  while (total < length) {
+    const res = await handle.read(buffer, offset + total, length - total, position + total);
+    if (!res.bytesRead) break;
+    total += res.bytesRead;
+  }
+  return total;
 }
 
 function decryptWeixinV4Page(page, material, pageNumber) {
