@@ -91,13 +91,15 @@ export async function readHistoryDigest(settings, digestId) {
 
 export async function overwriteRenderedPng({ settings, item, digest, png_data_url }) {
   const base = outputDirFromSettings(settings);
-  const target = await assertRevealable(settings, item?.file_path || '', { extensions: ['.png'] });
+  const target = await writableHistoryPngTarget(settings, item?.file_path || '');
   const buffer = pngBufferFromDataUrl(png_data_url);
   const digestPath = resolveDigestPath(base, item) || digestJsonPathForPng(target);
   await writeBinaryAtomic(target, buffer);
   await writeDigestJson(digestPath, digest);
   const next = {
     ...item,
+    file_path: target,
+    relative_path: toProjectRelative(target),
     digest_path: digestPath,
     digest_relative_path: toProjectRelative(digestPath),
     rerendered_at: new Date().toISOString(),
@@ -154,6 +156,37 @@ export async function assertRevealable(settings, targetPath, { extensions = [] }
     fsp.realpath(resolved).catch(() => ''),
   ]);
   if (!realBase || !realTarget || !isInside(realBase, realTarget)) {
+    const err = new Error('path outside output dir');
+    err.status = 403;
+    throw err;
+  }
+  return resolved;
+}
+
+async function writableHistoryPngTarget(settings, targetPath) {
+  const base = outputDirFromSettings(settings);
+  const resolved = path.resolve(targetPath || '');
+  if (!isInside(base, resolved)) {
+    const err = new Error('path outside output dir');
+    err.status = 403;
+    throw err;
+  }
+  if (path.extname(resolved).toLowerCase() !== '.png') {
+    const err = new Error('file must be .png');
+    err.status = 400;
+    throw err;
+  }
+  const existing = await fsp.stat(resolved).catch(e => {
+    if (e?.code === 'ENOENT') return null;
+    throw e;
+  });
+  if (existing) return assertRevealable(settings, resolved, { extensions: ['.png'] });
+  await ensureDir(path.dirname(resolved));
+  const [realBase, realParent] = await Promise.all([
+    fsp.realpath(base).catch(() => ''),
+    fsp.realpath(path.dirname(resolved)).catch(() => ''),
+  ]);
+  if (!realBase || !realParent || !isInside(realBase, realParent)) {
     const err = new Error('path outside output dir');
     err.status = 403;
     throw err;
