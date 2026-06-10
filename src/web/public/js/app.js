@@ -1587,7 +1587,7 @@ function digestTopicCategory(topic = {}) {
   const haystack = `${topic.title || ''} ${topic.summary || ''}`;
   if (/github|文档|教程|链接|仓库|资料|入口|官网|下载/.test(haystack)) return '资源分享';
   if (/观点|理念|趋势|行业|能力|效率|未来|职业|工作流|认知|思考|争议|看法/.test(haystack)) return '观点讨论';
-  if (/确认|跟进|修复|处理|任务|目标|goal|迁移|发布|上线|测试|排查|付款|领取|结果|待确认/.test(haystack)) return '进展跟踪';
+  if (/确认|跟进|修复|处理|任务|目标|goal|迁移|发布|上线|测试|排查|付款|领取|结果|待确认/.test(haystack)) return '后续讨论';
   return '聊天主线';
 }
 
@@ -1657,14 +1657,6 @@ function digestLinkScore(link = {}) {
   if (/报价|文档|官网|仓库|注册|入口|教程|新闻|快讯|公告|优惠|充值|支付|模型|API|代码|下载/.test(`${link.title || ''} ${summary}`)) score += 3;
   if (/^https?:\/\//i.test(String(link.title || '').trim())) score -= 2;
   return score;
-}
-
-function isLowValueDigestLink(link = {}) {
-  const summary = String(link.summary || '');
-  if (/该网页链接出现在本分段原始消息中；分段模型失败/.test(summary)) return true;
-  if (/该网页链接已保留，但当前没有可靠中文摘要/.test(summary)) return true;
-  if (/聊天上下文不足，当前只能确认：(?:环境异常|加载中|打开超时|Tip|Favorites)/.test(summary)) return true;
-  return false;
 }
 
 function isRenderableDigestUrl(value) {

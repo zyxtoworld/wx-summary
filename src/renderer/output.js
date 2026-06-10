@@ -289,7 +289,6 @@ function isAnalyzableWebLinkUrl(value) {
 
 function publicDigestLinks(links, limit = 12) {
   return links
-    .filter(link => !isLowValueDigestLink(link))
     .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
     .slice(0, limit);
 }
@@ -302,14 +301,6 @@ function digestLinkScore(link = {}) {
   if (/报价|文档|官网|仓库|注册|入口|教程|新闻|快讯|公告|优惠|充值|支付|模型|API|代码|下载/.test(`${link.title || ''} ${summary}`)) score += 3;
   if (/^https?:\/\//i.test(String(link.title || '').trim())) score -= 2;
   return score;
-}
-
-function isLowValueDigestLink(link = {}) {
-  const summary = String(link.summary || '');
-  if (/该网页链接出现在本分段原始消息中；分段模型失败/.test(summary)) return true;
-  if (/该网页链接已保留，但当前没有可靠中文摘要/.test(summary)) return true;
-  if (/聊天上下文不足，当前只能确认：(?:环境异常|加载中|打开超时|Tip|Favorites)/.test(summary)) return true;
-  return false;
 }
 
 function isIgnoredWebLinkUrl(parsed) {

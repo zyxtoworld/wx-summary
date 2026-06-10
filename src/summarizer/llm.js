@@ -422,7 +422,7 @@ async function summarizeMessageChunks({ settings, model, groupName, since, until
     label: 'AI 总结 · 分段总结',
     detail: `${chunks.length} 段 · 并发 ${concurrency} 路`,
   });
-  const mediaRetryState = { forceTextOnly: false };
+  const mediaRetryState = createMediaRetryState();
   await mapWithConcurrency(chunks, concurrency, async (chunk, index) => {
     throwIfAborted(signal);
     notifyProgress(onProgress, {
@@ -665,10 +665,24 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error, all
   }
   if (fallbackParts.length && allowFallbackParts) {
     const fallbackLimit = Math.max(1, Math.floor(validParts.length * 0.08));
-    if (fallbackParts.length > fallbackLimit || fallbackParts.length === validParts.length) {
+    const totalWeight = validParts.reduce((n, part) => n + chunkImportanceOfPart(part), 0);
+    const fallbackWeight = fallbackParts.reduce((n, part) => n + chunkImportanceOfPart(part), 0);
+    const fallbackWeightRatio = totalWeight ? fallbackWeight / totalWeight : 1;
+    const fallbackLinkCount = fallbackParts.reduce((n, part) => n + arrayOf(part.links).length, 0);
+    const fallbackMediaCount = fallbackParts.reduce((n, part) => {
+      const meta = part?._chunk_importance || part?._fallback_weight || {};
+      return n + Number(meta.image_count || 0) + Number(meta.audio_count || 0);
+    }, 0);
+    if (
+      fallbackParts.length > fallbackLimit
+      || fallbackParts.length === validParts.length
+      || fallbackWeightRatio > 0.12
+      || fallbackLinkCount > 0
+      || fallbackMediaCount > 0
+    ) {
       throw httpError(
         502,
-        `AI 分段仍有 ${fallbackParts.length}/${Math.max(1, validParts.length)} 段只剩原始时间线兜底；为避免把分段日志或媒体元信息堆成长图，本次未保存。可稍后重试，或缩短时间范围再生成。`,
+        `AI 分段仍有 ${fallbackParts.length}/${Math.max(1, validParts.length)} 段只剩原始时间线兜底，约占输入权重 ${Math.round(fallbackWeightRatio * 100)}%${fallbackLinkCount ? `，含 ${fallbackLinkCount} 个链接` : ''}${fallbackMediaCount ? `，含 ${fallbackMediaCount} 条媒体` : ''}；为避免生成不完整或误导性的群总结，本次未保存。可稍后重试，或缩短时间范围再生成。`,
       );
     }
   }
@@ -835,23 +849,25 @@ function isLowValueDigestLink(link = {}) {
 
 async function summarizeChunkWithFallback({ settings, model, groupName, since, until, chunk, index, total, signal, onProgress, mediaRetryState = null }) {
   const mode = `chunk ${index + 1}/${total}`;
+  const bundle = formatMessageBundle(chunk);
   try {
-    return await callJsonModel({
+    const part = await callJsonModel({
       settings,
       model,
       groupName,
       since,
       until,
-      messageBundle: formatMessageBundle(chunk),
+      messageBundle: bundle,
       mode,
       signal,
       onProgress,
       mediaRetryState,
     });
+    return attachChunkImportance(part, chunk, bundle);
   } catch (err) {
     if (err?.status === 499 || signal?.aborted) throw err;
     if (!isLikelyRecoverableChunkFailure(err)) throw err;
-    const fallback = buildFallbackChunkDigest({ chunk, index, error: err });
+    const fallback = attachChunkImportance(buildFallbackChunkDigest({ chunk, index, error: err }), chunk, bundle);
     notifyProgress(onProgress, {
       phase: 'llm_chunk_fallback',
       label: 'AI 总结 · 分段兜底',
@@ -864,6 +880,7 @@ async function summarizeChunkWithFallback({ settings, model, groupName, since, u
 function buildFallbackChunkDigest({ chunk, index, error }) {
   const bundle = formatMessageBundle(chunk);
   const media = chunkMediaStats(bundle);
+  const weight = estimateChunkImportance(chunk, bundle);
   const participants = [...new Set(chunk.map(msg => cleanField(msg.sender)).filter(Boolean))].slice(0, 20);
   const firstTime = chunk[0]?.time || '';
   const lastTime = chunk[chunk.length - 1]?.time || firstTime;
@@ -889,6 +906,7 @@ function buildFallbackChunkDigest({ chunk, index, error }) {
     links: fallbackLinksFromChunk(chunk),
     _fallback_chunk: true,
     _fallback_error: sanitizeText(error?.message || String(error)),
+    _fallback_weight: weight,
     _raw_timeline: bundle.text,
   };
 }
@@ -898,6 +916,66 @@ function chunkMediaStats(bundle = {}) {
     images: Number(bundle.imageCount || 0),
     audio: Number(bundle.audioCount || 0),
   };
+}
+
+function createMediaRetryState() {
+  return {
+    forceTextOnly: false,
+    unsupportedMediaFailures: 0,
+  };
+}
+
+function rememberUnsupportedMediaFailure(mediaRetryState, err) {
+  if (!mediaRetryState || !isLikelyModelWideUnsupportedMediaError(err)) return false;
+  mediaRetryState.unsupportedMediaFailures = Number(mediaRetryState.unsupportedMediaFailures || 0) + 1;
+  if (mediaRetryState.unsupportedMediaFailures < 2) return false;
+  mediaRetryState.forceTextOnly = true;
+  return true;
+}
+
+function attachChunkImportance(part, chunk, bundle = null) {
+  if (!part || typeof part !== 'object') return part;
+  try {
+    Object.defineProperty(part, '_chunk_importance', {
+      value: estimateChunkImportance(chunk, bundle),
+      enumerable: false,
+      configurable: true,
+    });
+  } catch {}
+  return part;
+}
+
+function estimateChunkImportance(chunk = [], bundle = null) {
+  const effectiveBundle = bundle || formatMessageBundle(chunk);
+  const textChars = effectiveBundle.text?.length || estimateMessageTextChars(chunk);
+  const linkCount = chunk.reduce((n, msg) => {
+    const previewCount = Array.isArray(msg.link_previews) ? msg.link_previews.length : 0;
+    return n + previewCount + extractUrlsFromText(msg.content).length + extractUrlsFromText(msg.media?.url).length;
+  }, 0);
+  const media = chunkMediaStats(effectiveBundle);
+  const messages = Array.isArray(chunk) ? chunk.length : 0;
+  return {
+    messages,
+    text_chars: textChars,
+    image_count: media.images,
+    audio_count: media.audio,
+    link_count: linkCount,
+    weight: chunkImportanceWeight({ messages, text_chars: textChars, image_count: media.images, audio_count: media.audio, link_count: linkCount }),
+  };
+}
+
+function chunkImportanceWeight(stats = {}) {
+  const messages = Math.max(0, Number(stats.messages || 0));
+  const textChars = Math.max(0, Number(stats.text_chars || stats.textChars || 0));
+  const imageCount = Math.max(0, Number(stats.image_count || stats.images || 0));
+  const audioCount = Math.max(0, Number(stats.audio_count || stats.audio || 0));
+  const linkCount = Math.max(0, Number(stats.link_count || stats.links || 0));
+  return Math.max(1, Math.ceil(messages / 8) + Math.ceil(textChars / 2400) + imageCount * 4 + audioCount * 4 + linkCount * 3);
+}
+
+function chunkImportanceOfPart(part = {}) {
+  const meta = part?._chunk_importance || part?._fallback_weight || {};
+  return Math.max(1, Number(meta.weight || chunkImportanceWeight(meta)) || 1);
 }
 
 function fallbackLinksFromChunk(chunk = []) {
@@ -2012,11 +2090,11 @@ async function callJsonModel({ settings, model, groupName, since, until, message
         activeBlocks = withoutMediaBlocksForTextOnlyRetry(activeBlocks);
         mediaTextRetryUsed = true;
         audioRetryUsed = true;
-        if (mediaRetryState && isLikelyUnsupportedMediaError(e)) mediaRetryState.forceTextOnly = true;
+        const futureTextOnly = rememberUnsupportedMediaFailure(mediaRetryState, e);
         notifyProgress(onProgress, {
           phase: 'llm_media_retry',
           label: 'AI 总结 · 媒体兜底',
-          detail: `任务 ${mode || 'summary'} 当前模型无法直接处理媒体，改用文本和媒体元信息重试`,
+          detail: `任务 ${mode || 'summary'} 当前媒体请求失败，改用文本和媒体元信息重试${futureTextOnly ? '；连续确认端点不支持媒体，后续分段将直接走文本兜底' : ''}`,
         });
         continue;
       }
@@ -2921,6 +2999,15 @@ function isLikelyUnsupportedMediaError(err) {
   const message = String(err?.message || '').toLowerCase();
   return [400, 415, 422].includes(status)
     && /image|image_url|input_image|audio|input_audio|vision|multimodal|media|unsupported|invalid.*content|content.*type|format|does not support/.test(message);
+}
+
+function isLikelyModelWideUnsupportedMediaError(err) {
+  if (!isLikelyUnsupportedMediaError(err)) return false;
+  const message = String(err?.message || '').toLowerCase();
+  return /model.*(?:does not support|doesn't support|not support).*?(?:image|audio|vision|multimodal|media|input_image|input_audio)/.test(message)
+    || /(?:image|audio|vision|multimodal|media|input_image|input_audio).*?(?:not supported|unsupported by.*model|does not support|doesn't support)/.test(message)
+    || /unsupported (?:content|media) type/.test(message)
+    || /content type.*(?:not supported|unsupported)/.test(message);
 }
 
 function isJsonParseError(err) {
