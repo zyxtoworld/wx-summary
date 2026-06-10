@@ -20,12 +20,43 @@ $dec = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [Security
 const MAC_KEYCHAIN_SERVICE = 'wx-summary.secrets';
 const MAC_KEYCHAIN_ACCOUNT = 'wx-summary';
 const MAC_ENVELOPE_VERSION = 1;
+let winDpapi = null;
+
+async function loadWinDpapi() {
+  if (winDpapi) return winDpapi;
+  const koffi = (await import('koffi')).default;
+  const crypt32 = koffi.load('crypt32.dll');
+  const kernel32 = koffi.load('kernel32.dll');
+  koffi.struct('WX_SUMMARY_DATA_BLOB', {
+    cbData: 'uint32',
+    pbData: 'void *',
+  });
+  winDpapi = {
+    koffi,
+    CryptProtectData: crypt32.func('bool __stdcall CryptProtectData(WX_SUMMARY_DATA_BLOB *pDataIn, const wchar_t *szDataDescr, WX_SUMMARY_DATA_BLOB *pOptionalEntropy, void *pvReserved, void *pPromptStruct, uint32 dwFlags, _Out_ WX_SUMMARY_DATA_BLOB *pDataOut)'),
+    CryptUnprotectData: crypt32.func('bool __stdcall CryptUnprotectData(WX_SUMMARY_DATA_BLOB *pDataIn, _Out_ void **ppszDataDescr, WX_SUMMARY_DATA_BLOB *pOptionalEntropy, void *pvReserved, void *pPromptStruct, uint32 dwFlags, _Out_ WX_SUMMARY_DATA_BLOB *pDataOut)'),
+    LocalFree: kernel32.func('void* __stdcall LocalFree(void*)'),
+    GetLastError: kernel32.func('uint32 __stdcall GetLastError()'),
+  };
+  return winDpapi;
+}
+
+function dataBlobFromBuffer(buffer) {
+  const bytes = Buffer.from(buffer || Buffer.alloc(0));
+  return { cbData: bytes.length, pbData: bytes };
+}
+
+function bufferFromDataBlob(api, blob) {
+  if (!blob?.pbData || !blob.cbData) return Buffer.alloc(0);
+  return Buffer.from(api.koffi.decode(blob.pbData, 'uint8_t', blob.cbData));
+}
 
 function runPowerShell(script, stdin, preferPwsh = true) {
   return new Promise((resolve, reject) => {
     const exe = preferPwsh ? 'pwsh' : 'powershell';
     const args = ['-NoProfile', '-NonInteractive', '-Command', script];
     const child = spawn(exe, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    let settled = false;
     let out = '';
     let err = '';
     child.stdout.setEncoding('utf-8');
@@ -33,6 +64,8 @@ function runPowerShell(script, stdin, preferPwsh = true) {
     child.stdout.on('data', chunk => { out += chunk; });
     child.stderr.on('data', chunk => { err += chunk; });
     child.on('error', error => {
+      if (settled) return;
+      settled = true;
       if (preferPwsh && error?.code === 'ENOENT') {
         runPowerShell(script, stdin, false).then(resolve, reject);
       } else {
@@ -40,8 +73,15 @@ function runPowerShell(script, stdin, preferPwsh = true) {
       }
     });
     child.on('close', code => {
-      if (code === 0) resolve(out);
-      else reject(new Error((err || `PowerShell exited with ${code}`).trim()));
+      if (settled) return;
+      settled = true;
+      if (code === 0) {
+        resolve(out);
+      } else if (preferPwsh) {
+        runPowerShell(script, stdin, false).then(resolve, reject);
+      } else {
+        reject(new Error((err || `PowerShell exited with ${code}`).trim()));
+      }
     });
     child.stdin.end(stdin, 'utf-8');
   });
@@ -117,6 +157,34 @@ async function unprotectTextMac(buffer) {
   ]).toString('utf-8');
 }
 
+async function protectTextWin(text) {
+  const api = await loadWinDpapi();
+  const input = Buffer.from(String(text || ''), 'utf-8');
+  const out = {};
+  const ok = api.CryptProtectData(dataBlobFromBuffer(input), null, null, null, null, 0, out);
+  if (!ok) throw new Error(`CryptProtectData failed with ${api.GetLastError()}`);
+  try {
+    return bufferFromDataBlob(api, out);
+  } finally {
+    if (out.pbData) api.LocalFree(out.pbData);
+  }
+}
+
+async function unprotectTextWin(buffer) {
+  const api = await loadWinDpapi();
+  const input = Buffer.from(buffer || Buffer.alloc(0));
+  const out = {};
+  const description = [null];
+  const ok = api.CryptUnprotectData(dataBlobFromBuffer(input), description, null, null, null, 0, out);
+  if (!ok) throw new Error(`CryptUnprotectData failed with ${api.GetLastError()}`);
+  try {
+    return bufferFromDataBlob(api, out).toString('utf-8');
+  } finally {
+    if (out.pbData) api.LocalFree(out.pbData);
+    if (description[0]) api.LocalFree(description[0]);
+  }
+}
+
 export async function protectText(text) {
   if (process.platform === 'darwin') {
     return protectTextMac(text);
@@ -124,8 +192,12 @@ export async function protectText(text) {
   if (process.platform !== 'win32') {
     throw new Error('DPAPI is only available on Windows');
   }
-  const base64 = (await runPowerShell(PROTECT_SCRIPT, text)).trim();
-  return Buffer.from(base64, 'base64');
+  try {
+    return await protectTextWin(text);
+  } catch {
+    const base64 = (await runPowerShell(PROTECT_SCRIPT, text)).trim();
+    return Buffer.from(base64, 'base64');
+  }
 }
 
 export async function unprotectToText(buffer) {
@@ -135,5 +207,9 @@ export async function unprotectToText(buffer) {
   if (process.platform !== 'win32') {
     throw new Error('DPAPI is only available on Windows');
   }
-  return runPowerShell(UNPROTECT_SCRIPT, Buffer.from(buffer).toString('base64'));
+  try {
+    return await unprotectTextWin(buffer);
+  } catch {
+    return runPowerShell(UNPROTECT_SCRIPT, Buffer.from(buffer).toString('base64'));
+  }
 }
