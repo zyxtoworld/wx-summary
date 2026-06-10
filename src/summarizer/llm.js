@@ -17,7 +17,7 @@ const DEFAULT_LINK_RESEARCH_CONCURRENCY = 2;
 const MESSAGE_CONTEXT_NEIGHBORS = 2;
 const MESSAGE_CONTEXT_SNIPPET_CHARS = 90;
 const MESSAGE_CONTEXT_TOTAL_CHARS = 420;
-const DEFAULT_AI_REQUEST_CONCURRENCY = 1;
+const DEFAULT_AI_REQUEST_CONCURRENCY = 2;
 const DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS = 15000;
 const CHUNK_RECOVERY_MAX_DEPTH = 3;
 const MERGE_PARTS_PER_CALL = 10;
@@ -35,6 +35,7 @@ const DEFAULT_LINK_PREVIEW = {
 };
 const ATTACHMENT_DATA_KEYS = new Set(['data_url', 'frame_data_url', 'audio_data_url']);
 let ACTIVE_AI_REQUESTS = 0;
+let CONFIGURED_AI_REQUEST_CONCURRENCY = DEFAULT_AI_REQUEST_CONCURRENCY;
 const AI_WAIT_QUEUE = [];
 
 function throwIfAborted(signal) {
@@ -65,8 +66,14 @@ async function withAiRequestSlot({ signal = null, onProgress = null, label = 'AI
 }
 
 function aiRequestConcurrency() {
-  const raw = Number(process.env.WX_SUMMARY_AI_CONCURRENCY || DEFAULT_AI_REQUEST_CONCURRENCY);
-  return Math.max(1, Math.min(2, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY));
+  const raw = Number(process.env.WX_SUMMARY_AI_CONCURRENCY || CONFIGURED_AI_REQUEST_CONCURRENCY);
+  return Math.max(1, Math.min(4, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY));
+}
+
+function configureAiRequestConcurrency(settings = {}) {
+  const raw = Number(settings?.llm?.ai_concurrency || DEFAULT_AI_REQUEST_CONCURRENCY);
+  CONFIGURED_AI_REQUEST_CONCURRENCY = Math.max(1, Math.min(4, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY));
+  drainAiRequestQueue();
 }
 
 function acquireAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲' } = {}) {
@@ -286,6 +293,7 @@ function normalizeModelList(json) {
 
 export async function summarizeDigest({ settings, groupName, since, until, messages, signal, onProgress }) {
   throwIfAborted(signal);
+  configureAiRequestConcurrency(settings);
   const llm = settings.llm;
   const apiKey = llm.api_key;
   if (!apiKey) throw httpError(400, 'API key is not configured');

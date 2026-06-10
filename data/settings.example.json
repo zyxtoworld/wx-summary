@@ -11,6 +11,7 @@
     "max_input_chars": 60000,
     "max_messages_per_call": 800,
     "max_image_chars_per_call": 300000,
+    "ai_concurrency": 2,
     "custom_model": false,
     "custom_long_context_model": false
   },

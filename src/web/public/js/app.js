@@ -306,6 +306,10 @@ function getDurationControlValue(fieldId, fallback) {
   return value;
 }
 
+function normalizeAiConcurrency(value) {
+  return Math.max(1, Math.min(4, parseInt(value ?? '2', 10) || 2));
+}
+
 function fmtMonthTitle(date) {
   return `${date.getFullYear()} 年 ${date.getMonth() + 1} 月`;
 }
@@ -2373,6 +2377,7 @@ async function renderSettings() {
   document.getElementById('s-apikey-mask').textContent = s.llm.api_key_set ? `已保存 (${s.llm.api_key_display})` : '尚未保存';
   document.getElementById('s-model').value = s.llm.model || '';
   document.getElementById('s-model-long').value = s.llm.long_context_model || '';
+  document.getElementById('s-ai-concurrency').value = normalizeAiConcurrency(s.llm.ai_concurrency);
 
   function selectedProvider() {
     return document.querySelector('input[name="s-provider"]:checked')?.value || 'openai';
@@ -2411,6 +2416,7 @@ async function renderSettings() {
     document.getElementById('s-apikey-mask').textContent = s.llm.api_key_set ? `已保存 (${s.llm.api_key_display})` : '尚未保存';
     document.getElementById('s-model').value = s.llm.model || '';
     document.getElementById('s-model-long').value = s.llm.long_context_model || '';
+    document.getElementById('s-ai-concurrency').value = normalizeAiConcurrency(s.llm.ai_concurrency);
     document.getElementById('s-model-custom').checked = !!s.llm.custom_model;
     document.getElementById('s-model-long-custom').checked = !!s.llm.custom_long_context_model;
     fillModelSelects();
@@ -2477,6 +2483,7 @@ async function renderSettings() {
     const baseUrl = document.getElementById('s-baseurl').value.trim();
     const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
     const longModel = customLongModel ? document.getElementById('s-model-long').value.trim() : document.getElementById('s-model-long-select').value;
+    const aiConcurrency = normalizeAiConcurrency(document.getElementById('s-ai-concurrency').value);
     if (!baseUrl) {
       $st.className = 'status err';
       $st.textContent = '✗ 请填写 Base URL';
@@ -2512,6 +2519,7 @@ async function renderSettings() {
         long_context_model: longModel || model,
         custom_model: customModel,
         custom_long_context_model: customLongModel,
+        ai_concurrency: aiConcurrency,
         available_models: availableModels,
       },
     };
