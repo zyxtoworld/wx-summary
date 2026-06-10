@@ -67,12 +67,12 @@ async function withAiRequestSlot({ signal = null, onProgress = null, label = 'AI
 
 function aiRequestConcurrency() {
   const raw = Number(process.env.WX_SUMMARY_AI_CONCURRENCY || CONFIGURED_AI_REQUEST_CONCURRENCY);
-  return Math.max(1, Math.min(4, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY));
+  return Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY);
 }
 
 function configureAiRequestConcurrency(settings = {}) {
   const raw = Number(settings?.llm?.ai_concurrency || DEFAULT_AI_REQUEST_CONCURRENCY);
-  CONFIGURED_AI_REQUEST_CONCURRENCY = Math.max(1, Math.min(4, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY));
+  CONFIGURED_AI_REQUEST_CONCURRENCY = Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY);
   drainAiRequestQueue();
 }
 

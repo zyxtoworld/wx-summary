@@ -180,7 +180,7 @@ export function normalizeSettings(settings) {
   s.llm.max_input_chars = finiteInteger(s.llm.max_input_chars, 60000, 1000, 1000000);
   s.llm.max_messages_per_call = finiteInteger(s.llm.max_messages_per_call, 800, 1, 20000);
   s.llm.max_image_chars_per_call = finiteInteger(s.llm.max_image_chars_per_call, 300000, 100000, 2 * 1024 * 1024);
-  s.llm.ai_concurrency = finiteInteger(s.llm.ai_concurrency, 2, 1, 4);
+  s.llm.ai_concurrency = finiteInteger(s.llm.ai_concurrency, 2, 1, Number.MAX_SAFE_INTEGER);
   s.link_preview = s.link_preview && typeof s.link_preview === 'object' ? s.link_preview : {};
   s.link_preview.enabled = true;
   s.link_preview.ai_web_search = s.link_preview.ai_web_search !== false;

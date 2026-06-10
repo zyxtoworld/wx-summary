@@ -307,7 +307,7 @@ function getDurationControlValue(fieldId, fallback) {
 }
 
 function normalizeAiConcurrency(value) {
-  return Math.max(1, Math.min(4, parseInt(value ?? '2', 10) || 2));
+  return Math.max(1, parseInt(value ?? '2', 10) || 2);
 }
 
 function fmtMonthTitle(date) {
