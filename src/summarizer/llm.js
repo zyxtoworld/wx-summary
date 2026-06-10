@@ -615,7 +615,7 @@ async function recoverFallbackChunkSummaries({ settings, model, groupName, since
 
 async function recoverFallbackChunkPart({ settings, model, groupName, since, until, chunk, fallback, originalIndex, originalTotal, signal, onProgress, mediaRetryState, depth }) {
   if (depth >= CHUNK_RECOVERY_MAX_DEPTH || !Array.isArray(chunk) || chunk.length <= 1) return [fallback];
-  const subChunks = splitChunkForRecovery(chunk);
+  const subChunks = splitChunkForRecovery(chunk, settings?.llm, depth);
   if (subChunks.length <= 1) return [fallback];
 
   notifyProgress(onProgress, {
@@ -663,10 +663,19 @@ async function recoverFallbackChunkPart({ settings, model, groupName, since, unt
   return recoveredParts.length ? recoveredParts : [fallback];
 }
 
-function splitChunkForRecovery(chunk) {
+function splitChunkForRecovery(chunk, llm = {}, depth = 0) {
   if (!Array.isArray(chunk) || chunk.length <= 1) return [chunk];
+  const limits = digestChunkLimits(llm);
+  const factor = Math.min(8, 2 ** (Math.max(0, Number(depth) || 0) + 1));
   const targetParts = chunk.length >= 80 ? 4 : 2;
-  const size = Math.max(1, Math.ceil(chunk.length / targetParts));
+  const targetSize = Math.max(1, Math.ceil(chunk.length / targetParts));
+  const maxMessages = Math.max(1, Math.min(targetSize, Math.floor(limits.maxMessages / factor) || 1));
+  const maxChars = Math.max(1000, Math.floor(limits.maxChars / factor));
+  const maxMediaChars = Math.max(100000, Math.floor(limits.maxMediaChars / factor));
+  const costChunks = splitMessages(chunk, maxMessages, maxChars, maxMediaChars);
+  if (costChunks.length > 1) return costChunks;
+
+  const size = targetSize;
   const out = [];
   for (let i = 0; i < chunk.length; i += size) out.push(chunk.slice(i, i + size));
   return out;
@@ -3292,6 +3301,7 @@ export const __llmInternals = {
   prepareMessagesForChunking,
   estimateMessageBundleStats,
   splitMessages,
+  splitChunkForRecovery,
   buildDigestChunkPlan,
   openAiUserContent,
   anthropicUserContent,
