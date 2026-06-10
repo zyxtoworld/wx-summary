@@ -616,7 +616,7 @@ async function postSaveSettingsWarnings(patch) {
   if (modelMissing || longModelMissing) {
     warnings.push({
       code: 'llm_model_not_listed',
-      message: 'AI 设置已保存，但所选模型不在已缓存的模型列表里；如确认可用，请开启自定义模型后保存，或刷新模型列表。',
+      message: 'AI 设置已保存，但所选模型不在已获取的模型列表里；如确认可用，请开启自定义模型后保存，或重新获取模型列表。',
     });
   }
   const capabilitySnapshot = patch.llm.capabilities === undefined ? saved.llm.capabilities : patch.llm.capabilities;

@@ -610,6 +610,7 @@ let _state_digest = {
   lastTextComplete: false,
   lastTextDone: 0,
   lastTextTotal: 0,
+  lastTextPartialReason: '',
   generating: false,
   abortController: null,
   abortReason: '',
@@ -722,14 +723,11 @@ function decorateDigestGroups(groups, digestSettings = {}, accountId = selectedA
   const whitelistRefs = Array.isArray(digestSettings.groups?.whitelist) ? digestSettings.groups.whitelist : [];
   const hasCurrentWhitelist = (Array.isArray(groups) ? groups : [])
     .some(group => whitelistRefs.some(ref => groupRefMatches(ref, group, accountId)));
-  const recentNames = Array.isArray(digestSettings.groups?.recent) ? digestSettings.groups.recent : [];
-  const recentRank = new Map(recentNames.map((name, index) => [String(name || ''), index]));
+  const recentRefs = Array.isArray(digestSettings.groups?.recent) ? digestSettings.groups.recent : [];
   return (Array.isArray(groups) ? groups : [])
     .map(group => {
-      const rank = Math.min(
-        recentRank.has(group.name) ? recentRank.get(group.name) : Number.POSITIVE_INFINITY,
-        recentRank.has(group.id) ? recentRank.get(group.id) : Number.POSITIVE_INFINITY,
-      );
+      const recentIndex = recentRefs.findIndex(ref => groupRefMatches(ref, group, accountId));
+      const rank = recentIndex >= 0 ? recentIndex : Number.POSITIVE_INFINITY;
       const starred = Number.isFinite(rank);
       const nonWhitelist = hasCurrentWhitelist && !whitelistRefs.some(ref => groupRefMatches(ref, group, accountId));
       return { ...group, starred, non_whitelist: nonWhitelist, recent_rank: starred ? rank : 9999 };
@@ -834,7 +832,15 @@ async function renderDigest() {
     document.getElementById('btn-generate').disabled = disabled;
     document.getElementById('btn-preview-text').disabled = disabled;
   }
+  const whitelistButton = document.getElementById('select-whitelist');
+  function updateWhitelistButton() {
+    if (!whitelistButton) return;
+    const currentWhitelistCount = groups.filter(g => whitelistRefs.some(ref => groupRefMatches(ref, g, accountId))).length;
+    whitelistButton.disabled = currentWhitelistCount === 0;
+    whitelistButton.title = currentWhitelistCount ? '选择设置页白名单里的群' : '当前账号尚未配置白名单';
+  }
   paint();
+  updateWhitelistButton();
   document.getElementById('group-search').addEventListener('input', e => paint(e.target.value));
   if (cacheHasGroups && !cacheIsFresh) {
     setGroupStatus('后台更新中');
@@ -844,6 +850,7 @@ async function renderDigest() {
         groups = decorateDigestGroups(rawGroups, digestSettings, accountId);
         setGroupStatus('');
         paint(document.getElementById('group-search')?.value || '');
+        updateWhitelistButton();
       })
       .catch(e => {
         if (!isCurrentDigestView()) return;
@@ -854,10 +861,6 @@ async function renderDigest() {
         }
       });
   }
-  const whitelistButton = document.getElementById('select-whitelist');
-  const currentWhitelistCount = groups.filter(g => whitelistRefs.some(ref => groupRefMatches(ref, g, accountId))).length;
-  whitelistButton.disabled = currentWhitelistCount === 0;
-  whitelistButton.title = currentWhitelistCount ? '选择设置页白名单里的群' : '当前账号尚未配置白名单';
   document.getElementById('select-whitelist').addEventListener('click', () => {
     groups.filter(g => whitelistRefs.some(ref => groupRefMatches(ref, g, accountId))).forEach(g => _state_digest.selectedGroups.add(g.id));
     paint(document.getElementById('group-search').value);
@@ -1405,10 +1408,14 @@ async function generateDigest({ previewText = false } = {}) {
   if (_state_digest.generating) return;
   _state_digest.generating = true;
   _state_digest.abortReason = '';
+  const controller = new AbortController();
+  _state_digest.abortController = controller;
+  const accountId = selectedAccountId();
   const generateButton = document.getElementById('btn-generate');
   const previewButton = document.getElementById('btn-preview-text');
   if (generateButton) generateButton.disabled = true;
   if (previewButton) previewButton.disabled = true;
+  updateDigestCancelButton();
   const $progress = document.getElementById('progress-card');
   const $stages = document.getElementById('progress-stages');
   const $fill = document.getElementById('progress-fill');
@@ -1451,25 +1458,35 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.lastTextComplete = false;
   _state_digest.lastTextDone = 0;
   _state_digest.lastTextTotal = 0;
+  _state_digest.lastTextPartialReason = '';
   scrollDigestWorkIntoView($progress);
   const selectedIds = [..._state_digest.selectedGroups];
   const batchId = createDigestBatchId();
-  const accountId = selectedAccountId();
   let groups;
   try {
     const cache = getDigestGroupCache(accountId);
     groups = digestGroupCacheHasData(cache) ? cache.groups : await fetchDigestGroups(accountId, { force: true });
+    if (routeSeq !== _routeSeq || controller.signal.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   } catch (e) {
-    _state_digest.generating = false;
+    const abortReason = _state_digest.abortReason;
+    if (_state_digest.abortController === controller) {
+      _state_digest.generating = false;
+      _state_digest.abortController = null;
+      _state_digest.abortReason = '';
+      updateDigestCancelButton();
+    }
     if (generateButton) generateButton.disabled = false;
     if (previewButton) previewButton.disabled = false;
+    if (routeSeq !== _routeSeq) return;
     if ($progress && $stages && $fill) {
       $progress.classList.remove('hidden');
       $fill.style.width = '0%';
       setDigestProgressFill('0%');
-      $stages.innerHTML = `<li class="error">✗ 读取群列表失败：${escapeHtml(e.message || '未知错误')}</li>`;
-      setDigestProgressStages([{ key: 'error', name: 'error', stageName: 'error', label: `读取群列表失败：${e.message || '未知错误'}`, status: 'error' }]);
-      showProgressLogPrompt(e.message || '读取群列表失败');
+      const aborted = controller.signal.aborted;
+      const message = aborted ? (abortReason || '已取消') : (e.message || '未知错误');
+      $stages.innerHTML = `<li class="${aborted ? 'done' : 'error'}">${aborted ? '✓ 已取消' : `✗ 读取群列表失败：${escapeHtml(message)}`}</li>`;
+      setDigestProgressStages([{ key: 'error', name: 'error', stageName: 'error', label: aborted ? '已取消' : `读取群列表失败：${message}`, status: aborted ? 'done' : 'error' }]);
+      if (!aborted) showProgressLogPrompt(message || '读取群列表失败');
       scrollDigestWorkIntoView($progress);
     }
     return;
@@ -1478,7 +1495,7 @@ async function generateDigest({ previewText = false } = {}) {
     const group = groups.find(g => g.id === id) || {};
     return { id, name: group.name || id || '未命名会话' };
   });
-  rememberRecentGroups(targets, groups).catch(() => {});
+  rememberRecentGroups(targets, groups, accountId, controller.signal).catch(() => {});
 
   let since, until;
   if (_state_digest.rangeKey === 'custom') {
@@ -1605,9 +1622,6 @@ async function generateDigest({ previewText = false } = {}) {
 
   // 用 fetch + ReadableStream 解析 SSE（不用 EventSource 是为了带 X-WX-Token）
   try {
-    const controller = new AbortController();
-    _state_digest.abortController = controller;
-    updateDigestCancelButton();
     const digests = new Array(targets.length);
     const failures = [];
     const prepareConcurrency = digestPrepareConcurrency(targets.length);
@@ -1632,6 +1646,7 @@ async function generateDigest({ previewText = false } = {}) {
       try {
         const digest = await runSingleDigestRequest({
           target,
+          accountId,
           since,
           until,
           batchId,
@@ -1647,12 +1662,15 @@ async function generateDigest({ previewText = false } = {}) {
           renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
         } else {
           await enqueueRender(async () => {
+            if (controller.signal.aborted) return;
             const livePreviewCard = document.getElementById('preview-card');
             if (livePreviewCard) livePreviewCard.classList.remove('hidden');
             const canvas = drawDigestCanvas(digest);
+            if (controller.signal.aborted) return;
             upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
             try {
-              const saved = await saveRenderedCanvas(digest, canvas);
+              const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal });
+              if (controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
               digest.file_path = saved.item.file_path;
               const revealButton = document.getElementById('btn-reveal');
@@ -1663,6 +1681,10 @@ async function generateDigest({ previewText = false } = {}) {
               upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'done', detail: saved.item.relative_path }));
               scrollDigestWorkIntoView(document.getElementById('preview-card'));
             } catch (e) {
+              if (e?.name === 'AbortError' || controller.signal.aborted) {
+                upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'done', detail: '已取消' }));
+                return;
+              }
               failures.push({ group: target.name, error: e.message });
               upsertStage(groupStage(i, { name: 'saving', label: `保存失败：${e.message}`, status: 'error' }));
               showProgressLogPrompt(e.message);
@@ -1681,7 +1703,12 @@ async function generateDigest({ previewText = false } = {}) {
 
     const doneDigests = digests.filter(Boolean);
     if (previewText && doneDigests.length) {
-      renderTextPreviews(doneDigests, { complete: true, total: targets.length });
+      const complete = !controller.signal.aborted && !failures.length && doneDigests.length === targets.length;
+      renderTextPreviews(doneDigests, {
+        complete,
+        total: targets.length,
+        partialReason: complete ? '' : (controller.signal.aborted ? 'cancelled' : 'partial'),
+      });
     }
     if (controller.signal.aborted) {
       const reason = _state_digest.abortReason || '已取消';
@@ -1712,10 +1739,12 @@ async function generateDigest({ previewText = false } = {}) {
     if (!aborted) showProgressLogPrompt(e.message);
   } finally {
     clearAllRunningStages();
-    _state_digest.abortController = null;
-    _state_digest.abortReason = '';
-    _state_digest.generating = false;
-    updateDigestCancelButton();
+    if (_state_digest.abortController === controller) {
+      _state_digest.abortController = null;
+      _state_digest.abortReason = '';
+      _state_digest.generating = false;
+      updateDigestCancelButton();
+    }
     restoreDigestOutputs();
     const finalGenerateButton = document.getElementById('btn-generate');
     const finalPreviewButton = document.getElementById('btn-preview-text');
@@ -1833,22 +1862,24 @@ async function toggleProgressLog() {
   }
 }
 
-async function rememberRecentGroups(targets, allGroups) {
+async function rememberRecentGroups(targets, allGroups, accountId = selectedAccountId(), signal = null) {
+  if (signal?.aborted) return;
   const current = await api('/api/settings').catch(() => ({}));
+  if (signal?.aborted) return;
   const previous = Array.isArray(current.groups?.recent) ? current.groups.recent : [];
-  const selectedNames = targets
+  const selectedRefs = targets
     .map(target => {
       const group = allGroups.find(g => g.id === target.id || g.name === target.name);
-      return group?.name || target.name || target.id || '';
+      return groupRefForPayload(group || { id: target.id, name: target.name }, accountId);
     })
-    .map(name => String(name || '').trim())
-    .filter(Boolean);
-  const nextRecentGroups = [...new Set([...selectedNames, ...previous])].slice(0, 5);
+    .filter(ref => ref.group_id || ref.group_name);
+  const nextRecentGroups = mergeGroupRefs([...selectedRefs, ...previous]).slice(0, 5);
   if (!nextRecentGroups.length || JSON.stringify(nextRecentGroups) === JSON.stringify(previous.slice(0, 5))) return;
-  await api('/api/settings', { method: 'PUT', body: { groups: { recent: nextRecentGroups } } });
+  if (signal?.aborted) return;
+  await api('/api/settings', { method: 'PUT', signal, body: { groups: { recent: nextRecentGroups } } });
 }
 
-async function runSingleDigestRequest({ target, since, until, batchId, previewText, signal, onStage }) {
+async function runSingleDigestRequest({ target, accountId, since, until, batchId, previewText, signal, onStage }) {
   let digest = null;
   let modelError = null;
   const resp = await fetch('/api/digest', {
@@ -1859,7 +1890,7 @@ async function runSingleDigestRequest({ target, since, until, batchId, previewTe
       group_id: target.id,
       group_name: target.name,
       batch_id: batchId,
-      account_id: selectedAccountId(),
+      account_id: accountId,
       since,
       until,
       preview_text: previewText,
@@ -2334,17 +2365,19 @@ function drawDigestCanvas(d, targetCanvas = null) {
   return canvas;
 }
 
-async function saveRenderedCanvas(digest, renderedCanvas = null) {
+async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null } = {}) {
+  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   const canvas = renderedCanvas || document.getElementById('digest-canvas') || drawDigestCanvas(digest);
   const png_data_url = canvas.toDataURL('image/png');
-  return api('/api/save-render', { method: 'POST', body: { digest: { ...digest, __render: digestRenderPayload() }, png_data_url } });
+  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+  return api('/api/save-render', { method: 'POST', signal, body: { digest: { ...digest, __render: digestRenderPayload() }, png_data_url } });
 }
 
 function renderTextPreview(d) {
   renderTextPreviews([d], { complete: true, total: 1 });
 }
 
-function renderTextPreviews(digests, { complete = true, total = null } = {}) {
+function renderTextPreviews(digests, { complete = true, total = null, partialReason = '' } = {}) {
   const cleanDigests = (digests || []).filter(Boolean);
   const markdown = cleanDigests.map(d => {
     const topicSections = groupedDigestTopics(d.topics || []);
@@ -2377,6 +2410,7 @@ function renderTextPreviews(digests, { complete = true, total = null } = {}) {
   _state_digest.lastTextDone = cleanDigests.length;
   _state_digest.lastTextTotal = Math.max(cleanDigests.length, Number(total || cleanDigests.length) || 0);
   _state_digest.lastTextComplete = !!complete;
+  _state_digest.lastTextPartialReason = complete ? '' : String(partialReason || 'partial');
   paintTextPreviewMarkdown(markdown);
 }
 
@@ -2392,9 +2426,12 @@ function paintTextPreviewMarkdown(markdown = _state_digest.lastTextMarkdown || '
   const waitingForGeneration = hasMarkdown && _state_digest.generating && !_state_digest.lastTextComplete;
   if (exportButton) exportButton.disabled = !hasMarkdown || waitingForGeneration;
   if (status) {
-    status.className = 'status';
+    status.className = hasMarkdown && !_state_digest.lastTextComplete && !waitingForGeneration ? 'status warn' : 'status';
     if (waitingForGeneration) {
       status.textContent = `已完成 ${_state_digest.lastTextDone}/${_state_digest.lastTextTotal || _state_digest.lastTextDone}，生成完成后可导出`;
+    } else if (hasMarkdown && !_state_digest.lastTextComplete) {
+      const prefix = _state_digest.lastTextPartialReason === 'cancelled' ? '已取消' : '未完整生成';
+      status.textContent = `${prefix}，保留已完成 ${_state_digest.lastTextDone}/${_state_digest.lastTextTotal || _state_digest.lastTextDone}；可导出已完成部分`;
     } else if (hasMarkdown && _state_digest.lastTextTotal > 1) {
       status.textContent = `已完成 ${_state_digest.lastTextDone}/${_state_digest.lastTextTotal}`;
     } else {
@@ -2438,8 +2475,8 @@ async function exportTextPreviewMarkdown() {
     return;
   }
   if (status) {
-    status.className = 'status';
-    status.textContent = '正在导出...';
+    status.className = _state_digest.lastTextComplete ? 'status' : 'status warn';
+    status.textContent = _state_digest.lastTextComplete ? '正在导出...' : '正在导出已完成部分...';
   }
   if (button) button.disabled = true;
   try {
@@ -3024,9 +3061,24 @@ async function renderSettings() {
     $st.textContent = '获取中...';
     try {
       const key = document.getElementById('s-apikey').value.trim();
-      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, persist: true };
+      const requestIdentity = {
+        provider: selectedProvider(),
+        base_url: normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value),
+        api_key: key,
+      };
+      const payload = { provider: requestIdentity.provider, base_url: requestIdentity.base_url, persist: true };
       if (key) payload.api_key = key;
       const r = await api('/api/list-models', { method: 'POST', body: payload });
+      const currentIdentity = {
+        provider: selectedProvider(),
+        base_url: normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value),
+        api_key: document.getElementById('s-apikey').value.trim(),
+      };
+      if (JSON.stringify(currentIdentity) !== JSON.stringify(requestIdentity)) {
+        $st.className = 'status warn';
+        $st.textContent = '端点或密钥已变化，旧模型列表结果已忽略。';
+        return;
+      }
       availableModels = r.models || [];
       clearLlmCapabilitySnapshot();
       fillModelSelects();
@@ -3273,7 +3325,15 @@ async function renderSettings() {
     schedulerStatus.className = status.last_error ? 'status err' : 'status';
     schedulerStatus.textContent = bits.join(' · ');
   }
-  api('/api/scheduler/status').then(r => paintSchedulerStatus(r.scheduler)).catch(() => paintSchedulerStatus({ enabled: !!s.scheduler.enabled }));
+  api('/api/scheduler/status')
+    .then(r => {
+      if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-scheduler-status')) return;
+      paintSchedulerStatus(r.scheduler);
+    })
+    .catch(() => {
+      if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-scheduler-status')) return;
+      paintSchedulerStatus({ enabled: !!s.scheduler.enabled });
+    });
   const saveGroupsButton = document.getElementById('s-save-groups');
   const runSchedulerButton = document.getElementById('s-run-scheduler');
   function overrideGroupRef(item) {

@@ -198,7 +198,7 @@ export function normalizeSettings(settings) {
   s.groups = s.groups && typeof s.groups === 'object' ? s.groups : {};
   s.groups.whitelist = normalizeGroupRefs(s.groups.whitelist, 500);
   s.groups.overrides = Array.isArray(s.groups.overrides) ? s.groups.overrides : [];
-  s.groups.recent = normalizeStringList(s.groups.recent, 5);
+  s.groups.recent = normalizeGroupRefs(s.groups.recent, 5);
   s.scheduler = s.scheduler && typeof s.scheduler === 'object' ? s.scheduler : {};
   s.scheduler.enabled = !!s.scheduler.enabled;
   s.scheduler.default_interval = normalizeDurationText(s.scheduler.default_interval, '30m');
