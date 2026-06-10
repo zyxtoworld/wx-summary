@@ -106,7 +106,7 @@ export async function overwriteRenderedPng({ settings, item, digest, png_data_ur
   return next;
 }
 
-export async function savePreviewMarkdown({ title = '文本预览', markdown }) {
+export async function savePreviewMarkdown({ settings, title = '文本预览', markdown }) {
   const text = String(markdown || '').replace(/\r\n/g, '\n');
   if (!text.trim()) {
     const err = new Error('markdown is empty');
@@ -118,7 +118,7 @@ export async function savePreviewMarkdown({ title = '文本预览', markdown }) 
     err.status = 413;
     throw err;
   }
-  const dir = path.join(OUTPUTS_DIR, 'previews');
+  const dir = path.join(outputDirFromSettings(settings), 'previews');
   await ensureDir(dir);
   const filename = await uniqueFilename(dir, `${sanitizeName(title || '文本预览')}__${timestampForFilename(new Date())}.md`);
   const filePath = path.join(dir, filename);

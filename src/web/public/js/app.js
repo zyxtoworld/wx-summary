@@ -607,6 +607,9 @@ let _state_digest = {
   lastSavedItem: null,
   lastTextMarkdown: '',
   lastTextTitle: '',
+  lastTextComplete: false,
+  lastTextDone: 0,
+  lastTextTotal: 0,
   generating: false,
   abortController: null,
   abortReason: '',
@@ -664,8 +667,61 @@ async function fetchDigestGroups(accountId = selectedAccountId(), { force = fals
   return cache.promise;
 }
 
-function decorateDigestGroups(groups, digestSettings = {}) {
-  const whitelistNames = new Set(digestSettings.groups?.whitelist || []);
+function groupRefForPayload(group = {}, accountId = selectedAccountId()) {
+  return {
+    account_id: String(accountId || '').trim(),
+    group_id: String(group.id || group.group_id || '').trim(),
+    group_name: String(group.name || group.group_name || group.id || '').trim(),
+  };
+}
+
+function groupRefMatches(ref, group = {}, accountId = selectedAccountId()) {
+  const groupId = String(group.id || group.group_id || '').trim();
+  const groupName = String(group.name || group.group_name || '').trim();
+  if (typeof ref === 'string') {
+    const legacy = ref.trim();
+    return !!legacy && (legacy === groupId || legacy === groupName);
+  }
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return false;
+  const refAccountId = String(ref.account_id || ref.account || '').trim();
+  if (refAccountId && refAccountId !== String(accountId || '').trim()) return false;
+  const refGroupId = String(ref.group_id || ref.id || '').trim();
+  if (refGroupId) return refGroupId === groupId;
+  const refGroupName = String(ref.group_name || ref.name || '').trim();
+  if (refGroupName) return refGroupName === groupName;
+  const refLegacyGroup = String(ref.group || '').trim();
+  return !!refLegacyGroup && (refLegacyGroup === groupId || refLegacyGroup === groupName);
+}
+
+function groupRefKey(ref) {
+  if (typeof ref === 'string') return `legacy:${ref.trim()}`;
+  const accountId = String(ref?.account_id || ref?.account || '').trim();
+  const groupId = String(ref?.group_id || ref?.id || '').trim();
+  const groupName = String(ref?.group_name || ref?.name || ref?.group || '').trim();
+  return `${accountId || '*'}::${groupId || groupName}`;
+}
+
+function mergeGroupRefs(refs = []) {
+  const out = [];
+  const seen = new Set();
+  for (const ref of refs) {
+    const key = groupRefKey(ref);
+    if (!key || key === '*::' || seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+  }
+  return out;
+}
+
+function groupLabelFromRef(ref) {
+  if (typeof ref === 'string') return ref;
+  return ref?.group_name || ref?.group || ref?.group_id || ref?.name || '';
+}
+
+function decorateDigestGroups(groups, digestSettings = {}, accountId = selectedAccountId()) {
+  const whitelistRefs = Array.isArray(digestSettings.groups?.whitelist) ? digestSettings.groups.whitelist : [];
+  const hasCurrentWhitelist = (Array.isArray(groups) ? groups : [])
+    .some(group => whitelistRefs.some(ref => groupRefMatches(ref, group, accountId)));
   const recentNames = Array.isArray(digestSettings.groups?.recent) ? digestSettings.groups.recent : [];
   const recentRank = new Map(recentNames.map((name, index) => [String(name || ''), index]));
   return (Array.isArray(groups) ? groups : [])
@@ -675,7 +731,7 @@ function decorateDigestGroups(groups, digestSettings = {}) {
         recentRank.has(group.id) ? recentRank.get(group.id) : Number.POSITIVE_INFINITY,
       );
       const starred = Number.isFinite(rank);
-      const nonWhitelist = whitelistNames.size > 0 && !whitelistNames.has(group.name) && !whitelistNames.has(group.id);
+      const nonWhitelist = hasCurrentWhitelist && !whitelistRefs.some(ref => groupRefMatches(ref, group, accountId));
       return { ...group, starred, non_whitelist: nonWhitelist, recent_rank: starred ? rank : 9999 };
     })
     .sort((a, b) => (a.recent_rank - b.recent_rank) || ((b.last_msg_at || 0) - (a.last_msg_at || 0)));
@@ -689,7 +745,7 @@ async function renderDigest() {
   const digestSettings = await api('/api/settings').catch(() => ({}));
   if (routeSeq !== _routeSeq) return;
   applyDigestRenderDefaults(digestSettings.render || {});
-  const whitelistNames = new Set(digestSettings.groups?.whitelist || []);
+  const whitelistRefs = Array.isArray(digestSettings.groups?.whitelist) ? digestSettings.groups.whitelist : [];
   const notice = document.getElementById('wechat-notice');
   if (state.data_mode !== 'wxdb' || state.wechat?.running === false) {
     const hasWxData = state.data_mode === 'wxdb';
@@ -716,7 +772,7 @@ async function renderDigest() {
   try {
     const rawGroups = cacheHasGroups ? groupCache.groups : await fetchDigestGroups(accountId, { force: true });
     if (routeSeq !== _routeSeq) return;
-    groups = decorateDigestGroups(rawGroups, digestSettings);
+    groups = decorateDigestGroups(rawGroups, digestSettings, accountId);
   } catch (e) {
     if (routeSeq !== _routeSeq) return;
     notice.classList.remove('hidden');
@@ -785,7 +841,7 @@ async function renderDigest() {
     fetchDigestGroups(accountId, { force: true })
       .then(rawGroups => {
         if (!isCurrentDigestView()) return;
-        groups = decorateDigestGroups(rawGroups, digestSettings);
+        groups = decorateDigestGroups(rawGroups, digestSettings, accountId);
         setGroupStatus('');
         paint(document.getElementById('group-search')?.value || '');
       })
@@ -799,10 +855,11 @@ async function renderDigest() {
       });
   }
   const whitelistButton = document.getElementById('select-whitelist');
-  whitelistButton.disabled = whitelistNames.size === 0;
-  whitelistButton.title = whitelistNames.size ? '选择设置页白名单里的群' : '设置页尚未配置白名单';
+  const currentWhitelistCount = groups.filter(g => whitelistRefs.some(ref => groupRefMatches(ref, g, accountId))).length;
+  whitelistButton.disabled = currentWhitelistCount === 0;
+  whitelistButton.title = currentWhitelistCount ? '选择设置页白名单里的群' : '当前账号尚未配置白名单';
   document.getElementById('select-whitelist').addEventListener('click', () => {
-    groups.filter(g => whitelistNames.has(g.name)).forEach(g => _state_digest.selectedGroups.add(g.id));
+    groups.filter(g => whitelistRefs.some(ref => groupRefMatches(ref, g, accountId))).forEach(g => _state_digest.selectedGroups.add(g.id));
     paint(document.getElementById('group-search').value);
   });
 
@@ -1391,6 +1448,9 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.lastSavedItem = null;
   _state_digest.lastTextMarkdown = '';
   _state_digest.lastTextTitle = '';
+  _state_digest.lastTextComplete = false;
+  _state_digest.lastTextDone = 0;
+  _state_digest.lastTextTotal = 0;
   scrollDigestWorkIntoView($progress);
   const selectedIds = [..._state_digest.selectedGroups];
   const batchId = createDigestBatchId();
@@ -1584,7 +1644,7 @@ async function generateDigest({ previewText = false } = {}) {
         digests[i] = digest;
         _state_digest.lastDigest = digest;
         if (previewText) {
-          renderTextPreviews(digests.filter(Boolean));
+          renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
         } else {
           await enqueueRender(async () => {
             const livePreviewCard = document.getElementById('preview-card');
@@ -1620,6 +1680,9 @@ async function generateDigest({ previewText = false } = {}) {
     await renderQueue;
 
     const doneDigests = digests.filter(Boolean);
+    if (previewText && doneDigests.length) {
+      renderTextPreviews(doneDigests, { complete: true, total: targets.length });
+    }
     if (controller.signal.aborted) {
       const reason = _state_digest.abortReason || '已取消';
       upsertStage({
@@ -2278,11 +2341,12 @@ async function saveRenderedCanvas(digest, renderedCanvas = null) {
 }
 
 function renderTextPreview(d) {
-  renderTextPreviews([d]);
+  renderTextPreviews([d], { complete: true, total: 1 });
 }
 
-function renderTextPreviews(digests) {
-  const markdown = (digests || []).map(d => {
+function renderTextPreviews(digests, { complete = true, total = null } = {}) {
+  const cleanDigests = (digests || []).filter(Boolean);
+  const markdown = cleanDigests.map(d => {
     const topicSections = groupedDigestTopics(d.topics || []);
     const quotes = digestQuotesForRender(d);
     const highlights = digestHighlightsForRender(d);
@@ -2309,7 +2373,10 @@ function renderTextPreviews(digests) {
     ].filter(Boolean).join('\n\n');
   }).join('\n\n---\n\n');
   _state_digest.lastTextMarkdown = markdown;
-  _state_digest.lastTextTitle = (digests || []).map(d => d.group).filter(Boolean).join('_') || '文本预览';
+  _state_digest.lastTextTitle = cleanDigests.map(d => d.group).filter(Boolean).join('_') || '文本预览';
+  _state_digest.lastTextDone = cleanDigests.length;
+  _state_digest.lastTextTotal = Math.max(cleanDigests.length, Number(total || cleanDigests.length) || 0);
+  _state_digest.lastTextComplete = !!complete;
   paintTextPreviewMarkdown(markdown);
 }
 
@@ -2321,10 +2388,18 @@ function paintTextPreviewMarkdown(markdown = _state_digest.lastTextMarkdown || '
   pre.textContent = markdown;
   const exportButton = document.getElementById('btn-export-md');
   const status = document.getElementById('text-preview-status');
-  if (exportButton) exportButton.disabled = !markdown.trim();
+  const hasMarkdown = !!markdown.trim();
+  const waitingForGeneration = hasMarkdown && _state_digest.generating && !_state_digest.lastTextComplete;
+  if (exportButton) exportButton.disabled = !hasMarkdown || waitingForGeneration;
   if (status) {
     status.className = 'status';
-    status.textContent = '';
+    if (waitingForGeneration) {
+      status.textContent = `已完成 ${_state_digest.lastTextDone}/${_state_digest.lastTextTotal || _state_digest.lastTextDone}，生成完成后可导出`;
+    } else if (hasMarkdown && _state_digest.lastTextTotal > 1) {
+      status.textContent = `已完成 ${_state_digest.lastTextDone}/${_state_digest.lastTextTotal}`;
+    } else {
+      status.textContent = '';
+    }
   }
 }
 
@@ -2354,6 +2429,14 @@ async function exportTextPreviewMarkdown() {
   const status = document.getElementById('text-preview-status');
   const button = document.getElementById('btn-export-md');
   if (!_state_digest.lastTextMarkdown?.trim()) return;
+  if (_state_digest.generating && !_state_digest.lastTextComplete) {
+    if (status) {
+      status.className = 'status warn';
+      status.textContent = '文本预览仍在生成，完成后再导出。';
+    }
+    if (button) button.disabled = true;
+    return;
+  }
   if (status) {
     status.className = 'status';
     status.textContent = '正在导出...';
@@ -2377,7 +2460,7 @@ async function exportTextPreviewMarkdown() {
       status.textContent = `导出失败：${e.message || '未知错误'}`;
     }
   } finally {
-    if (button) button.disabled = false;
+    if (button) button.disabled = !_state_digest.lastTextMarkdown?.trim() || (_state_digest.generating && !_state_digest.lastTextComplete);
   }
 }
 
@@ -2778,6 +2861,7 @@ async function renderSettings() {
   const settingsRouteSeq = _routeSeq;
   const s = await api('/api/settings');
   if (settingsRouteSeq !== _routeSeq) return;
+  const settingsAccountId = selectedAccountId();
   const statePromise = api('/api/state').catch(() => ({ platform: '', project_root: '' }));
   let settingsState = _appState || { platform: '', project_root: '' };
 
@@ -3058,7 +3142,10 @@ async function renderSettings() {
   let groupsLoaded = false;
   let groupsLoadError = null;
   let schedulerOverrides = Array.isArray(s.scheduler.per_group) ? s.scheduler.per_group.map(item => ({
-    group: item.group || item.group_id || '',
+    account_id: item.account_id || '',
+    group_id: item.group_id || '',
+    group_name: item.group_name || item.name || '',
+    group: item.group || item.group_name || item.group_id || '',
     keywords: Array.isArray(item.keywords) ? item.keywords : String(item.keywords || '').split(/[,，]/).map(x => x.trim()).filter(Boolean),
     min_messages: Number(item.min_messages || item.min_messages_per_digest || 0) || 0,
   })).filter(item => item.group && (item.keywords.length || item.min_messages)) : [];
@@ -3075,8 +3162,8 @@ async function renderSettings() {
       return;
     }
     $wl.innerHTML = groups.map(g => {
-      const checked = (s.groups.whitelist || []).includes(g.name);
-      return `<label class="chip"><input type="checkbox" ${checked ? 'checked' : ''} value="${escapeHtml(g.name)}" /> ${escapeHtml(g.name)}</label>`;
+      const checked = (s.groups.whitelist || []).some(ref => groupRefMatches(ref, g, settingsAccountId));
+      return `<label class="chip"><input type="checkbox" ${checked ? 'checked' : ''} value="${escapeHtml(g.id)}" data-group-name="${escapeHtml(g.name)}" /> ${escapeHtml(g.name)}</label>`;
     }).join('');
   }
   function paintOverrideEditor() {
@@ -3084,7 +3171,7 @@ async function renderSettings() {
     const list = document.getElementById('s-overrides');
     if (!groupSelect || !list) return;
     groupSelect.innerHTML = groups.length
-      ? groups.map(g => `<option value="${escapeHtml(g.name || g.id)}">${escapeHtml(g.name || g.id)}</option>`).join('')
+      ? groups.map(g => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name || g.id)}</option>`).join('')
       : groupsLoadError
         ? '<option value="">群列表不可用</option>'
         : groupsLoaded
@@ -3094,7 +3181,7 @@ async function renderSettings() {
     list.innerHTML = schedulerOverrides.length
       ? schedulerOverrides.map((item, index) => `
         <div class="override-item" data-index="${index}">
-          <strong>${escapeHtml(item.group)}</strong>
+          <strong>${escapeHtml(groupLabelFromRef(item) || item.group)}</strong>
           <span class="muted">${escapeHtml(item.keywords?.length ? item.keywords.join('、') : '不过滤关键词')}</span>
           <span>${item.min_messages ? `${item.min_messages} 条` : '用全局'}</span>
           <button class="link-btn" type="button" data-remove-override="${index}">删除</button>
@@ -3114,7 +3201,7 @@ async function renderSettings() {
     paintWl();
     paintOverrideEditor();
     try {
-      const loaded = await api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`);
+      const loaded = await api(`/api/groups?account=${encodeURIComponent(settingsAccountId)}`);
       if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-whitelist')) return;
       groups = Array.isArray(loaded) ? loaded : [];
       groupsLoaded = true;
@@ -3131,15 +3218,17 @@ async function renderSettings() {
   paintWl();
   paintOverrideEditor();
   document.getElementById('s-add-override')?.addEventListener('click', () => {
-    const group = document.getElementById('s-override-group').value;
+    const groupId = document.getElementById('s-override-group').value;
+    const group = groups.find(item => item.id === groupId) || {};
     const keywords = document.getElementById('s-override-keywords').value
       .split(/[,，]/)
       .map(x => x.trim())
       .filter(Boolean);
     const minMessages = parseInt(document.getElementById('s-override-min').value || '0', 10) || 0;
-    if (!group || (!keywords.length && !minMessages)) return;
-    schedulerOverrides = schedulerOverrides.filter(item => item.group !== group);
-    schedulerOverrides.push({ group, keywords, min_messages: minMessages });
+    if (!groupId || (!keywords.length && !minMessages)) return;
+    const ref = groupRefForPayload({ id: groupId, name: group.name || groupId }, settingsAccountId);
+    schedulerOverrides = schedulerOverrides.filter(item => groupRefKey(item) !== groupRefKey(ref));
+    schedulerOverrides.push({ ...ref, group: ref.group_name || ref.group_id, keywords, min_messages: minMessages });
     document.getElementById('s-override-keywords').value = '';
     document.getElementById('s-override-min').value = '';
     paintOverrideEditor();
@@ -3149,20 +3238,36 @@ async function renderSettings() {
   setDurationControl('s-scheduler-window', s.scheduler.digest_window || '4h', '4h');
   document.getElementById('s-scheduler-min').value = s.scheduler.min_messages_per_digest ?? 30;
   const schedulerStatus = document.getElementById('s-scheduler-status');
+  function schedulerDetailLabel(detail) {
+    const map = {
+      scheduler_disabled: '定时任务未启用',
+      llm_not_configured: 'AI 设置未配置完整',
+      no_whitelisted_groups: '没有可自动检查的白名单群',
+      already_running: '已有检查正在运行',
+      below_minimum: '消息数低于阈值',
+      no_new_messages: '没有新消息',
+    };
+    return map[detail] || detail || '';
+  }
   function paintSchedulerStatus(status = {}) {
     const bits = [];
     bits.push(status.enabled ? '已启用' : '未启用');
     if (status.running) bits.push('运行中');
     if (status.next_run_at) bits.push(`下次 ${new Date(status.next_run_at).toLocaleString()}`);
-    if (status.last_result?.generated !== undefined) {
+    if (status.last_result) {
       const r = status.last_result;
-      const detail = [
-        `生成 ${r.generated || 0}`,
-        r.checked !== undefined ? `检查 ${r.checked}` : '',
-        r.skipped ? `跳过 ${r.skipped}` : '',
-        r.failed ? `失败 ${r.failed}` : '',
-      ].filter(Boolean).join(' / ');
-      bits.push(`上次 ${detail}`);
+      if (r.generated !== undefined) {
+        const detail = [
+          `生成 ${r.generated || 0}`,
+          r.checked !== undefined ? `检查 ${r.checked}` : '',
+          r.skipped ? `跳过 ${r.skipped}` : '',
+          r.failed ? `失败 ${r.failed}` : '',
+          r.detail ? schedulerDetailLabel(r.detail) : '',
+        ].filter(Boolean).join(' / ');
+        bits.push(`上次 ${detail}`);
+      } else if (r.detail) {
+        bits.push(`上次 ${schedulerDetailLabel(r.detail)}`);
+      }
     }
     if (status.last_error) bits.push(`错误：${status.last_error}`);
     schedulerStatus.className = status.last_error ? 'status err' : 'status';
@@ -3171,18 +3276,48 @@ async function renderSettings() {
   api('/api/scheduler/status').then(r => paintSchedulerStatus(r.scheduler)).catch(() => paintSchedulerStatus({ enabled: !!s.scheduler.enabled }));
   const saveGroupsButton = document.getElementById('s-save-groups');
   const runSchedulerButton = document.getElementById('s-run-scheduler');
-  function schedulerSettingsPayload() {
-    const wl = groupsLoaded
-      ? [...document.querySelectorAll('#s-whitelist input:checked')].map(i => i.value)
-      : (Array.isArray(s.groups?.whitelist) ? s.groups.whitelist : []);
+  function overrideGroupRef(item) {
+    if (item?.group_id || item?.group_name || item?.account_id) {
+      const out = {};
+      if (item.account_id) out.account_id = item.account_id;
+      if (item.group_id) out.group_id = item.group_id;
+      if (item.group_name) out.group_name = item.group_name;
+      return out;
+    }
+    const legacy = String(item?.group || '').trim();
+    return legacy || {};
+  }
+  function overridePayload(item) {
+    const ref = overrideGroupRef(item);
+    const base = typeof ref === 'string'
+      ? { group: ref }
+      : { ...ref, group: item.group || groupLabelFromRef(ref) };
     return {
-      groups: { whitelist: wl },
+      ...base,
+      keywords: item.keywords,
+      min_messages: item.min_messages,
+    };
+  }
+  function schedulerSettingsPayload() {
+    const existingWhitelist = Array.isArray(s.groups?.whitelist) ? s.groups.whitelist : [];
+    const wl = groupsLoaded
+      ? mergeGroupRefs([
+          ...existingWhitelist.filter(ref => !groups.some(group => groupRefMatches(ref, group, settingsAccountId))),
+          ...[...document.querySelectorAll('#s-whitelist input:checked')].map(input => {
+            const group = groups.find(item => item.id === input.value) || { id: input.value, name: input.dataset.groupName || input.value };
+            return groupRefForPayload(group, settingsAccountId);
+          }),
+        ])
+      : existingWhitelist;
+    const perGroup = schedulerOverrides.map(overridePayload);
+    return {
+      groups: { whitelist: mergeGroupRefs([...wl, ...perGroup.map(overrideGroupRef)]) },
       scheduler: {
         enabled: document.getElementById('s-scheduler').checked,
         default_interval: getDurationControlValue('s-scheduler-interval', '30m'),
         digest_window: getDurationControlValue('s-scheduler-window', '4h'),
         min_messages_per_digest: parseInt(document.getElementById('s-scheduler-min').value || '30', 10),
-        per_group: schedulerOverrides,
+        per_group: perGroup,
       },
     };
   }
@@ -3495,7 +3630,7 @@ async function renderSetup() {
   const $step = document.getElementById('setup-step');
   const $back = document.getElementById('setup-back');
   const $next = document.getElementById('setup-next');
-  const wizardData = { llm: {}, wechat: {}, whitelist: new Set() };
+  const wizardData = { llm: {}, wechat: {}, whitelist: new Map() };
   let setupPaintSeq = 0;
 
   function paint() {
@@ -3505,10 +3640,13 @@ async function renderSetup() {
     $next.textContent = step === 4 ? '完成' : '下一步';
     if (step === 1) {
       $title.textContent = '欢迎使用 wx-summary';
+      const secretWarningText = state.platform === 'win32'
+        ? '当前 Windows 用户不能解开已有的 DPAPI 密钥文件。请重新填写 AI Key 和可选微信手动密钥；旧密文不会展示，也不会上传。'
+        : '当前系统用户不能解开已有的本机密钥文件。请重新填写 AI Key 和可选微信手动密钥；旧密文不会展示，也不会上传。';
       const secretWarning = state.secrets_invalid
         ? `<div class="notice-card setup-secret-warning">
             <strong>检测到本机密钥无法解密</strong>
-            <span>当前系统用户不能解开已有的本机密钥文件。请重新填写 AI Key 和可选微信手动密钥；旧密文不会展示，也不会上传。</span>
+            <span>${secretWarningText}</span>
           </div>`
         : '';
       $body.innerHTML = `
@@ -3573,7 +3711,8 @@ async function renderSetup() {
       $next.disabled = true;
       $next.textContent = '读取群列表...';
       $body.innerHTML = '<p class="muted small">正在读取本机微信群列表...</p>';
-      api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`).then(groups => {
+      const setupAccountId = selectedAccountId();
+      api(`/api/groups?account=${encodeURIComponent(setupAccountId)}`).then(groups => {
         if (step !== 4 || paintSeq !== setupPaintSeq) return;
         $next.disabled = false;
         $next.textContent = '完成';
@@ -3594,11 +3733,16 @@ async function renderSetup() {
           });
           const list = document.getElementById('w-whitelist');
           list.innerHTML = visible.length
-            ? visible.map(g => `<label class="chip"><input type="checkbox" value="${escapeHtml(g.name)}" ${wizardData.whitelist.has(g.name) ? 'checked' : ''} /> ${escapeHtml(g.name)}</label>`).join('')
+            ? visible.map(g => {
+              const ref = groupRefForPayload(g, setupAccountId);
+              const key = groupRefKey(ref);
+              return `<label class="chip"><input type="checkbox" value="${escapeHtml(key)}" ${wizardData.whitelist.has(key) ? 'checked' : ''} /> ${escapeHtml(g.name)}</label>`;
+            }).join('')
             : '<span class="muted small">没有匹配的群。</span>';
           list.querySelectorAll('input[type="checkbox"]').forEach(input => {
             input.addEventListener('change', () => {
-              if (input.checked) wizardData.whitelist.add(input.value);
+              const group = groups.find(g => groupRefKey(groupRefForPayload(g, setupAccountId)) === input.value);
+              if (input.checked && group) wizardData.whitelist.set(input.value, groupRefForPayload(group, setupAccountId));
               else wizardData.whitelist.delete(input.value);
               document.getElementById('w-whitelist-count').textContent = `已选 ${wizardData.whitelist.size} 个群`;
             });
@@ -3611,7 +3755,10 @@ async function renderSetup() {
           const f = search.value.trim().toLowerCase();
           groups
             .filter(g => !f || [g.name, g.id, g.pinyin, g.pinyin_initial].some(v => String(v || '').toLowerCase().includes(f)))
-            .forEach(g => wizardData.whitelist.add(g.name));
+            .forEach(g => {
+              const ref = groupRefForPayload(g, setupAccountId);
+              wizardData.whitelist.set(groupRefKey(ref), ref);
+            });
           paintWhitelist(search.value);
         });
         document.getElementById('w-whitelist-clear').addEventListener('click', () => {
@@ -3680,7 +3827,7 @@ async function renderSetup() {
       }
     }
     if (step === 4) {
-      const wl = [...wizardData.whitelist];
+      const wl = [...wizardData.whitelist.values()];
       const payload = { llm: wizardData.llm, groups: { whitelist: wl } };
       if (wizardData.wechat.manual_key) payload.wechat = { manual_key: wizardData.wechat.manual_key };
       $next.disabled = true;

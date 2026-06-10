@@ -75,6 +75,7 @@ outputs/
 - `data/*weixin*baseline*.json`
 - `outputs/`
 - `node_modules/`
+- `docs/验收记录.md` 等本机验收材料
 - 本机微信数据库、解密副本、图片、语音、视频、`.dat`、`.wxgf`
 - 真实 API Key、手动数据库 key、本机路径、群 ID、群成员名单、聊天内容
 

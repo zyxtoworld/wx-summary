@@ -110,6 +110,7 @@ export async function loadSecrets({ file = SECRETS_FILE } = {}) {
     return { secrets: { api_key: parsed.api_key || '', manual_key: parsed.manual_key || '' }, invalid: false };
   } catch (e) {
     if (e?.code === 'ENOENT') return { secrets: { api_key: '', manual_key: '' }, invalid: false };
+    await fsp.rm(file, { force: true }).catch(() => {});
     return { secrets: { api_key: '', manual_key: '' }, invalid: true, error: e?.message || String(e) };
   }
 }
@@ -121,7 +122,7 @@ export async function saveSecrets(secrets) {
     manual_key: secrets.manual_key || '',
   };
   const encrypted = await protectText(JSON.stringify(filtered));
-  const tmp = path.join(DATA_DIR, `secrets.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
+  const tmp = path.join(DATA_DIR, `secrets.${process.pid}.${Date.now()}.tmp`);
   try {
     await fsp.writeFile(tmp, encrypted);
     await fsp.rename(tmp, SECRETS_FILE);
@@ -194,7 +195,7 @@ export function normalizeSettings(settings) {
   s.link_preview.max_related_bytes = finiteInteger(s.link_preview.max_related_bytes, 98304, 8192, 1024 * 1024);
   s.link_preview.max_related_chars = finiteInteger(s.link_preview.max_related_chars, 800, 200, 5000);
   s.groups = s.groups && typeof s.groups === 'object' ? s.groups : {};
-  s.groups.whitelist = normalizeStringList(s.groups.whitelist, 500);
+  s.groups.whitelist = normalizeGroupRefs(s.groups.whitelist, 500);
   s.groups.overrides = Array.isArray(s.groups.overrides) ? s.groups.overrides : [];
   s.groups.recent = normalizeStringList(s.groups.recent, 5);
   s.scheduler = s.scheduler && typeof s.scheduler === 'object' ? s.scheduler : {};
@@ -202,7 +203,11 @@ export function normalizeSettings(settings) {
   s.scheduler.default_interval = normalizeDurationText(s.scheduler.default_interval, '30m');
   s.scheduler.digest_window = normalizeDurationText(s.scheduler.digest_window, '4h');
   s.scheduler.min_messages_per_digest = finiteInteger(s.scheduler.min_messages_per_digest, 30, 1, 10000);
-  s.scheduler.per_group = normalizePerGroupOverrides(s.scheduler.per_group);
+  s.scheduler.per_group = normalizePerGroupOverrides([
+    ...(Array.isArray(s.scheduler.per_group) ? s.scheduler.per_group : []),
+    ...(Array.isArray(s.groups.overrides) ? s.groups.overrides : []),
+  ]);
+  s.groups.overrides = [];
   if (!outputDirIsSafe(s.output.dir)) s.output.dir = defaults.output.dir;
   s.output.retention_days = finiteInteger(s.output.retention_days, 0, 0, 3650);
   s.output.filename_pattern = normalizeFilenamePattern(s.output.filename_pattern, defaults.output.filename_pattern);
@@ -232,21 +237,65 @@ function normalizeStringList(value, limit) {
   return [...new Set(value.map(item => String(item || '').trim()).filter(Boolean))].slice(0, limit);
 }
 
+function normalizeGroupRefs(value, limit) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of value) {
+    const ref = normalizeGroupRef(item);
+    if (!ref) continue;
+    const key = typeof ref === 'string'
+      ? `legacy:${ref}`
+      : `ref:${ref.account_id || '*'}:${ref.group_id || ref.group_name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function normalizeGroupRef(item) {
+  if (typeof item === 'string') {
+    const legacy = item.trim();
+    return legacy || null;
+  }
+  if (!plainObject(item)) return null;
+  const accountId = String(item.account_id || item.account || '').trim();
+  const groupId = String(item.group_id || item.id || '').trim();
+  const groupName = String(item.group_name || item.name || '').trim();
+  const legacyGroup = String(item.group || '').trim();
+  if (!groupId && !groupName && legacyGroup) return legacyGroup;
+  if (!groupId && !groupName) return null;
+  const ref = {};
+  if (accountId) ref.account_id = accountId.slice(0, 200);
+  if (groupId) ref.group_id = groupId.slice(0, 300);
+  if (groupName) ref.group_name = groupName.slice(0, 300);
+  return ref;
+}
+
 function normalizePerGroupOverrides(value) {
   if (!Array.isArray(value)) return [];
   return value
     .map(item => {
-      const group = String(item?.group || item?.group_id || item?.name || '').trim();
+      const accountId = String(item?.account_id || item?.account || '').trim();
+      const groupId = String(item?.group_id || item?.id || '').trim();
+      const groupName = String(item?.group_name || item?.name || '').trim();
+      const group = String(item?.group || groupId || groupName || '').trim();
       const keywords = Array.isArray(item?.keywords)
         ? item.keywords.map(x => String(x || '').trim()).filter(Boolean)
         : String(item?.keywords || '').split(/[,，]/).map(x => x.trim()).filter(Boolean);
       const min = finiteInteger(item?.min_messages ?? item?.min_messages_per_digest, 0, 0, 10000);
-      if (!group) return null;
-      return {
-        group,
+      if (!group && !groupId && !groupName) return null;
+      const out = {
+        group: group || groupId || groupName,
         keywords: [...new Set(keywords)].slice(0, 20),
         min_messages: min,
       };
+      if (accountId) out.account_id = accountId.slice(0, 200);
+      if (groupId) out.group_id = groupId.slice(0, 300);
+      if (groupName) out.group_name = groupName.slice(0, 300);
+      return out;
     })
     .filter(item => item && (item.keywords.length || item.min_messages > 0))
     .slice(0, 200);

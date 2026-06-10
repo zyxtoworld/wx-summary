@@ -918,6 +918,7 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
   throwIfAborted(signal);
   const sinceTs = toUnixSeconds(since, 0);
   const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000));
+  const timeBounds = messageTimeBounds(sinceTs, untilTs);
   const out = [];
   const shardErrors = [];
   let readableShards = 0;
@@ -937,9 +938,12 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
         select local_id, server_id, local_type, sort_seq, real_sender_id, create_time,
                message_content, compress_content, packed_info_data
         from ${tableName}
-        where create_time >= ? and create_time <= ?
+        where (
+          (create_time >= ? and create_time <= ?)
+          or (create_time >= ? and create_time <= ?)
+        )
         order by create_time asc
-      `).all([sinceTs, untilTs]);
+      `).all([timeBounds.since_s, timeBounds.until_s, timeBounds.since_ms, timeBounds.until_ms]);
       throwIfAborted(signal);
       if (!rows.length) continue;
 
@@ -959,13 +963,14 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
           packed_info_data: row.packed_info_data,
         });
         const sender = normalized.sender || senderMap.get(Number(row.real_sender_id || 0)) || '未知成员';
+        const timestamp = normalizeWxTimestamp(row.create_time);
         out.push({
           id: `${file.name}:${row.local_id}`,
           local_id: Number(row.local_id),
           server_id: String(row.server_id || ''),
           sort_seq: Number(row.sort_seq || 0),
-          time: formatMessageTime(Number(row.create_time || 0)),
-          timestamp: Number(row.create_time || 0) * 1000,
+          time: formatMessageTime(timestamp),
+          timestamp,
           sender,
           type: normalized.type,
           content: normalized.content,
@@ -2027,8 +2032,20 @@ function toUnixSeconds(value, fallback) {
   return Math.floor(date.getTime() / 1000);
 }
 
-function formatMessageTime(seconds) {
-  const date = new Date(seconds * 1000);
+function messageTimeBounds(sinceSeconds, untilSeconds) {
+  const since = Number(sinceSeconds || 0);
+  const until = Number(untilSeconds || 0);
+  return {
+    since_s: since,
+    until_s: until,
+    since_ms: since * 1000,
+    until_ms: until * 1000,
+  };
+}
+
+function formatMessageTime(value) {
+  const timestamp = normalizeWxTimestamp(value);
+  const date = new Date(timestamp);
   const p = n => String(n).padStart(2, '0');
   return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`;
 }
@@ -2909,6 +2926,8 @@ export const __wxdbInternals = {
   validateWeixinV4PageHmac,
   decryptWeixinV4DbToPlaintext,
   weixinV4KeyCandidates,
+  normalizeWxTimestamp,
+  messageTimeBounds,
   formatMessageTime,
   groupPinyinInitial,
   groupSearchFields,

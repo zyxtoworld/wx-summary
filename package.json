@@ -6,6 +6,7 @@
   "type": "module",
   "main": "src/main.js",
   "scripts": {
+    "prepare": "node scripts/install-githooks.mjs",
     "start": "node src/main.js",
     "dev": "node src/main.js --no-open"
   },

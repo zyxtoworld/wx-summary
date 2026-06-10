@@ -275,7 +275,7 @@ async function dbRawKeyCandidateBundle({ memoryScan = true } = {}) {
   const cacheKey = JSON.stringify({
     platform: process.platform,
     memoryScan,
-    manual,
+    manual_key_text: manual.join('\n'),
     verified_hashes: VERIFIED_RAW_KEY_CACHE.map(key => key.slice(0, 12)),
     local_hashes: local?.candidate_hashes || [],
     local_file_count: Number(local?.file_stats?.scanned || 0),

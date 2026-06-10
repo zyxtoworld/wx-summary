@@ -259,39 +259,50 @@ function openerLaunchError(command, err) {
   return out;
 }
 
+function logOpenerLaunchFailure(command, err, { late = false } = {}) {
+  logWarn('reveal_in_folder_failed', {
+    platform: process.platform,
+    opener: command,
+    late: !!late,
+    error: sanitizeText(err?.message || String(err)),
+  });
+}
+
 function launchDetachedOpener(command, args, options = {}, result = {}) {
   return new Promise((resolve, reject) => {
     let child;
     try {
       child = spawn(command, args, { detached: true, stdio: 'ignore', ...options });
     } catch (err) {
+      logOpenerLaunchFailure(command, err);
       reject(openerLaunchError(command, err));
       return;
     }
     let settled = false;
     let timer = null;
-    const cleanup = () => {
+    const cleanup = ({ keepErrorListener = false } = {}) => {
       clearTimeout(timer);
       child.off('spawn', onSpawn);
+      if (!keepErrorListener) child.off('error', onError);
     };
     const onSpawn = () => {
       if (settled) return;
       settled = true;
-      cleanup();
+      cleanup({ keepErrorListener: true });
       child.unref();
       resolve(result);
     };
     const onError = err => {
+      logOpenerLaunchFailure(command, err, { late: settled });
       if (settled) {
-        logWarn('opener_late_error', { opener: command, error: sanitizeText(err?.message || String(err)) });
         return;
       }
       settled = true;
       cleanup();
       reject(openerLaunchError(command, err));
     };
-    child.once('spawn', onSpawn);
-    child.once('error', onError);
+    child.on('spawn', onSpawn);
+    child.on('error', onError);
     timer = setTimeout(onSpawn, 1000);
   });
 }
@@ -608,7 +619,24 @@ async function postSaveSettingsWarnings(patch) {
       message: 'AI 设置已保存，但所选模型不在已缓存的模型列表里；如确认可用，请开启自定义模型后保存，或刷新模型列表。',
     });
   }
+  const capabilitySnapshot = patch.llm.capabilities === undefined ? saved.llm.capabilities : patch.llm.capabilities;
+  if (hasFailedLlmCapability(capabilitySnapshot) || hasFailedLlmCapability(saved.llm.capabilities)) {
+    warnings.push({
+      code: 'llm_connectivity_failed',
+      message: 'AI 设置已保存，但最近一次连通能力检查有失败项；生成前建议重新测试连通。',
+    });
+  }
   return warnings;
+}
+
+function hasFailedLlmCapability(value, depth = 0) {
+  if (!value || depth > 5) return false;
+  if (Array.isArray(value)) {
+    return value.some(item => hasFailedLlmCapability(item, depth + 1));
+  }
+  if (typeof value !== 'object') return false;
+  if (Object.hasOwn(value, 'ok') && value.ok === false) return true;
+  return Object.values(value).some(item => hasFailedLlmCapability(item, depth + 1));
 }
 
 function settingsPatchNeedsSchedulerRestart(patch = {}) {
@@ -685,7 +713,7 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/scheduler/run-once' && req.method === 'POST') {
-    const result = await runSchedulerOnce({ reason: 'manual_api' });
+    const result = await runSchedulerOnce({ reason: 'manual_api', force: true });
     return sendJson(res, 200, { ok: true, result, scheduler: getSchedulerStatus() });
   }
 
@@ -830,7 +858,7 @@ async function handleApi(req, res, parsedUrl) {
     const body = await readBody(req);
     const settings = await loadSettings();
     const markdown = redactContent(body.markdown || '', settings.privacy || {});
-    const item = await savePreviewMarkdown({ title: body.title || '文本预览', markdown });
+    const item = await savePreviewMarkdown({ settings, title: body.title || '文本预览', markdown });
     logInfo('preview_markdown_exported', { relative_path: item.relative_path });
     return sendJson(res, 200, { ok: true, item });
   }
@@ -1018,6 +1046,8 @@ async function handleApi(req, res, parsedUrl) {
       comparison_scope: 'service_startup_vs_diagnostics_export',
       launcher_comparison_scope: 'cmd_pre_tray_and_tray_pre_node_vs_service_startup_and_diagnostics_export_when_fresh',
       external_baseline_required: true,
+      external_baseline_instruction: '退出 wx-summary 后运行项目根目录的 验收-记录微信哈希.cmd，生成 data/external-weixin-binary-baseline.json；这是启动本工具前独立记录的 SHA256。',
+      prelaunch_scope_note: 'prelaunch 由启动.cmd 在托盘启动前采集；launcher_pre_node 由托盘在启动 Node 前采集。',
       verification_note: `external_user_baseline 是启动本工具前由用户独立记录的 ${weixinExecutableLabel()} SHA256，可写入 data/external-weixin-binary-baseline.json；launcher_pre_node 由托盘在启动 Node 前采集；prelaunch 仅在本地另行提供 data/prelaunch-weixin-binary.json 时参与比较。external_to_* 为 true 时可作为 A3 的外部基线证据；launcher_to_* 可加强证明本工具启动链路内没有改动 ${weixinExecutableLabel()}。`,
     };
     return sendJson(res, 200, {
@@ -1104,8 +1134,8 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       next_step: externalBaselineMatched
         ? '确认 data/external-weixin-binary-baseline.json 是启动 wx-summary 前独立生成；确认后即可作为 A3 的外部基线证据。'
         : externalBaselineLate
-          ? `下次验收时先退出 wx-summary，再独立记录 ${binaryLabel} SHA256，然后启动 wx-summary 并导出诊断包。`
-        : `启动 wx-summary 前先独立记录 ${binaryLabel} SHA256 作为外部基线；已启动后只能作为下一轮验收的准备证据。`,
+          ? `下次验收时先退出 wx-summary，再运行 验收-记录微信哈希.cmd 独立记录 ${binaryLabel} SHA256，然后启动 wx-summary 并导出诊断包。`
+        : `启动 wx-summary 前先运行 验收-记录微信哈希.cmd 独立记录 ${binaryLabel} SHA256 作为外部基线；已启动后只能作为下一轮验收的准备证据。`,
     },
     {
       id: 'A6',

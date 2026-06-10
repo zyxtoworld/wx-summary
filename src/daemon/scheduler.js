@@ -53,17 +53,17 @@ export function getSchedulerStatus() {
   return { ...state, last_result: state.last_result ? { ...state.last_result } : null };
 }
 
-export async function runSchedulerOnce({ reason = 'manual' } = {}) {
+export async function runSchedulerOnce({ reason = 'manual', force = false } = {}) {
   if (state.running) {
     logWarn('scheduler_skipped', { reason, detail: 'already_running' });
-    return { skipped: true, reason: 'already_running' };
+    return { ok: true, skipped: true, reason, detail: 'already_running', at: new Date().toISOString() };
   }
   state.running = true;
   state.last_started_at = new Date().toISOString();
   state.last_error = '';
   logInfo('scheduler_run_started', { reason });
   try {
-    const result = await executeSchedulerTick({ reason });
+    const result = await executeSchedulerTick({ reason, force });
     state.last_result = result;
     logInfo('scheduler_run_finished', {
       reason,
@@ -110,11 +110,11 @@ function scheduleNext(settings, delayMs) {
   }, delay);
 }
 
-async function executeSchedulerTick({ reason }) {
+async function executeSchedulerTick({ reason, force = false }) {
   const settings = await loadSettings({ includeSecrets: true });
   state.enabled = !!settings.scheduler.enabled;
   state.interval_ms = durationToMs(settings.scheduler.default_interval);
-  if (!settings.scheduler.enabled) return { ok: true, reason, skipped: true, detail: 'scheduler_disabled', at: new Date().toISOString() };
+  if (!settings.scheduler.enabled && !force) return { ok: true, reason, skipped: true, detail: 'scheduler_disabled', at: new Date().toISOString() };
   if (!settings.llm.api_key || !settings.llm.base_url || !settings.llm.model) {
     logWarn('scheduler_skipped', { reason, detail: 'llm_not_configured' });
     return { ok: false, reason, skipped: true, detail: 'llm_not_configured', at: new Date().toISOString() };
@@ -149,7 +149,7 @@ async function executeSchedulerTick({ reason }) {
       logError('scheduler_account_failed', { account_id: accountId, error: message });
       continue;
     }
-    const targets = selectScheduledGroups(groups, settings.groups?.whitelist || []);
+    const targets = selectScheduledGroups(groups, settings.groups?.whitelist || [], account);
     for (const group of targets) {
       result.checked++;
       const item = await runGroupDigestWithRetry({ settings, account, group, window, attempts: 2 });
@@ -191,7 +191,7 @@ async function runGroupDigestWithRetry({ attempts = 2, ...args }) {
 }
 
 async function runGroupDigest({ settings, account, group, window }) {
-  const override = schedulerOverrideForGroup(settings.scheduler?.per_group, group);
+  const override = schedulerOverrideForGroup(settings.scheduler?.per_group, group, account);
   const minMessages = override?.min_messages || settings.scheduler.min_messages_per_digest;
   const collection = await collectMessages({
     account_id: accountIdentity(account),
@@ -262,7 +262,7 @@ async function runGroupDigest({ settings, account, group, window }) {
 }
 
 function accountIdentity(account = {}) {
-  return String(account.id || account.wxid || '').trim();
+  return String(account.account_id || account.id || account.wxid || account.account || '').trim();
 }
 
 function groupCursorKey(account = {}, group = {}) {
@@ -275,19 +275,50 @@ function shouldSkipUnchangedCursor(previousCursor, latestCursor) {
   return !!previousCursor && !!latestCursor && previousCursor === latestCursor;
 }
 
-function selectScheduledGroups(groups, whitelist) {
-  const wanted = new Set((whitelist || []).map(x => String(x || '').trim()).filter(Boolean));
-  if (!wanted.size) return [];
-  return (groups || []).filter(group => wanted.has(group.name) || wanted.has(group.id));
+function selectScheduledGroups(groups, whitelist, account = {}) {
+  const refs = Array.isArray(whitelist) ? whitelist : [];
+  if (!refs.length) return [];
+  return (groups || []).filter(group => refs.some(ref => groupRefMatches(ref, group, account)));
 }
 
-function schedulerOverrideForGroup(overrides = [], group = {}) {
-  const groupId = String(group.id || '').trim();
-  const groupName = String(group.name || '').trim();
-  return (Array.isArray(overrides) ? overrides : []).find(item => {
-    const key = String(item?.group || item?.group_id || '').trim();
-    return key && (key === groupId || key === groupName);
-  }) || null;
+function schedulerOverrideForGroup(overrides = [], group = {}, account = {}) {
+  let best = null;
+  let bestScore = 0;
+  for (const item of Array.isArray(overrides) ? overrides : []) {
+    const score = groupRefMatchScore(item, group, account, {
+      legacyKeys: [item?.group, item?.group_id, item?.group_name, item?.name],
+    });
+    if (score > bestScore) {
+      best = item;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function groupRefMatches(ref, group = {}, account = {}, { legacyKeys = [] } = {}) {
+  return groupRefMatchScore(ref, group, account, { legacyKeys }) > 0;
+}
+
+function groupRefMatchScore(ref, group = {}, account = {}, { legacyKeys = [] } = {}) {
+  const accountId = accountIdentity(account);
+  const groupId = String(group.id || group.group_id || '').trim();
+  const groupName = String(group.name || group.group_name || '').trim();
+  if (typeof ref === 'string') {
+    const legacy = ref.trim();
+    return legacy && (legacy === groupId || legacy === groupName) ? 1 : 0;
+  }
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return 0;
+  const refAccountId = String(ref.account_id || ref.account || '').trim();
+  if (refAccountId && refAccountId !== accountId) return 0;
+  const refGroupId = String(ref.group_id || ref.id || '').trim();
+  if (refGroupId) return refGroupId === groupId ? (refAccountId ? 4 : 3) : 0;
+  const refGroupName = String(ref.group_name || ref.name || '').trim();
+  if (refGroupName) return refGroupName === groupName ? (refAccountId ? 2 : 1) : 0;
+  const refLegacyGroup = String(ref.group || '').trim();
+  if (refLegacyGroup) return refLegacyGroup === groupId || refLegacyGroup === groupName ? 1 : 0;
+  const legacy = legacyKeys.map(key => String(key || '').trim()).filter(Boolean);
+  return legacy.some(key => key === groupId || key === groupName) ? 1 : 0;
 }
 
 function schedulerWindow(value, now = new Date()) {
@@ -349,4 +380,5 @@ export const __schedulerInternals = {
   groupCursorKey,
   shouldSkipUnchangedCursor,
   schedulerOverrideForGroup,
+  groupRefMatches,
 };
