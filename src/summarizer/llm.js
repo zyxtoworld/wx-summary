@@ -336,7 +336,8 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   const normalized = messages.map(m => redactStructuredValue(m, settings.privacy));
   const enriched = await enrichMessagesWithLinkPreviews(normalized, settings.link_preview, settings, signal, onProgress);
   throwIfAborted(signal);
-  const plan = buildDigestChunkPlan(enriched, llm);
+  const chunkableMessages = prepareMessagesForChunking(enriched, llm);
+  const plan = buildDigestChunkPlan(chunkableMessages, llm);
   let raw;
   if (plan.useChunks) {
     notifyProgress(onProgress, {
@@ -381,7 +382,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
       });
     } catch (firstError) {
       const limits = digestChunkLimits(llm);
-      const chunks = splitMessages(enriched, limits.maxMessages, limits.maxChars, limits.maxMediaChars);
+      const chunks = splitMessages(chunkableMessages, limits.maxMessages, limits.maxChars, limits.maxMediaChars);
       if (!isLikelyChunkableFailure(firstError) || chunks.length <= 1) throw firstError;
 
       try {
@@ -1066,6 +1067,113 @@ function digestChunkLimits(llm = {}) {
       DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
     ),
   };
+}
+
+function prepareMessagesForChunking(messages = [], llm = {}) {
+  const limits = digestChunkLimits(llm);
+  const out = [];
+  for (let index = 0; index < messages.length; index++) {
+    out.push(...splitOversizedMessageForChunking(messages, index, limits));
+  }
+  return out;
+}
+
+function splitOversizedMessageForChunking(messages = [], index = 0, limits = digestChunkLimits()) {
+  const msg = messages[index] || {};
+  const refsCost = estimateMessageBundleItemCost(messages, index, { imageCount: 0, audioCount: 0 });
+  if (refsCost.textChars <= limits.maxChars) return [msg];
+  if (!canSplitMessageForChunking(msg)) return [msg];
+
+  const emptyMsg = { ...msg, content: '', link_previews: [] };
+  const baseCost = estimateMessageBundleItemCost([emptyMsg], 0, { imageCount: 0, audioCount: 0 }).textChars;
+  const payloadLimit = Math.max(600, limits.maxChars - baseCost - 260);
+  if (payloadLimit < 600) return [msg];
+
+  const contentParts = splitLongTextForChunking(msg.content, payloadLimit);
+  const previewGroups = splitLinkPreviewsForChunking(msg.link_previews, payloadLimit);
+  if (contentParts.length <= 1 && previewGroups.length <= 1) return [msg];
+
+  const parts = [];
+  for (const text of contentParts) {
+    if (!cleanField(text)) continue;
+    parts.push({ kind: 'content', msg: { ...msg, content: text, link_previews: [] } });
+  }
+  const contentHint = truncateText(cleanContextText(msg.content), 180);
+  for (const previews of previewGroups) {
+    if (!previews.length) continue;
+    parts.push({
+      kind: 'links',
+      msg: {
+        ...msg,
+        content: contentHint
+          ? `同一条长消息的链接打开结果；原消息片段=${contentHint}`
+          : '同一条长消息的链接打开结果',
+        link_previews: previews,
+      },
+    });
+  }
+  if (parts.length <= 1) return [msg];
+
+  const total = parts.length;
+  return parts.map((part, partIndex) => ({
+    ...part.msg,
+    id: msg.id ? `${msg.id}:chunk-${partIndex + 1}` : `${msg.time || 'message'}:${partIndex + 1}`,
+    content: part.kind === 'content'
+      ? `（同一条长消息第 ${partIndex + 1}/${total} 段）${part.msg.content}`
+      : `（同一条长消息第 ${partIndex + 1}/${total} 段，链接打开结果）${part.msg.content}`,
+  }));
+}
+
+function canSplitMessageForChunking(msg = {}) {
+  const type = msg.type || 'text';
+  return (!type || type === 'text') && mediaPayloadChars(msg) === 0;
+}
+
+function splitLongTextForChunking(value, maxChars) {
+  const text = String(value || '');
+  const limit = Math.max(600, Number(maxChars) || 4000);
+  if (!text || text.length <= limit) return text ? [text] : [];
+  const out = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(text.length, start + limit);
+    if (end < text.length) {
+      const window = text.slice(start, end);
+      const boundary = Math.max(
+        window.lastIndexOf('\n'),
+        window.lastIndexOf('。'),
+        window.lastIndexOf('！'),
+        window.lastIndexOf('？'),
+        window.lastIndexOf('；'),
+        window.lastIndexOf(';'),
+      );
+      if (boundary > Math.floor(limit * 0.5)) end = start + boundary + 1;
+    }
+    out.push(text.slice(start, end));
+    start = end;
+  }
+  return out;
+}
+
+function splitLinkPreviewsForChunking(previews, maxChars) {
+  const items = arrayOf(previews);
+  if (!items.length) return [];
+  const limit = Math.max(600, Number(maxChars) || 4000);
+  const groups = [];
+  let current = [];
+  let chars = 0;
+  for (const preview of items) {
+    const cost = formatLinkPreviewLines([preview]).length + 1;
+    if (current.length && chars + cost > limit) {
+      groups.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(preview);
+    chars += cost;
+  }
+  if (current.length) groups.push(current);
+  return groups;
 }
 
 function estimateMessageTextChars(messages) {
@@ -3181,6 +3289,7 @@ function sleep(ms, signal = null) {
 
 export const __llmInternals = {
   formatMessageBundle,
+  prepareMessagesForChunking,
   estimateMessageBundleStats,
   splitMessages,
   buildDigestChunkPlan,
