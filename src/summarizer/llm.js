@@ -1090,9 +1090,52 @@ function prepareMessagesForChunking(messages = [], llm = {}) {
   const limits = digestChunkLimits(llm);
   const out = [];
   for (let index = 0; index < messages.length; index++) {
-    out.push(...splitOversizedMessageForChunking(messages, index, limits));
+    out.push(...splitOversizedMessageForChunking(trimOversizedMediaPayloads(messages, index, limits), index, limits));
   }
   return out;
+}
+
+function trimOversizedMediaPayloads(messages = [], index = 0, limits = digestChunkLimits()) {
+  const msg = messages[index] || {};
+  const media = msg.media || {};
+  if (!media || typeof media !== 'object') return messages;
+  const maxSinglePayloadChars = Math.max(12000, Math.floor(Number(limits.maxMediaChars || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL) * 0.85));
+  const replacements = [];
+  const nextMedia = { ...media };
+  for (const key of ATTACHMENT_DATA_KEYS) {
+    const value = typeof media[key] === 'string' ? media[key] : '';
+    if (!value || value.length <= maxSinglePayloadChars) continue;
+    const kind = mediaPayloadKeyLabel(key, msg);
+    replacements.push(`${kind}${formatApproxPayloadSize(value.length)}`);
+    delete nextMedia[key];
+    if (key === 'frame_data_url') delete nextMedia.frame_mime;
+  }
+  if (!replacements.length) return messages;
+  const next = [...messages];
+  const content = String(msg.content || '').trim();
+  next[index] = {
+    ...msg,
+    media: {
+      ...nextMedia,
+      payload_omitted_reason: `附件过大，已改为只发送元信息：${replacements.join('、')}`,
+    },
+    content,
+  };
+  return next;
+}
+
+function mediaPayloadKeyLabel(key, msg = {}) {
+  if (key === 'audio_data_url') return '音频';
+  if (key === 'frame_data_url') return '视频关键帧';
+  if (msg.type === 'image') return '图片';
+  return '媒体';
+}
+
+function formatApproxPayloadSize(chars) {
+  const bytes = Math.floor(Number(chars || 0) * 0.75);
+  if (bytes >= 1024 * 1024) return `约${(bytes / 1024 / 1024).toFixed(1)}MB`;
+  if (bytes >= 1024) return `约${Math.round(bytes / 1024)}KB`;
+  return bytes ? `约${bytes}B` : '';
 }
 
 function splitOversizedMessageForChunking(messages = [], index = 0, limits = digestChunkLimits()) {
@@ -1413,6 +1456,9 @@ function formatMessageLine(m, { imageRef = '', audioRef = '', context = '' } = {
     suffix = `（下一块就是这条视频/文件对应的${imageRef}）`;
   } else if ((m.type === 'voice' || isAudioLikeMedia(m.media)) && audioRef) {
     suffix = `（下一块尝试附上这条消息对应的${audioRef}；如果模型不支持音频，仍按本行元信息总结）`;
+  } else if (m.media?.payload_omitted_reason) {
+    const detail = mediaMetadataSummary(m.media);
+    suffix = `（${m.media.payload_omitted_reason}${detail ? `；媒体元信息=${detail}` : ''}；不要假装看过画面或听过语音内容）`;
   } else if (m.type === 'image' && m.media?.local_available && !m.media?.data_url) {
     suffix = '（本地图片文件已定位，但当前格式暂不能直接解封为 JPG/PNG）';
   } else if ((m.type === 'video' || isVideoLikeMedia(m.media)) && m.media?.local_available && !m.media?.frame_data_url) {
@@ -1468,8 +1514,29 @@ function mediaContextText(media = {}) {
     media?.title,
     media?.desc,
     media?.file_name ? `文件 ${media.file_name}` : '',
+    mediaMetadataSummary(media),
     media?.url ? '网页链接' : '',
   ].filter(Boolean).join('，');
+}
+
+function mediaMetadataSummary(media = {}) {
+  const parts = [];
+  if (media?.width && media?.height) parts.push(`尺寸 ${media.width}x${media.height}`);
+  if (media?.size) parts.push(`大小 ${formatBytesForPrompt(media.size)}`);
+  if (media?.duration_ms) parts.push(`时长 ${Math.round(Number(media.duration_ms) / 1000)}秒`);
+  else if (media?.duration_s) parts.push(`时长 ${media.duration_s}秒`);
+  if (media?.ext) parts.push(`扩展名 ${media.ext}`);
+  if (media?.mime) parts.push(`格式 ${media.mime}`);
+  if (media?.local_path_hint) parts.push(`本地文件 ${media.local_path_hint}`);
+  return parts.filter(Boolean).join('，');
+}
+
+function formatBytesForPrompt(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)}KB`;
+  return `${Math.round(bytes)}B`;
 }
 
 function cleanContextText(value) {
