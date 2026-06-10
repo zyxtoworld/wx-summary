@@ -213,6 +213,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 .btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
 .btn-ghost { background: transparent; }
 .btn-danger { background: var(--danger); color: white; border-color: var(--danger); }
+.btn-danger:hover { background: var(--danger); border-color: var(--danger); filter: brightness(0.94); }
 .link-btn {
   background: none; border: none; color: var(--primary); cursor: pointer;
   font-size: 12px; padding: 0;

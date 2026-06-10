@@ -144,6 +144,7 @@ function abortActiveDigest(reason = '取消') {
   if (!_state_digest.abortController) return false;
   _state_digest.abortReason = reason;
   _state_digest.abortController.abort();
+  updateDigestCancelButton();
   return true;
 }
 
@@ -887,6 +888,7 @@ async function renderDigest() {
   bindDigestRenderOptions();
   document.getElementById('btn-generate').addEventListener('click', () => generateDigest({ previewText: false }));
   document.getElementById('btn-preview-text').addEventListener('click', () => generateDigest({ previewText: true }));
+  document.getElementById('btn-cancel-digest').addEventListener('click', () => abortActiveDigest('用户取消'));
   document.getElementById('btn-export-md').addEventListener('click', exportTextPreviewMarkdown);
   document.getElementById('progress-log-toggle').addEventListener('click', toggleProgressLog);
   document.getElementById('btn-rerender').addEventListener('click', e => {
@@ -1278,6 +1280,7 @@ function paintDigestProgressSnapshot() {
   if (!card || !stages || !fill) return;
   if (!snapshot?.visible) {
     card.classList.add('hidden');
+    updateDigestCancelButton();
     stopDigestProgressPaintTimer();
     return;
   }
@@ -1299,8 +1302,18 @@ function paintDigestProgressSnapshot() {
     log.textContent = snapshot.logText || '';
     log.classList.toggle('hidden', !snapshot.logVisible);
   }
+  updateDigestCancelButton();
   if (_state_digest.generating && (snapshot.stages || []).some(stage => stage.status === 'running')) startDigestProgressPaintTimer();
   else stopDigestProgressPaintTimer();
+}
+
+function updateDigestCancelButton() {
+  const button = document.getElementById('btn-cancel-digest');
+  if (!button) return;
+  const active = !!_state_digest.abortController && _state_digest.generating;
+  button.classList.toggle('hidden', !active);
+  button.disabled = !active || !!_state_digest.abortController?.signal?.aborted;
+  button.textContent = _state_digest.abortController?.signal?.aborted ? '正在取消...' : '取消生成';
 }
 
 function digestStageText(stage = {}) {
@@ -1533,6 +1546,7 @@ async function generateDigest({ previewText = false } = {}) {
   try {
     const controller = new AbortController();
     _state_digest.abortController = controller;
+    updateDigestCancelButton();
     const digests = new Array(targets.length);
     const failures = [];
     const prepareConcurrency = digestPrepareConcurrency(targets.length);
@@ -1637,6 +1651,7 @@ async function generateDigest({ previewText = false } = {}) {
     _state_digest.abortController = null;
     _state_digest.abortReason = '';
     _state_digest.generating = false;
+    updateDigestCancelButton();
     restoreDigestOutputs();
     const finalGenerateButton = document.getElementById('btn-generate');
     const finalPreviewButton = document.getElementById('btn-preview-text');
