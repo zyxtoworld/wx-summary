@@ -58,8 +58,8 @@ function notifyProgress(onProgress, data) {
   try { onProgress(data); } catch {}
 }
 
-async function withAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲' } = {}, action) {
-  const release = await acquireAiRequestSlot({ signal, onProgress, label, detail });
+async function withAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲', limit = CONFIGURED_AI_REQUEST_CONCURRENCY } = {}, action) {
+  const release = await acquireAiRequestSlot({ signal, onProgress, label, detail, limit });
   try {
     return await action();
   } finally {
@@ -67,21 +67,26 @@ async function withAiRequestSlot({ signal = null, onProgress = null, label = 'AI
   }
 }
 
-function aiRequestConcurrency() {
-  const raw = Number(process.env.WX_SUMMARY_AI_CONCURRENCY || CONFIGURED_AI_REQUEST_CONCURRENCY);
+function normalizedAiRequestConcurrency(value = DEFAULT_AI_REQUEST_CONCURRENCY) {
+  const raw = Number(value);
   return Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY);
 }
 
+function aiRequestConcurrency(value = CONFIGURED_AI_REQUEST_CONCURRENCY) {
+  const env = Number(process.env.WX_SUMMARY_AI_CONCURRENCY || 0);
+  if (Number.isFinite(env) && env > 0) return normalizedAiRequestConcurrency(env);
+  return normalizedAiRequestConcurrency(value);
+}
+
 function configureAiRequestConcurrency(settings = {}) {
-  const raw = Number(settings?.llm?.ai_concurrency || DEFAULT_AI_REQUEST_CONCURRENCY);
-  CONFIGURED_AI_REQUEST_CONCURRENCY = Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_AI_REQUEST_CONCURRENCY);
+  CONFIGURED_AI_REQUEST_CONCURRENCY = normalizedAiRequestConcurrency(settings?.llm?.ai_concurrency);
   drainAiRequestQueue();
 }
 
-function acquireAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲' } = {}) {
+function acquireAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲', limit = CONFIGURED_AI_REQUEST_CONCURRENCY } = {}) {
   throwIfAborted(signal);
-  const limit = aiRequestConcurrency();
-  if (ACTIVE_AI_REQUESTS < limit) {
+  const requestLimit = aiRequestConcurrency(limit);
+  if (ACTIVE_AI_REQUESTS < requestLimit) {
     ACTIVE_AI_REQUESTS++;
     return Promise.resolve(releaseAiRequestSlot);
   }
@@ -91,7 +96,7 @@ function acquireAiRequestSlot({ signal = null, onProgress = null, label = 'AI �
     detail: `${detail} · 前面 ${AI_WAIT_QUEUE.length + ACTIVE_AI_REQUESTS} 个 AI 请求`,
   });
   return new Promise((resolve, reject) => {
-    const item = { resolve, reject, signal, onAbort: null };
+    const item = { resolve, reject, signal, limit: requestLimit, onAbort: null };
     item.onAbort = () => {
       const index = AI_WAIT_QUEUE.indexOf(item);
       if (index >= 0) AI_WAIT_QUEUE.splice(index, 1);
@@ -109,9 +114,10 @@ function releaseAiRequestSlot() {
 }
 
 function drainAiRequestQueue() {
-  const limit = aiRequestConcurrency();
-  while (ACTIVE_AI_REQUESTS < limit && AI_WAIT_QUEUE.length) {
-    const item = AI_WAIT_QUEUE.shift();
+  while (AI_WAIT_QUEUE.length) {
+    const index = AI_WAIT_QUEUE.findIndex(item => ACTIVE_AI_REQUESTS < aiRequestConcurrency(item.limit));
+    if (index < 0) return;
+    const item = AI_WAIT_QUEUE.splice(index, 1)[0];
     if (item.signal?.aborted) {
       item.signal.removeEventListener('abort', item.onAbort);
       item.reject(httpError(499, '请求已取消'));
@@ -321,6 +327,8 @@ function normalizeModelList(json) {
 export async function summarizeDigest({ settings, groupName, since, until, messages, signal, onProgress }) {
   throwIfAborted(signal);
   configureAiRequestConcurrency(settings);
+  const sourceMessages = Array.isArray(messages) ? messages : [];
+  if (!sourceMessages.length) throw httpError(400, '所选时间范围内没有可总结的消息，请换一个时间范围或群聊。');
   const llm = settings.llm;
   const apiKey = llm.api_key;
   if (!apiKey) throw httpError(400, 'API key is not configured');
@@ -331,9 +339,9 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   notifyProgress(onProgress, {
     phase: 'prepare',
     label: 'AI 总结 · 准备输入',
-    detail: `${messages.length} 条消息`,
+    detail: `${sourceMessages.length} 条消息`,
   });
-  const normalized = messages.map(m => redactStructuredValue(m, settings.privacy));
+  const normalized = sourceMessages.map(m => redactStructuredValue(m, settings.privacy));
   const enriched = await enrichMessagesWithLinkPreviews(normalized, settings.link_preview, settings, signal, onProgress);
   throwIfAborted(signal);
   const chunkableMessages = prepareMessagesForChunking(enriched, llm);
@@ -367,7 +375,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
       notifyProgress(onProgress, {
         phase: 'llm_full',
         label: 'AI 总结 · 全量请求',
-        detail: `${messages.length} 条消息一次发送`,
+        detail: `${sourceMessages.length} 条消息一次发送`,
       });
       raw = await callJsonModel({
         settings,
@@ -419,13 +427,13 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     signal,
     onProgress,
   });
-  assertDigestPublishable(raw, { messageCount: messages.length });
+  assertDigestPublishable(raw, { messageCount: sourceMessages.length });
 
   return normalizeDigest(raw, {
     groupName,
     since,
     until,
-    messageCount: messages.length,
+    messageCount: sourceMessages.length,
     model,
     linkPreviewCount: enriched.reduce((n, msg) => n + (msg.link_previews?.length || 0), 0),
   });
@@ -1976,6 +1984,7 @@ async function fetchAiLinkResearchBatch(urls, settings, signal = null, onProgres
     onProgress,
     label: 'AI 总结 · 等待 AI 查链接',
     detail: `${urls.length} 个网页链接等待联网核查`,
+    limit: settings.llm.ai_concurrency,
   }, () => fetchJson(`${settings.llm.base_url}/responses`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${settings.llm.api_key}` },
@@ -2673,6 +2682,7 @@ async function callOpenAI({ settings, model, system, user, intro, blocks = [], s
     onProgress,
     label: 'AI 总结 · 等待 AI',
     detail: `任务 ${mode || 'summary'} 等待模型请求`,
+    limit: settings.llm.ai_concurrency,
   }, () => fetchJson(`${settings.llm.base_url}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${settings.llm.api_key}` },
@@ -2704,6 +2714,7 @@ async function callAnthropic({ settings, model, system, user, intro, blocks = []
     onProgress,
     label: 'AI 总结 · 等待 AI',
     detail: `任务 ${mode || 'summary'} 等待模型请求`,
+    limit: settings.llm.ai_concurrency,
   }, () => fetchJson(`${settings.llm.base_url}/messages`, {
     method: 'POST',
     headers: { 'x-api-key': settings.llm.api_key, 'anthropic-version': '2023-06-01' },

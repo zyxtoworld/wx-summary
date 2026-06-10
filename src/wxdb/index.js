@@ -1397,8 +1397,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys) {
         key_profile: `${manual.key_profile}:verified_memory_hmac`,
         copied,
         close() {
-          try { manual.db.close(); } catch {}
-          return removeCopiedDb(copied.target_path);
+          return closeCopiedDb(copied.target_path, manual.db, manual.plain_path);
         },
       };
     }
@@ -1412,8 +1411,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys) {
       key_profile: manual.key_profile,
       copied,
       close() {
-        try { manual.db.close(); } catch {}
-        return removeCopiedDb(copied.target_path);
+        return closeCopiedDb(copied.target_path, manual.db, manual.plain_path);
       },
     };
   }
@@ -1780,6 +1778,12 @@ async function removeCopiedDb(targetPath) {
   const tempRoot = path.dirname(path.dirname(targetPath));
   await rmWithRetry(tempRoot);
   await removeEmptyCopiedDbParents(tempRoot);
+}
+
+async function closeCopiedDb(targetPath, db, plainPath = '') {
+  try { db?.close(); } catch {}
+  if (plainPath) await fsp.rm(plainPath, { force: true }).catch(() => {});
+  return removeCopiedDb(targetPath);
 }
 
 async function rmWithRetry(target) {

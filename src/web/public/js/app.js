@@ -6,6 +6,8 @@ const $app = document.getElementById('app');
 let _appState = null;
 let _keyboardShortcutsAttached = false;
 let _routeSeq = 0;
+let _activeRouteHash = '';
+let _customRangeOutsideClickAttached = false;
 
 function selectedAccountId() {
   return document.getElementById('account-switcher')?.value || '';
@@ -87,6 +89,8 @@ async function route() {
   const rawHash = location.hash.replace(/^#/, '') || '/digest';
   const hash = rawHash.split('?')[0] || '/digest';
   const fn = routes[hash] || renderDigest;
+  if (_activeRouteHash === '/digest' && hash !== '/digest') abortActiveDigest('切换页面');
+  _activeRouteHash = hash;
   closeTransientOverlays();
   // 设置导航 active
   document.querySelectorAll('.nav a').forEach(a => {
@@ -132,11 +136,18 @@ function renderBootstrapError(error) {
 }
 
 function handleAccountSwitch() {
-  if (_state_digest.abortController) _state_digest.abortController.abort();
+  abortActiveDigest('切换账号');
   _state_digest.selectedGroups.clear();
   _state_digest.lastDigest = null;
   _state_digest.lastSavedItem = null;
   route();
+}
+
+function abortActiveDigest(reason = '取消') {
+  if (!_state_digest.abortController) return false;
+  _state_digest.abortReason = reason;
+  _state_digest.abortController.abort();
+  return true;
 }
 
 async function bootstrap() {
@@ -181,7 +192,10 @@ async function bootstrap() {
     location.hash = '#/setup';
     return;
   }
-  if (!location.hash) location.hash = '#/digest';
+  if (!location.hash) {
+    location.hash = '#/digest';
+    return;
+  }
   await route();
 }
 bootstrap();
@@ -400,13 +414,20 @@ function setupCustomRangePicker() {
   document.getElementById('range-next-month').addEventListener('click', () => shiftRangeMonth(1));
   hour.addEventListener('change', updateCustomRangeTime);
   minute.addEventListener('change', updateCustomRangeTime);
+  ensureCustomRangeOutsideClick();
+}
+
+function ensureCustomRangeOutsideClick() {
+  if (_customRangeOutsideClickAttached) return;
   document.addEventListener('click', e => {
-    if (popover.classList.contains('hidden')) return;
+    const popover = document.getElementById('range-popover');
+    if (!popover || popover.classList.contains('hidden')) return;
     if (document.getElementById('range-picker')?.contains(e.target)) return;
     popover.classList.add('hidden');
-    startButton.classList.remove('active');
-    endButton.classList.remove('active');
+    document.getElementById('range-start')?.classList.remove('active');
+    document.getElementById('range-end')?.classList.remove('active');
   });
+  _customRangeOutsideClickAttached = true;
 }
 
 function ensureCustomRangeDefaults() {
@@ -572,6 +593,7 @@ let _state_digest = {
   lastTextTitle: '',
   generating: false,
   abortController: null,
+  abortReason: '',
 };
 
 let _state_settings = {
@@ -600,7 +622,7 @@ function getDigestGroupCache(accountId = selectedAccountId()) {
 }
 
 function digestGroupCacheFresh(cache) {
-  return !!cache?.groups?.length && Date.now() - Number(cache.fetchedAt || 0) < DIGEST_GROUP_CACHE_TTL_MS;
+  return Number(cache?.fetchedAt || 0) > 0 && Date.now() - Number(cache.fetchedAt || 0) < DIGEST_GROUP_CACHE_TTL_MS;
 }
 
 async function fetchDigestGroups(accountId = selectedAccountId(), { force = false } = {}) {
@@ -666,7 +688,7 @@ async function renderDigest() {
   let groups = [];
   let groupStatusText = '';
   const groupCache = getDigestGroupCache(accountId);
-  const hasCachedGroups = Array.isArray(groupCache.groups) && groupCache.groups.length > 0;
+  const hasCachedGroups = digestGroupCacheFresh(groupCache);
   try {
     const rawGroups = hasCachedGroups ? groupCache.groups : await fetchDigestGroups(accountId, { force: true });
     if (routeSeq !== _routeSeq) return;
@@ -1092,7 +1114,10 @@ function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigest
       preview();
     });
   });
-  panel.querySelector('[data-save]').addEventListener('click', async () => {
+  const saveButton = panel.querySelector('[data-save]');
+  saveButton.addEventListener('click', async () => {
+    if (saveButton.disabled) return;
+    saveButton.disabled = true;
     panelStatus.className = 'status';
     panelStatus.textContent = '保存中...';
     try {
@@ -1110,6 +1135,8 @@ function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigest
         statusTarget.className = 'status err';
         statusTarget.textContent = '重渲染失败：' + (e.message || '未知错误');
       }
+    } finally {
+      saveButton.disabled = false;
     }
   });
   preview();
@@ -1146,7 +1173,7 @@ function kbd(e) {
       search.focus();
     }
   } else if (e.key === 'Escape' && _state_digest.abortController) {
-    _state_digest.abortController.abort();
+    abortActiveDigest('用户取消');
   }
 }
 
@@ -1162,6 +1189,7 @@ async function generateDigest({ previewText = false } = {}) {
   if (_state_digest.selectedGroups.size === 0) return;
   if (_state_digest.generating) return;
   _state_digest.generating = true;
+  _state_digest.abortReason = '';
   const generateButton = document.getElementById('btn-generate');
   const previewButton = document.getElementById('btn-preview-text');
   if (generateButton) generateButton.disabled = true;
@@ -1200,7 +1228,7 @@ async function generateDigest({ previewText = false } = {}) {
   let groups;
   try {
     const cache = getDigestGroupCache(accountId);
-    groups = cache.groups?.length ? cache.groups : await fetchDigestGroups(accountId, { force: true });
+    groups = digestGroupCacheFresh(cache) ? cache.groups : await fetchDigestGroups(accountId, { force: true });
   } catch (e) {
     _state_digest.generating = false;
     if (generateButton) generateButton.disabled = false;
@@ -1400,7 +1428,18 @@ async function generateDigest({ previewText = false } = {}) {
     await renderQueue;
 
     const doneDigests = digests.filter(Boolean);
-    if (failures.length && doneDigests.length) {
+    if (controller.signal.aborted) {
+      const reason = _state_digest.abortReason || '已取消';
+      upsertStage({
+        key: 'batch',
+        name: 'batch',
+        stageName: 'batch',
+        label: doneDigests.length ? `已取消，已完成 ${doneDigests.length} 个群` : '已取消',
+        status: 'done',
+        detail: reason,
+      });
+      $fill.style.width = doneDigests.length ? Math.max(10, Number.parseFloat($fill.style.width) || 10) + '%' : '0%';
+    } else if (failures.length && doneDigests.length) {
       upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个，失败 ${failures.length} 个`, status: 'error', detail: failures.map(f => f.group).join('、') });
       $fill.style.width = '100%';
       showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
@@ -1419,6 +1458,7 @@ async function generateDigest({ previewText = false } = {}) {
   } finally {
     clearAllRunningStages();
     _state_digest.abortController = null;
+    _state_digest.abortReason = '';
     _state_digest.generating = false;
     restoreDigestOutputs();
     const finalGenerateButton = document.getElementById('btn-generate');

@@ -602,7 +602,17 @@ async function handleApi(req, res, parsedUrl) {
     configureLogger(saved.logging);
     const warnings = await postSaveSettingsWarnings(body);
     logInfo('settings_saved', { sections: Object.keys(body || {}) });
-    await restartScheduler().catch(() => {});
+    if (body?.scheduler || body?.groups) {
+      await restartScheduler().catch(e => {
+        logWarn('scheduler_restart_after_settings_failed', { error: sanitizeText(e?.message || String(e)) });
+      });
+    } else {
+      setTimeout(() => {
+        restartScheduler().catch(e => {
+          logWarn('scheduler_restart_after_settings_failed', { error: sanitizeText(e?.message || String(e)) });
+        });
+      }, 0).unref();
+    }
     return sendJson(res, 200, { ok: true, settings: saved, warnings });
   }
 
@@ -1142,6 +1152,10 @@ async function runDigestSSE(req, res, body) {
       scanned_message_count: collection.scanned_message_count || collection.message_count,
       source_label: collection.source_label,
     });
+
+    if (!collection.message_count || !Array.isArray(collection.messages) || collection.messages.length === 0) {
+      throw Object.assign(new Error('所选时间范围内没有可总结的消息，请换一个时间范围或群聊。'), { status: 400 });
+    }
 
     if (collection.below_minimum) {
       sendStage({ name: 'fetching', label: `消息数少于阈值，仍继续总结`, status: 'done' });
