@@ -5,9 +5,7 @@ import { normalizeBaseUrl, rememberModels } from '../config/settings.js';
 const DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL = 800;
 const DEFAULT_FALLBACK_MAX_INPUT_CHARS = 60_000;
 const DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL = 300_000;
-const ADAPTIVE_CHUNK_MESSAGE_THRESHOLD = 700;
-const ADAPTIVE_CHUNK_TEXT_THRESHOLD = 120_000;
-const ADAPTIVE_CHUNK_MEDIA_THRESHOLD = 900_000;
+const MAX_IMAGE_DATA_URL_CHARS_PER_CALL = 2 * 1024 * 1024;
 const ADAPTIVE_CHUNK_MAX_MESSAGES = 450;
 const ADAPTIVE_CHUNK_MAX_INPUT_CHARS = 80_000;
 const DEFAULT_DIGEST_CHUNK_CONCURRENCY = 2;
@@ -338,14 +336,29 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   throwIfAborted(signal);
   const contextualMessages = attachGlobalNearbyContexts(enriched);
   const chunkableMessages = prepareMessagesForChunking(contextualMessages, llm);
-  const plan = buildDigestChunkPlan(chunkableMessages, llm);
   let raw;
-  if (plan.useChunks) {
+  try {
     notifyProgress(onProgress, {
-      phase: 'llm_chunk_plan',
-      label: 'AI 总结 · 自动分段',
-      detail: `${plan.chunks.length} 段 · ${plan.reason}`,
+      phase: 'llm_full',
+      label: 'AI 总结 · 全量请求',
+      detail: `${sourceMessages.length} 条消息一次发送`,
     });
+    raw = await callJsonModel({
+      settings,
+      model,
+      groupName,
+      since,
+      until,
+      messageBundle: formatMessageBundle(contextualMessages),
+      mode: 'final/full',
+      signal,
+      onProgress,
+    });
+  } catch (firstError) {
+    const limits = digestChunkLimits(llm);
+    const chunks = splitMessages(chunkableMessages, limits.maxMessages, limits.maxChars, limits.maxMediaChars);
+    if (!isLikelyChunkableFailure(firstError) || chunks.length <= 1) throw firstError;
+
     try {
       raw = await summarizeMessageChunks({
         settings,
@@ -353,56 +366,15 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
         groupName,
         since,
         until,
-        chunks: plan.chunks,
+        chunks,
         signal,
         onProgress,
       });
-    } catch (chunkError) {
+    } catch (fallbackError) {
       throw httpError(
-        chunkError.status || 502,
-        `已因输入较大自动分段；分段失败：${chunkError.message || String(chunkError)}`,
+        fallbackError.status || firstError.status || 502,
+        `已尝试一次全量发送，失败后自动分段；分段也失败：${fallbackError.message || String(fallbackError)}`,
       );
-    }
-  } else {
-    try {
-      notifyProgress(onProgress, {
-        phase: 'llm_full',
-        label: 'AI 总结 · 全量请求',
-        detail: `${sourceMessages.length} 条消息一次发送`,
-      });
-      raw = await callJsonModel({
-        settings,
-        model,
-        groupName,
-        since,
-        until,
-        messageBundle: formatMessageBundle(contextualMessages),
-        mode: 'final/full',
-        signal,
-        onProgress,
-      });
-    } catch (firstError) {
-      const limits = digestChunkLimits(llm);
-      const chunks = splitMessages(chunkableMessages, limits.maxMessages, limits.maxChars, limits.maxMediaChars);
-      if (!isLikelyChunkableFailure(firstError) || chunks.length <= 1) throw firstError;
-
-      try {
-        raw = await summarizeMessageChunks({
-          settings,
-          model,
-          groupName,
-          since,
-          until,
-          chunks,
-          signal,
-          onProgress,
-        });
-      } catch (fallbackError) {
-        throw httpError(
-          fallbackError.status || firstError.status || 502,
-          `已尝试一次全量发送，失败后自动分段；分段也失败：${fallbackError.message || String(fallbackError)}`,
-        );
-      }
     }
   }
 
@@ -1042,27 +1014,6 @@ function fallbackLinksFromChunk(chunk = []) {
   return out;
 }
 
-function buildDigestChunkPlan(messages, llm = {}) {
-  const { maxMessages, maxChars, maxMediaChars } = digestChunkLimits(llm);
-  const stats = estimateMessageBundleStats(messages);
-  const reasons = [];
-  if (stats.messages > maxMessages) reasons.push(`${stats.messages} 条消息超过每段 ${maxMessages}`);
-  if (stats.textChars > maxChars) reasons.push(`约 ${stats.textChars} 字符输入超过每段 ${maxChars}`);
-  if (stats.mediaChars > maxMediaChars) reasons.push(`约 ${Math.round(stats.mediaChars / 1024)}KB 媒体附件超过每段 ${Math.round(maxMediaChars / 1024)}KB`);
-  if (stats.messages > ADAPTIVE_CHUNK_MESSAGE_THRESHOLD && stats.messages <= maxMessages) reasons.push(`${stats.messages} 条消息`);
-  if (stats.textChars > ADAPTIVE_CHUNK_TEXT_THRESHOLD && stats.textChars <= maxChars) reasons.push(`约 ${stats.textChars} 字符输入`);
-  if (stats.mediaChars > ADAPTIVE_CHUNK_MEDIA_THRESHOLD && stats.mediaChars <= maxMediaChars) reasons.push(`约 ${Math.round(stats.mediaChars / 1024)}KB 媒体附件`);
-  if (!reasons.length) return { useChunks: false, chunks: [messages], stats, reason: '' };
-
-  const chunks = splitMessages(messages, maxMessages, maxChars, maxMediaChars);
-  return {
-    useChunks: chunks.length > 1,
-    chunks,
-    stats,
-    reason: reasons.join('，'),
-  };
-}
-
 function digestChunkLimits(llm = {}) {
   return {
     maxMessages: Math.min(
@@ -1075,7 +1026,7 @@ function digestChunkLimits(llm = {}) {
     ),
     maxMediaChars: Math.min(
       Math.max(100000, Number(llm.max_image_chars_per_call || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL)),
-      DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
+      MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
     ),
   };
 }
@@ -3404,7 +3355,6 @@ export const __llmInternals = {
   estimateMessageBundleStats,
   splitMessages,
   splitChunkForRecovery,
-  buildDigestChunkPlan,
   openAiUserContent,
   anthropicUserContent,
   chatAudioFormatForModel,
