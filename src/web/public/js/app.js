@@ -3036,6 +3036,7 @@ async function renderSettings() {
     try {
       const r = await api('/api/settings', { method: 'PUT', body: payload });
       applySavedLlmSettings(r.settings);
+      refreshAppStateSilently();
       const warnings = Array.isArray(r.warnings) ? r.warnings : [];
       if (warnings.length) {
         $st.className = 'status warn';
@@ -3043,7 +3044,6 @@ async function renderSettings() {
       } else {
         $st.className = 'status ok';
         $st.textContent = capabilities ? '✓ 已保存，已记录连通能力' : '✓ 已保存';
-        refreshAppStateSilently();
       }
     } catch (e) {
       $st.className = 'status err';
