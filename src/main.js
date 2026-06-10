@@ -635,11 +635,10 @@ async function handleApi(req, res, parsedUrl) {
       provider,
       base_url: baseUrl,
       api_key: apiKey,
-      refresh: true,
       timeout_ms: Math.min(Number(current.llm.timeout_ms || 30000), 20000),
       persist: body.persist !== false,
     });
-    logInfo('models_listed', { provider, base_url: baseUrl, ok: result.ok, count: result.models?.length || 0, cached: !!result.cached });
+    logInfo('models_listed', { provider, base_url: baseUrl, ok: result.ok, count: result.models?.length || 0 });
     return sendJson(res, 200, result);
   }
 

@@ -362,6 +362,24 @@ function getDurationControlValue(fieldId, fallback) {
   return value;
 }
 
+async function withBusyButtons(buttons, action) {
+  const items = (Array.isArray(buttons) ? buttons : [buttons]).filter(Boolean);
+  if (items.some(button => button.dataset.busy === '1')) return undefined;
+  const previous = items.map(button => ({ button, disabled: button.disabled }));
+  for (const { button } of previous) {
+    button.dataset.busy = '1';
+    button.disabled = true;
+  }
+  try {
+    return await action();
+  } finally {
+    for (const { button, disabled } of previous) {
+      delete button.dataset.busy;
+      if (button.isConnected) button.disabled = disabled;
+    }
+  }
+}
+
 function normalizeAiConcurrency(value) {
   return Math.max(1, parseInt(value ?? '2', 10) || 2);
 }
@@ -2787,7 +2805,12 @@ async function renderSettings() {
     const inp = document.getElementById('s-apikey');
     inp.type = inp.type === 'password' ? 'text' : 'password';
   });
-  document.getElementById('s-list-models').addEventListener('click', async () => {
+  const llmActionButtons = [
+    document.getElementById('s-list-models'),
+    document.getElementById('s-test-llm'),
+    document.getElementById('s-save-llm'),
+  ];
+  document.getElementById('s-list-models').addEventListener('click', () => withBusyButtons(llmActionButtons, async () => {
     const $st = document.getElementById('s-model-status');
     $st.className = 'status';
     $st.textContent = '获取中...';
@@ -2804,8 +2827,8 @@ async function renderSettings() {
       $st.className = 'status err';
       $st.textContent = '✗ ' + e.message;
     }
-  });
-  document.getElementById('s-test-llm').addEventListener('click', async () => {
+  }));
+  document.getElementById('s-test-llm').addEventListener('click', () => withBusyButtons(llmActionButtons, async () => {
     const $st = document.getElementById('s-llm-status');
     $st.className = 'status'; $st.textContent = '测试中...';
     try {
@@ -2826,8 +2849,8 @@ async function renderSettings() {
     } catch (e) {
       $st.className = 'status err'; $st.textContent = '✗ 失败：' + e.message;
     }
-  });
-  document.getElementById('s-save-llm').addEventListener('click', async () => {
+  }));
+  document.getElementById('s-save-llm').addEventListener('click', () => withBusyButtons(llmActionButtons, async () => {
     const $st = document.getElementById('s-llm-status');
     const apiKey = document.getElementById('s-apikey').value.trim();
     const customModel = document.getElementById('s-model-custom').checked;
@@ -2896,7 +2919,7 @@ async function renderSettings() {
       $st.className = 'status err';
       $st.textContent = '✗ 保存失败：' + e.message;
     }
-  });
+  }));
 
   // 群与调度
   const $wl = document.getElementById('s-whitelist');
@@ -3015,7 +3038,9 @@ async function renderSettings() {
     schedulerStatus.textContent = bits.join(' · ');
   }
   api('/api/scheduler/status').then(r => paintSchedulerStatus(r.scheduler)).catch(() => paintSchedulerStatus({ enabled: !!s.scheduler.enabled }));
-  document.getElementById('s-save-groups').addEventListener('click', async () => {
+  const saveGroupsButton = document.getElementById('s-save-groups');
+  const runSchedulerButton = document.getElementById('s-run-scheduler');
+  saveGroupsButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
     const wl = groupsLoaded
       ? [...document.querySelectorAll('#s-whitelist input:checked')].map(i => i.value)
       : (Array.isArray(s.groups?.whitelist) ? s.groups.whitelist : []);
@@ -3043,8 +3068,8 @@ async function renderSettings() {
       schedulerStatus.className = 'status err';
       schedulerStatus.textContent = '✗ 保存失败：' + e.message;
     }
-  });
-  document.getElementById('s-run-scheduler').addEventListener('click', async () => {
+  }));
+  runSchedulerButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
     schedulerStatus.className = 'status';
     schedulerStatus.textContent = '检查中...';
     try {
@@ -3054,9 +3079,9 @@ async function renderSettings() {
       schedulerStatus.className = 'status err';
       schedulerStatus.textContent = '✗ ' + e.message;
     }
-  });
-  document.getElementById('s-save-groups').disabled = false;
-  document.getElementById('s-run-scheduler').disabled = false;
+  }));
+  saveGroupsButton.disabled = false;
+  runSchedulerButton.disabled = false;
   loadSettingsGroupsInBackground();
 
   // 渲染与输出
@@ -3075,7 +3100,9 @@ async function renderSettings() {
   document.getElementById('s-fontsize').value = s.render.default_font_size;
   document.getElementById('s-outdir').value = s.output.dir;
   document.getElementById('s-retention').value = s.output.retention_days ?? 0;
-  document.getElementById('s-open-outdir').addEventListener('click', async () => {
+  const openOutdirButton = document.getElementById('s-open-outdir');
+  const saveRenderButton = document.getElementById('s-save-render');
+  openOutdirButton.addEventListener('click', () => withBusyButtons(openOutdirButton, async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
@@ -3093,8 +3120,8 @@ async function renderSettings() {
       $st.className = 'status err';
       $st.textContent = '✗ 打开失败：' + e.message;
     }
-  });
-  document.getElementById('s-save-render').addEventListener('click', async () => {
+  }));
+  saveRenderButton.addEventListener('click', () => withBusyButtons(saveRenderButton, async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
@@ -3124,9 +3151,9 @@ async function renderSettings() {
       $st.className = 'status err';
       $st.textContent = '✗ ' + e.message;
     }
-  });
-  document.getElementById('s-open-outdir').disabled = false;
-  document.getElementById('s-save-render').disabled = false;
+  }));
+  openOutdirButton.disabled = false;
+  saveRenderButton.disabled = false;
 
   // 隐私
   document.getElementById('s-redact-phone').checked = !!s.privacy.redact_phone;
@@ -3138,7 +3165,9 @@ async function renderSettings() {
     document.getElementById('s-manual-key-row').classList.toggle('hidden', e.target.value !== 'manual');
   });
   if (document.getElementById('s-keymode').value === 'manual') document.getElementById('s-manual-key-row').classList.remove('hidden');
-  document.getElementById('s-save-privacy').addEventListener('click', async () => {
+  const savePrivacyButton = document.getElementById('s-save-privacy');
+  const exportDiagButton = document.getElementById('s-export-diag');
+  savePrivacyButton.addEventListener('click', () => withBusyButtons([savePrivacyButton, exportDiagButton], async () => {
     const $st = document.getElementById('s-privacy-status');
     const keyMode = document.getElementById('s-keymode').value;
     const manualKey = document.getElementById('s-manual-key').value.trim();
@@ -3174,8 +3203,8 @@ async function renderSettings() {
       $st.className = 'status err';
       $st.textContent = '✗ 保存失败：' + e.message;
     }
-  });
-  document.getElementById('s-export-diag').addEventListener('click', async () => {
+  }));
+  exportDiagButton.addEventListener('click', () => withBusyButtons([savePrivacyButton, exportDiagButton], async () => {
     const $st = document.getElementById('s-privacy-status');
     $st.className = 'status';
     $st.textContent = '正在导出诊断包...';
@@ -3194,9 +3223,9 @@ async function renderSettings() {
       $st.className = 'status err';
       $st.textContent = '✗ 导出失败：' + e.message;
     }
-  });
-  document.getElementById('s-save-privacy').disabled = false;
-  document.getElementById('s-export-diag').disabled = false;
+  }));
+  savePrivacyButton.disabled = false;
+  exportDiagButton.disabled = false;
 
   async function refreshAcceptanceChecks() {
     const $list = document.getElementById('s-acceptance-checks');
@@ -3286,10 +3315,12 @@ async function renderSettings() {
     $st.className = 'status ok';
     $st.textContent = '✓ 已导出验收记录 MD';
   }
-  document.getElementById('s-refresh-acceptance').addEventListener('click', refreshAcceptanceChecks);
-  document.getElementById('s-export-acceptance-md').addEventListener('click', exportAcceptanceMarkdown);
-  document.getElementById('s-refresh-acceptance').disabled = false;
-  document.getElementById('s-export-acceptance-md').disabled = false;
+  const refreshAcceptanceButton = document.getElementById('s-refresh-acceptance');
+  const exportAcceptanceButton = document.getElementById('s-export-acceptance-md');
+  refreshAcceptanceButton.addEventListener('click', () => withBusyButtons([refreshAcceptanceButton, exportAcceptanceButton], refreshAcceptanceChecks));
+  exportAcceptanceButton.addEventListener('click', () => withBusyButtons(exportAcceptanceButton, exportAcceptanceMarkdown));
+  refreshAcceptanceButton.disabled = false;
+  exportAcceptanceButton.disabled = false;
   document.getElementById('s-acceptance-status').textContent = '未读取';
 
   // 关于
@@ -3359,14 +3390,15 @@ async function renderSetup() {
         <div class="form-row"><label>长上下文模型</label><select id="w-model-long">${models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('') || '<option value="">请先获取模型</option>'}</select></div>`;
       if (wizardData.llm.model) document.getElementById('w-model').value = wizardData.llm.model;
       if (wizardData.llm.long_context_model) document.getElementById('w-model-long').value = wizardData.llm.long_context_model;
-      document.getElementById('w-list').addEventListener('click', async () => {
+      const listButton = document.getElementById('w-list');
+      listButton.addEventListener('click', () => withBusyButtons(listButton, async () => {
         const $st = document.getElementById('w-status');
         $st.className = 'status'; $st.textContent = '获取中...';
         try {
           const provider = document.querySelector('input[name="w-provider"]:checked')?.value || 'openai';
-          const r = await api('/api/list-models?refresh=true', {
+          const r = await api('/api/list-models', {
             method: 'POST',
-            body: { provider, base_url: document.getElementById('w-base').value, api_key: document.getElementById('w-key').value, refresh: true },
+            body: { provider, base_url: document.getElementById('w-base').value, api_key: document.getElementById('w-key').value },
           });
           wizardData.llm.provider = provider;
           wizardData.llm.base_url = document.getElementById('w-base').value;
@@ -3377,7 +3409,7 @@ async function renderSetup() {
           $st.className = 'status ok'; $st.textContent = `✓ 获取到 ${wizardData.llm.available_models.length} 个模型`;
           paint();
         } catch (e) { $st.className = 'status err'; $st.textContent = '✗ ' + e.message; }
-      });
+      }));
     } else if (step === 3) {
       $title.textContent = '检测微信';
       $body.innerHTML = `

@@ -2,8 +2,6 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { normalizeBaseUrl, rememberModels } from '../config/settings.js';
 
-const MODEL_CACHE = new Map();
-const CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL = 800;
 const DEFAULT_FALLBACK_MAX_INPUT_CHARS = 60_000;
 const DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL = 300_000;
@@ -165,27 +163,19 @@ export function redactStructuredValue(value, privacy = {}, key = '') {
   return value;
 }
 
-export async function listModels({ provider, base_url, api_key, refresh = false, timeout_ms = 30000, persist = false }) {
+export async function listModels({ provider, base_url, api_key, timeout_ms = 30000, persist = false }) {
   const normalizedBase = normalizeBaseUrl(base_url);
   if (!['openai', 'anthropic'].includes(provider)) throw httpError(400, 'Unsupported provider');
   if (!normalizedBase) throw httpError(400, 'Missing base_url');
   if (!api_key) throw httpError(400, 'Missing api_key');
-
-  const cacheKey = `${provider}:${normalizedBase}`;
-  const cached = MODEL_CACHE.get(cacheKey);
-  if (!refresh && cached && Date.now() - cached.at < CACHE_TTL_MS) {
-    if (persist) await rememberModels({ provider, base_url: normalizedBase, models: cached.models }).catch(() => {});
-    return { ok: true, models: cached.models, cached: true };
-  }
 
   const headers = provider === 'openai'
     ? { Authorization: `Bearer ${api_key}` }
     : { 'x-api-key': api_key, 'anthropic-version': '2023-06-01' };
   const json = await fetchJson(`${normalizedBase}/models`, { method: 'GET', headers, timeout_ms, api_key });
   const models = normalizeModelList(json);
-  MODEL_CACHE.set(cacheKey, { at: Date.now(), models });
   if (persist) await rememberModels({ provider, base_url: normalizedBase, models }).catch(() => {});
-  return { ok: true, models, cached: false };
+  return { ok: true, models };
 }
 
 export async function testLlmConnectivity({ provider, base_url, api_key, model, timeout_ms = DEFAULT_CONNECTIVITY_TEST_TIMEOUT_MS }) {
