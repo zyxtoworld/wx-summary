@@ -6,7 +6,6 @@ const $app = document.getElementById('app');
 let _appState = null;
 let _keyboardShortcutsAttached = false;
 let _routeSeq = 0;
-let _activeRouteHash = '';
 let _customRangeOutsideClickAttached = false;
 
 function selectedAccountId() {
@@ -89,8 +88,6 @@ async function route() {
   const rawHash = location.hash.replace(/^#/, '') || '/digest';
   const hash = rawHash.split('?')[0] || '/digest';
   const fn = routes[hash] || renderDigest;
-  if (_activeRouteHash === '/digest' && hash !== '/digest') abortActiveDigest('切换页面');
-  _activeRouteHash = hash;
   closeTransientOverlays();
   // 设置导航 active
   document.querySelectorAll('.nav a').forEach(a => {
@@ -594,7 +591,10 @@ let _state_digest = {
   generating: false,
   abortController: null,
   abortReason: '',
+  progress: null,
 };
+
+let _digestProgressPaintTimer = null;
 
 let _state_settings = {
   acceptanceDiagnostics: null,
@@ -920,6 +920,7 @@ async function renderDigest() {
   });
 
   restoreDigestOutputs();
+  paintDigestProgressSnapshot();
   ensureKeyboardShortcuts();
 }
 
@@ -1183,6 +1184,122 @@ function commitPendingChipInputs() {
   });
 }
 
+function stripDigestElapsedDetail(detail = '') {
+  return String(detail || '')
+    .trim()
+    .replace(/\s*·?\s*仍在处理[，,]?\s*已用时\s*\d+分\d{1,2}秒\s*$/u, '')
+    .replace(/\s*·?\s*仍在处理[，,]?\s*已用时\s*\d+秒\s*$/u, '')
+    .replace(/\s*·?\s*已用时\s*\d+分\d{1,2}秒\s*$/u, '')
+    .replace(/\s*·?\s*已用时\s*\d+秒\s*$/u, '')
+    .trim();
+}
+
+function formatDigestElapsedDetail(baseDetail, startedAt) {
+  const elapsedSeconds = Math.max(1, Math.floor((Date.now() - Number(startedAt || Date.now())) / 1000));
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  const elapsed = minutes ? `已用时 ${minutes}分${String(seconds).padStart(2, '0')}秒` : `已用时 ${seconds}秒`;
+  return baseDetail ? `${baseDetail} · ${elapsed}` : elapsed;
+}
+
+function resetDigestProgressSnapshot({ previewText = false } = {}) {
+  _state_digest.progress = {
+    visible: true,
+    previewText: !!previewText,
+    fill: '0%',
+    stages: [],
+    logVisible: false,
+    logSummary: '',
+    logText: '',
+    logStatusClass: 'status',
+    logStatusText: '',
+  };
+  paintDigestProgressSnapshot();
+}
+
+function setDigestProgressFill(width) {
+  if (!_state_digest.progress) return;
+  _state_digest.progress.fill = width || '0%';
+  const fill = document.getElementById('progress-fill');
+  if (fill) fill.style.width = _state_digest.progress.fill;
+}
+
+function setDigestProgressStages(stages = []) {
+  if (!_state_digest.progress) resetDigestProgressSnapshot();
+  _state_digest.progress.stages = stages.map(stage => ({ ...stage }));
+  paintDigestProgressSnapshot();
+}
+
+function setDigestProgressLogPrompt(summary = '') {
+  if (!_state_digest.progress) resetDigestProgressSnapshot();
+  const cleanSummary = compactErrorSummary(summary);
+  _state_digest.progress.logSummary = cleanSummary;
+  _state_digest.progress.logStatusClass = 'status err';
+  _state_digest.progress.logStatusText = cleanSummary ? `错误摘要：${cleanSummary}` : '生成失败';
+  paintDigestProgressSnapshot();
+}
+
+function paintDigestProgressSnapshot() {
+  const snapshot = _state_digest.progress;
+  const card = document.getElementById('progress-card');
+  const stages = document.getElementById('progress-stages');
+  const fill = document.getElementById('progress-fill');
+  const tools = document.getElementById('progress-log-tools');
+  const log = document.getElementById('progress-log');
+  const status = document.getElementById('progress-log-status');
+  if (!card || !stages || !fill) return;
+  if (!snapshot?.visible) {
+    card.classList.add('hidden');
+    stopDigestProgressPaintTimer();
+    return;
+  }
+  card.classList.remove('hidden');
+  fill.style.width = snapshot.fill || '0%';
+  stages.innerHTML = '';
+  for (const stage of snapshot.stages || []) {
+    const li = document.createElement('li');
+    li.className = stage.status || '';
+    li.dataset.stageName = stage.stageName || stage.name || '';
+    li.textContent = digestStageText(stage);
+    stages.appendChild(li);
+  }
+  if (tools && status && log) {
+    const hasLog = !!(snapshot.logSummary || snapshot.logText || snapshot.logStatusText);
+    tools.classList.toggle('hidden', !hasLog);
+    status.className = snapshot.logStatusClass || 'status';
+    status.textContent = snapshot.logStatusText || '';
+    log.textContent = snapshot.logText || '';
+    log.classList.toggle('hidden', !snapshot.logVisible);
+  }
+  if (_state_digest.generating && (snapshot.stages || []).some(stage => stage.status === 'running')) startDigestProgressPaintTimer();
+  else stopDigestProgressPaintTimer();
+}
+
+function digestStageText(stage = {}) {
+  const icon = stage.status === 'done' ? '✓' : stage.status === 'running' ? '⟳' : stage.status === 'error' ? '✗' : '·';
+  const detail = stage.status === 'running'
+    ? formatDigestElapsedDetail(stage.baseDetail || '', stage.startedAt)
+    : (stage.detail || '');
+  return `${icon} ${stage.label || ''}${detail ? ' (' + detail + ')' : ''}`;
+}
+
+function startDigestProgressPaintTimer() {
+  if (_digestProgressPaintTimer) return;
+  _digestProgressPaintTimer = setInterval(() => {
+    if (!_state_digest.generating) {
+      stopDigestProgressPaintTimer();
+      return;
+    }
+    paintDigestProgressSnapshot();
+  }, 1000);
+}
+
+function stopDigestProgressPaintTimer() {
+  if (!_digestProgressPaintTimer) return;
+  clearInterval(_digestProgressPaintTimer);
+  _digestProgressPaintTimer = null;
+}
+
 // ---------- 生成（SSE） ----------
 async function generateDigest({ previewText = false } = {}) {
   commitPendingChipInputs();
@@ -1205,9 +1322,20 @@ async function generateDigest({ previewText = false } = {}) {
   const $exportMd = document.getElementById('btn-export-md');
   const $textPreviewStatus = document.getElementById('text-preview-status');
   const $revealButton = document.getElementById('btn-reveal');
+  resetDigestProgressSnapshot({ previewText });
+  setDigestProgressStages([{
+    key: 'prepare',
+    name: 'prepare',
+    stageName: 'prepare',
+    label: '准备生成 · 读取群列表',
+    status: 'running',
+    startedAt: Date.now(),
+    baseDetail: '',
+  }]);
   $progress.classList.remove('hidden');
   $stages.innerHTML = `<li class="running">⟳ 准备生成 · 读取群列表</li>`;
   $fill.style.width = '2%';
+  setDigestProgressFill('2%');
   $logTools.classList.add('hidden');
   $log.classList.add('hidden');
   $log.textContent = '';
@@ -1236,7 +1364,9 @@ async function generateDigest({ previewText = false } = {}) {
     if ($progress && $stages && $fill) {
       $progress.classList.remove('hidden');
       $fill.style.width = '0%';
+      setDigestProgressFill('0%');
       $stages.innerHTML = `<li class="error">✗ 读取群列表失败：${escapeHtml(e.message || '未知错误')}</li>`;
+      setDigestProgressStages([{ key: 'error', name: 'error', stageName: 'error', label: `读取群列表失败：${e.message || '未知错误'}`, status: 'error' }]);
       showProgressLogPrompt(e.message || '读取群列表失败');
       scrollDigestWorkIntoView($progress);
     }
@@ -1262,28 +1392,21 @@ async function generateDigest({ previewText = false } = {}) {
   $progress.classList.remove('hidden');
   $stages.innerHTML = '';
   $fill.style.width = '0%';
+  setDigestProgressFill('0%');
+  setDigestProgressStages([]);
   $logTools.classList.add('hidden');
   $log.classList.add('hidden');
   $log.textContent = '';
   $logStatus.textContent = '';
 
   const stageMap = {};
+  const stageSnapshots = new Map();
   const stagesOrder = previewText ? ['fetching', 'summarizing', 'rendering'] : ['fetching', 'summarizing', 'rendering', 'saving'];
   function stripElapsedDetail(detail = '') {
-    return String(detail || '')
-      .trim()
-      .replace(/\s*·?\s*仍在处理[，,]?\s*已用时\s*\d+分\d{1,2}秒\s*$/u, '')
-      .replace(/\s*·?\s*仍在处理[，,]?\s*已用时\s*\d+秒\s*$/u, '')
-      .replace(/\s*·?\s*已用时\s*\d+分\d{1,2}秒\s*$/u, '')
-      .replace(/\s*·?\s*已用时\s*\d+秒\s*$/u, '')
-      .trim();
+    return stripDigestElapsedDetail(detail);
   }
   function formatElapsedDetail(baseDetail, startedAt) {
-    const elapsedSeconds = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
-    const minutes = Math.floor(elapsedSeconds / 60);
-    const seconds = elapsedSeconds % 60;
-    const elapsed = minutes ? `已用时 ${minutes}分${String(seconds).padStart(2, '0')}秒` : `已用时 ${seconds}秒`;
-    return baseDetail ? `${baseDetail} · ${elapsed}` : elapsed;
+    return formatDigestElapsedDetail(baseDetail, startedAt);
   }
   function writeStageText(li, stage, detail = stage.detail || '') {
     const icon = stage.status === 'done' ? '✓' : stage.status === 'running' ? '⟳' : stage.status === 'error' ? '✗' : '·';
@@ -1310,7 +1433,16 @@ async function generateDigest({ previewText = false } = {}) {
       clearRunningStage(li);
       li.className = status;
       writeStageText(li, { ...runningStage, status, detail });
+      stageSnapshots.set(key, {
+        ...runningStage,
+        key,
+        status,
+        detail,
+        startedAt: runningStage.startedAt,
+        baseDetail: runningStage.baseDetail || '',
+      });
     });
+    setDigestProgressStages([...stageSnapshots.values()]);
   }
   function upsertStage(s) {
     const key = s.key || s.name;
@@ -1335,13 +1467,30 @@ async function generateDigest({ previewText = false } = {}) {
         li._runningStage.timer = setInterval(() => renderRunningStage(li), 1000);
       }
       renderRunningStage(li);
+      stageSnapshots.set(key, {
+        ...s,
+        key,
+        stageName: s.stageName || s.name || '',
+        status: 'running',
+        startedAt: li._runningStage.startedAt,
+        baseDetail: li._runningStage.baseDetail || '',
+      });
     } else {
       clearRunningStage(li);
       writeStageText(li, s);
+      stageSnapshots.set(key, {
+        ...s,
+        key,
+        stageName: s.stageName || s.name || '',
+        detail: s.detail || '',
+      });
     }
     const doneStageCount = Object.values(stageMap).filter(item => stagesOrder.includes(item.dataset.stageName) && item.classList.contains('done')).length;
     const totalSteps = Math.max(1, targets.length * stagesOrder.length);
-    $fill.style.width = Math.min(100, (doneStageCount / totalSteps * 100)) + '%';
+    const fillWidth = Math.min(100, (doneStageCount / totalSteps * 100)) + '%';
+    $fill.style.width = fillWidth;
+    setDigestProgressStages([...stageSnapshots.values()]);
+    setDigestProgressFill(fillWidth);
   }
   function groupStage(index, stage) {
     return {
@@ -1438,18 +1587,18 @@ async function generateDigest({ previewText = false } = {}) {
         status: 'done',
         detail: reason,
       });
-      $fill.style.width = doneDigests.length ? Math.max(10, Number.parseFloat($fill.style.width) || 10) + '%' : '0%';
+      setDigestProgressFill(doneDigests.length ? Math.max(10, Number.parseFloat($fill.style.width) || 10) + '%' : '0%');
     } else if (failures.length && doneDigests.length) {
       upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个，失败 ${failures.length} 个`, status: 'error', detail: failures.map(f => f.group).join('、') });
-      $fill.style.width = '100%';
+      setDigestProgressFill('100%');
       showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
     } else if (failures.length) {
       upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `全部失败 ${failures.length} 个群`, status: 'error', detail: failures.map(f => f.group).join('、') });
-      $fill.style.width = '100%';
+      setDigestProgressFill('100%');
       if (!failures.every(f => f.error === '已取消')) showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
     } else if (doneDigests.length === targets.length) {
       upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个群`, status: 'done' });
-      $fill.style.width = '100%';
+      setDigestProgressFill('100%');
     }
   } catch (e) {
     const aborted = e?.name === 'AbortError';
@@ -1465,6 +1614,7 @@ async function generateDigest({ previewText = false } = {}) {
     const finalPreviewButton = document.getElementById('btn-preview-text');
     if (finalGenerateButton) finalGenerateButton.disabled = _state_digest.selectedGroups.size === 0;
     if (finalPreviewButton) finalPreviewButton.disabled = _state_digest.selectedGroups.size === 0;
+    paintDigestProgressSnapshot();
   }
 }
 
@@ -1505,8 +1655,9 @@ function scrollDigestWorkIntoView(element) {
 function showProgressLogPrompt(summary = '') {
   const tools = document.getElementById('progress-log-tools');
   const status = document.getElementById('progress-log-status');
-  if (!tools || !status) return;
   const cleanSummary = compactErrorSummary(summary);
+  setDigestProgressLogPrompt(cleanSummary);
+  if (!tools || !status) return;
   tools.classList.remove('hidden');
   status.className = 'status err';
   status.textContent = cleanSummary ? `错误摘要：${cleanSummary}` : '生成失败';
@@ -1537,10 +1688,19 @@ async function toggleProgressLog() {
   if (!log || !status) return;
   if (!log.classList.contains('hidden')) {
     log.classList.add('hidden');
+    if (_state_digest.progress) {
+      _state_digest.progress.logVisible = false;
+      paintDigestProgressSnapshot();
+    }
     return;
   }
   status.className = 'status';
   status.textContent = '正在读取日志...';
+  if (_state_digest.progress) {
+    _state_digest.progress.logStatusClass = 'status';
+    _state_digest.progress.logStatusText = '正在读取日志...';
+    paintDigestProgressSnapshot();
+  }
   try {
     const result = await api('/api/logs?limit=80');
     const lines = Array.isArray(result.log_tail) ? result.log_tail.slice(-80) : [];
@@ -1548,9 +1708,21 @@ async function toggleProgressLog() {
     log.classList.remove('hidden');
     status.className = 'status';
     status.textContent = '已显示最近日志';
+    if (_state_digest.progress) {
+      _state_digest.progress.logVisible = true;
+      _state_digest.progress.logText = log.textContent;
+      _state_digest.progress.logStatusClass = 'status';
+      _state_digest.progress.logStatusText = '已显示最近日志';
+      paintDigestProgressSnapshot();
+    }
   } catch (e) {
     status.className = 'status err';
     status.textContent = `日志读取失败：${e.message || '未知错误'}`;
+    if (_state_digest.progress) {
+      _state_digest.progress.logStatusClass = 'status err';
+      _state_digest.progress.logStatusText = `日志读取失败：${e.message || '未知错误'}`;
+      paintDigestProgressSnapshot();
+    }
   }
 }
 
