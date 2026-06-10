@@ -861,12 +861,25 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/diagnostics' && req.method === 'GET') {
+    const scope = parsedUrl.searchParams.get('scope') || '';
+    const lightweight = scope === 'acceptance' || parsedUrl.searchParams.get('light') === 'true';
     const settings = await loadSettings();
-    const logTail = await sanitizedLogTail(200, settings);
-    const currentBinary = await getWeixinBinaryEvidence().catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) }));
-    const weixinModules = await getWeixinModuleEvidence().catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) }));
-    const mediaTools = await probeMediaTools().catch(e => ({ error: sanitizeText(e?.message || String(e)) }));
-    const externalBinary = await readExternalWeixinBaseline();
+    const logTail = await sanitizedLogTail(lightweight ? 40 : 200, settings);
+    const [
+      currentBinary,
+      weixinModules,
+      mediaTools,
+      externalBinary,
+    ] = await Promise.all([
+      getWeixinBinaryEvidence().catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) })),
+      lightweight
+        ? Promise.resolve({ skipped: true, reason: 'lightweight_acceptance_scope' })
+        : getWeixinModuleEvidence().catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) })),
+      lightweight
+        ? Promise.resolve({ skipped: true, reason: 'lightweight_acceptance_scope' })
+        : probeMediaTools().catch(e => ({ error: sanitizeText(e?.message || String(e)) })),
+      readExternalWeixinBaseline(),
+    ]);
     const prelaunchBinary = freshPrelaunchBaseline();
     const launcherBinary = freshLauncherBaseline();
     const service = {
@@ -912,6 +925,7 @@ async function handleApi(req, res, parsedUrl) {
     };
     return sendJson(res, 200, {
       ok: true,
+      diagnostic_scope: lightweight ? 'acceptance' : 'full',
       project_root: PROJECT_ROOT,
       service,
       acceptance_manual_checks: manualAcceptanceChecks({ service, localActionEvidence, secrets, weixinBinary, platform: process.platform }),

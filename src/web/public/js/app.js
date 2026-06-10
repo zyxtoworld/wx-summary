@@ -3283,7 +3283,7 @@ async function renderSettings() {
     $st.className = 'status';
     $st.textContent = '正在读取诊断状态...';
     try {
-      const diag = await api('/api/diagnostics');
+      const diag = await api('/api/diagnostics?scope=acceptance');
       const checks = Array.isArray(diag.acceptance_manual_checks) ? diag.acceptance_manual_checks : [];
       _state_settings.acceptanceDiagnostics = diag;
       if (!checks.length) {
