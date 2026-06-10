@@ -2450,8 +2450,11 @@ function showImageZoomModal({ title, src }) {
 // ---------- 设置页 ----------
 async function renderSettings() {
   $app.appendChild(tplOf('tpl-settings'));
+  const settingsRouteSeq = _routeSeq;
   const s = await api('/api/settings');
+  if (settingsRouteSeq !== _routeSeq) return;
   const statePromise = api('/api/state').catch(() => ({ platform: '', project_root: '' }));
+  let settingsState = _appState || { platform: '', project_root: '' };
 
   // AI
   let availableModels = Array.isArray(s.llm.available_models) ? s.llm.available_models : [];
@@ -2676,33 +2679,41 @@ async function renderSettings() {
   const $wl = document.getElementById('s-whitelist');
   let groups = [];
   let groupsLoaded = false;
+  let groupsLoadError = null;
   let schedulerOverrides = Array.isArray(s.scheduler.per_group) ? s.scheduler.per_group.map(item => ({
     group: item.group || item.group_id || '',
     keywords: Array.isArray(item.keywords) ? item.keywords : String(item.keywords || '').split(/[,，]/).map(x => x.trim()).filter(Boolean),
     min_messages: Number(item.min_messages || item.min_messages_per_digest || 0) || 0,
   })).filter(item => item.group && (item.keywords.length || item.min_messages)) : [];
-  try {
-    groups = await api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`);
-    groupsLoaded = true;
-  } catch (e) {
-    groups = [];
-    $wl.innerHTML = `<p class="empty">读取本机微信群列表失败：${escapeHtml(e.message || '未知错误')}。保存调度设置时会保留原白名单，不会清空。</p>`;
-  }
+  $wl.innerHTML = '<p class="empty">正在后台读取本机微信群列表...</p>';
   function paintWl() {
-    if (!groups.length) return;
+    if (!groups.length) {
+      if (groupsLoadError) {
+        $wl.innerHTML = `<p class="empty">读取本机微信群列表失败：${escapeHtml(groupsLoadError.message || '未知错误')}。保存调度设置时会保留原白名单，不会清空。</p>`;
+      } else if (!groupsLoaded) {
+        $wl.innerHTML = '<p class="empty">正在后台读取本机微信群列表...</p>';
+      } else {
+        $wl.innerHTML = '<p class="empty">本机没有可显示的微信群。保存调度设置时会保留原白名单。</p>';
+      }
+      return;
+    }
     $wl.innerHTML = groups.map(g => {
       const checked = (s.groups.whitelist || []).includes(g.name);
       return `<label class="chip"><input type="checkbox" ${checked ? 'checked' : ''} value="${escapeHtml(g.name)}" /> ${escapeHtml(g.name)}</label>`;
     }).join('');
   }
-  paintWl();
   function paintOverrideEditor() {
     const groupSelect = document.getElementById('s-override-group');
     const list = document.getElementById('s-overrides');
     if (!groupSelect || !list) return;
     groupSelect.innerHTML = groups.length
       ? groups.map(g => `<option value="${escapeHtml(g.name || g.id)}">${escapeHtml(g.name || g.id)}</option>`).join('')
-      : '<option value="">群列表不可用</option>';
+      : groupsLoadError
+        ? '<option value="">群列表不可用</option>'
+        : groupsLoaded
+          ? '<option value="">没有可选群</option>'
+          : '<option value="">群列表读取中...</option>';
+    document.getElementById('s-add-override').disabled = !groups.length;
     list.innerHTML = schedulerOverrides.length
       ? schedulerOverrides.map((item, index) => `
         <div class="override-item" data-index="${index}">
@@ -2720,6 +2731,27 @@ async function renderSettings() {
       });
     });
   }
+  async function loadSettingsGroupsInBackground() {
+    groupsLoadError = null;
+    groupsLoaded = false;
+    paintWl();
+    paintOverrideEditor();
+    try {
+      const loaded = await api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`);
+      if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-whitelist')) return;
+      groups = Array.isArray(loaded) ? loaded : [];
+      groupsLoaded = true;
+      groupsLoadError = null;
+    } catch (e) {
+      if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-whitelist')) return;
+      groups = [];
+      groupsLoaded = false;
+      groupsLoadError = e;
+    }
+    paintWl();
+    paintOverrideEditor();
+  }
+  paintWl();
   paintOverrideEditor();
   document.getElementById('s-add-override')?.addEventListener('click', () => {
     const group = document.getElementById('s-override-group').value;
@@ -2802,9 +2834,20 @@ async function renderSettings() {
   });
   document.getElementById('s-save-groups').disabled = false;
   document.getElementById('s-run-scheduler').disabled = false;
+  loadSettingsGroupsInBackground();
 
   // 渲染与输出
-  const state = await statePromise;
+  function paintSettingsStateMeta() {
+    const platformEl = document.getElementById('s-platform');
+    const rootEl = document.getElementById('s-projroot');
+    if (platformEl) platformEl.textContent = settingsState.platform || '';
+    if (rootEl) rootEl.textContent = settingsState.project_root || '';
+  }
+  statePromise.then(state => {
+    if (settingsRouteSeq !== _routeSeq) return;
+    settingsState = state || settingsState;
+    paintSettingsStateMeta();
+  }).catch(() => {});
   document.getElementById('s-theme').value = s.render.default_theme;
   document.getElementById('s-fontsize').value = s.render.default_font_size;
   document.getElementById('s-outdir').value = s.output.dir;
@@ -2812,7 +2855,7 @@ async function renderSettings() {
   document.getElementById('s-open-outdir').addEventListener('click', async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
-    if (!outputDirLooksInsideProject(outDir, state.project_root)) {
+    if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
       $st.className = 'status err';
       $st.textContent = '✗ 输出目录必须在项目根之下，且不能位于 outputs/.tmp';
       return;
@@ -2831,7 +2874,7 @@ async function renderSettings() {
   document.getElementById('s-save-render').addEventListener('click', async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
-    if (!outputDirLooksInsideProject(outDir, state.project_root)) {
+    if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
       $st.className = 'status err';
       $st.textContent = '✗ 输出目录必须在项目根之下，且不能位于 outputs/.tmp';
       return;
@@ -3027,8 +3070,7 @@ async function renderSettings() {
   document.getElementById('s-acceptance-status').textContent = '未读取';
 
   // 关于
-  document.getElementById('s-platform').textContent = state.platform;
-  document.getElementById('s-projroot').textContent = state.project_root;
+  paintSettingsStateMeta();
 }
 
 function formatCapabilityStatus(item = {}) {
