@@ -6,7 +6,9 @@ import { redactSecrets } from '../summarizer/llm.js';
 
 let REAL_GROUP_CACHE = null;
 let DB_KEY_CANDIDATE_CACHE = null;
+let WEIXIN_ENV_CACHE = { at: 0, result: null, promise: null };
 const DB_KEY_CANDIDATE_CACHE_MS = 2 * 60 * 1000;
+const WEIXIN_ENV_CACHE_MS = 30 * 1000;
 const MESSAGE_SEARCH_FIELDS = ['time', 'sender', 'type', 'content'];
 const MEDIA_SEARCH_FIELDS = ['kind', 'file_name', 'ext', 'size', 'width', 'height', 'duration_ms', 'duration_s', 'format', 'url', 'title', 'desc'];
 const QUOTE_SEARCH_FIELDS = ['from', 'content', 'type'];
@@ -20,8 +22,20 @@ function throwIfAborted(signal) {
   if (signal?.aborted) throw abortError();
 }
 
-export async function detectWeixin() {
-  return discoverWeixinEnvironment();
+export async function detectWeixin({ force = false } = {}) {
+  if (!force && WEIXIN_ENV_CACHE.result && Date.now() - WEIXIN_ENV_CACHE.at < WEIXIN_ENV_CACHE_MS) {
+    return WEIXIN_ENV_CACHE.result;
+  }
+  if (!force && WEIXIN_ENV_CACHE.promise) return WEIXIN_ENV_CACHE.promise;
+  const promise = discoverWeixinEnvironment();
+  WEIXIN_ENV_CACHE.promise = promise;
+  try {
+    const result = await promise;
+    WEIXIN_ENV_CACHE = { at: Date.now(), result, promise: null };
+    return result;
+  } finally {
+    if (WEIXIN_ENV_CACHE.promise === promise) WEIXIN_ENV_CACHE.promise = null;
+  }
 }
 
 export async function listAccounts() {

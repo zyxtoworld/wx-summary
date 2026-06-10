@@ -536,7 +536,8 @@ async function handleApi(req, res, parsedUrl) {
 
   if (pathname === '/api/state' && req.method === 'GET') {
     const settings = await loadSettings();
-    const wechat = await detectWeixin();
+    const refresh = parsedUrl.searchParams.get('refresh') === 'true';
+    const wechat = await detectWeixin({ force: refresh });
     const needSetup = settings._secrets_invalid || !settings.llm.base_url || !settings.llm.api_key_set;
     return sendJson(res, 200, {
       ok: true,
@@ -664,18 +665,18 @@ async function handleApi(req, res, parsedUrl) {
       ACTIVE_DEEP_KEY_STATUS = { started_at: new Date().toISOString() };
     }
     try {
-    const processStatus = await detectWeixin();
-    const localKeyStatus = scan ? await scanLocalWeixinKeyCandidates({ include_raw: true }).catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) })) : null;
-    const keyStatus = await probeWxKey({ scan, include_raw: scan, scan_all_processes: scan });
-    const rawKeys = [
-      ...(Array.isArray(localKeyStatus?.raw_candidates) ? localKeyStatus.raw_candidates : []),
-      ...(Array.isArray(keyStatus._raw_candidates) ? keyStatus._raw_candidates : []),
-    ];
-    if (localKeyStatus) delete localKeyStatus.raw_candidates;
-    delete keyStatus._raw_candidates;
-    delete keyStatus._raw_image_keys;
-    const dbStatus = await probeWxDb({ raw_keys: rawKeys, deep_scan: deepScan });
-    return sendJson(res, 200, { ok: true, process: processStatus, local_key_scan: localKeyStatus, key: keyStatus, db: dbStatus });
+      const processStatus = await detectWeixin({ force: scan || deepScan });
+      const localKeyStatus = scan ? await scanLocalWeixinKeyCandidates({ include_raw: true }).catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) })) : null;
+      const keyStatus = await probeWxKey({ scan, include_raw: scan, scan_all_processes: scan });
+      const rawKeys = [
+        ...(Array.isArray(localKeyStatus?.raw_candidates) ? localKeyStatus.raw_candidates : []),
+        ...(Array.isArray(keyStatus._raw_candidates) ? keyStatus._raw_candidates : []),
+      ];
+      if (localKeyStatus) delete localKeyStatus.raw_candidates;
+      delete keyStatus._raw_candidates;
+      delete keyStatus._raw_image_keys;
+      const dbStatus = await probeWxDb({ raw_keys: rawKeys, deep_scan: deepScan });
+      return sendJson(res, 200, { ok: true, process: processStatus, local_key_scan: localKeyStatus, key: keyStatus, db: dbStatus });
     } finally {
       if (deepScan) ACTIVE_DEEP_KEY_STATUS = null;
     }

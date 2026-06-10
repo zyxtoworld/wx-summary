@@ -138,31 +138,42 @@ function handleAccountSwitch() {
 }
 
 async function bootstrap() {
-  // 拉账号列表填充顶部切换器
-  try {
-    const accounts = await api('/api/accounts');
-    const sel = document.getElementById('account-switcher');
-    sel.innerHTML = accounts.length
-      ? accounts.map(a => `<option value="${escapeHtml(a.id || a.wxid)}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
-      : '<option value="">未检测到微信账号</option>';
-    sel.disabled = !accounts.length;
-    sel.addEventListener('change', handleAccountSwitch);
-  } catch (e) {
-    const sel = document.getElementById('account-switcher');
-    if (sel) {
-      sel.innerHTML = `<option value="">账号读取失败：${escapeHtml(e.message || '未知错误')}</option>`;
+  const accountsPromise = api('/api/accounts').then(
+    accounts => ({ accounts }),
+    error => ({ error }),
+  );
+  const statePromise = api('/api/state').then(
+    state => ({ state }),
+    error => ({ error }),
+  );
+
+  const accountResult = await accountsPromise;
+  const sel = document.getElementById('account-switcher');
+  if (sel) {
+    if (accountResult.error) {
+      sel.innerHTML = `<option value="">账号读取失败：${escapeHtml(accountResult.error.message || '未知错误')}</option>`;
       sel.disabled = true;
+    } else {
+      const accounts = accountResult.accounts || [];
+      const previousValue = sel.value;
+      const hadListener = sel.dataset.bound === '1';
+      if (hadListener) sel.removeEventListener('change', handleAccountSwitch);
+      sel.innerHTML = accounts.length
+        ? accounts.map(a => `<option value="${escapeHtml(a.id || a.wxid)}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
+        : '<option value="">未检测到微信账号</option>';
+      if (previousValue && accounts.some(a => (a.id || a.wxid) === previousValue)) sel.value = previousValue;
+      sel.disabled = !accounts.length;
+      sel.addEventListener('change', handleAccountSwitch);
+      sel.dataset.bound = '1';
     }
   }
 
-  // 检查是否需要走向导
-  let state;
-  try {
-    state = await api('/api/state');
-  } catch (e) {
-    renderBootstrapError(e);
+  const stateResult = await statePromise;
+  if (stateResult.error) {
+    renderBootstrapError(stateResult.error);
     return;
   }
+  const state = stateResult.state;
   _appState = state;
   if (state.need_setup && !location.hash.includes('/setup')) {
     location.hash = '#/setup';
@@ -172,6 +183,38 @@ async function bootstrap() {
   await route();
 }
 bootstrap();
+
+async function refreshTopbarAccounts() {
+  try {
+    const accounts = await api('/api/accounts');
+    const sel = document.getElementById('account-switcher');
+    sel.innerHTML = accounts.length
+      ? accounts.map(a => `<option value="${escapeHtml(a.id || a.wxid)}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
+      : '<option value="">未检测到微信账号</option>';
+    sel.disabled = !accounts.length;
+    if (sel.dataset.bound !== '1') {
+      sel.addEventListener('change', handleAccountSwitch);
+      sel.dataset.bound = '1';
+    }
+    return accounts;
+  } catch (e) {
+    const sel = document.getElementById('account-switcher');
+    if (sel) {
+      sel.innerHTML = `<option value="">账号读取失败：${escapeHtml(e.message || '未知错误')}</option>`;
+      sel.disabled = true;
+    }
+    return [];
+  }
+}
+
+async function refreshAppStateSilently() {
+  try {
+    _appState = await api('/api/state');
+    return _appState;
+  } catch {
+    return null;
+  }
+}
 
 // ---------- 工具 ----------
 function tplOf(id) {
@@ -601,8 +644,8 @@ async function renderDigest() {
       <button class="link-btn" id="wechat-retry">重试检测</button>
       <button class="link-btn" id="wechat-manual-key">填写手动密钥</button>`;
     document.getElementById('wechat-retry').addEventListener('click', async () => {
-      _appState = await api('/api/state');
-      location.reload();
+      _appState = await api('/api/state?refresh=true');
+      route();
     });
     document.getElementById('wechat-manual-key').addEventListener('click', () => { location.hash = '#/settings'; });
   }
@@ -625,8 +668,8 @@ async function renderDigest() {
       <button class="link-btn" id="wechat-retry">重试检测</button>
       <button class="link-btn" id="wechat-manual-key">填写手动密钥</button>`;
     document.getElementById('wechat-retry').addEventListener('click', async () => {
-      _appState = await api('/api/state');
-      location.reload();
+      _appState = await api('/api/state?refresh=true');
+      route();
     });
     document.getElementById('wechat-manual-key').addEventListener('click', () => { location.hash = '#/settings'; });
   }
@@ -2535,8 +2578,8 @@ async function renderSettings() {
         $st.textContent = '⚠ 已保存；' + warnings.map(w => w.message || w).join('；');
       } else {
         $st.className = 'status ok';
-        $st.textContent = '✓ 已保存并完成连通探测';
-        setTimeout(() => location.reload(), 600);
+        $st.textContent = '✓ 已保存';
+        refreshAppStateSilently();
       }
     } catch (e) {
       $st.className = 'status err';
@@ -2892,7 +2935,7 @@ async function renderSettings() {
   document.getElementById('s-export-acceptance-md').addEventListener('click', exportAcceptanceMarkdown);
   document.getElementById('s-refresh-acceptance').disabled = false;
   document.getElementById('s-export-acceptance-md').disabled = false;
-  refreshAcceptanceChecks();
+  document.getElementById('s-acceptance-status').textContent = '未读取';
 
   // 关于
   document.getElementById('s-platform').textContent = state.platform;
@@ -3114,8 +3157,11 @@ async function renderSetup() {
           $st.textContent = '⚠ 已保存；' + warnings.map(w => w.message || w).join('；');
           await new Promise(resolve => setTimeout(resolve, 1200));
         }
+        _appState = await api('/api/state?refresh=true').catch(() => _appState);
+        await refreshTopbarAccounts();
+        const alreadyDigest = location.hash === '#/digest';
         location.hash = '#/digest';
-        location.reload();
+        if (alreadyDigest) await route();
       } catch (e) {
         $st.className = 'status err';
         $st.textContent = '✗ 保存失败：' + (e.message || '未知错误');
