@@ -20,6 +20,8 @@ $dec = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [Security
 const MAC_KEYCHAIN_SERVICE = 'wx-summary.secrets';
 const MAC_KEYCHAIN_ACCOUNT = 'wx-summary';
 const MAC_ENVELOPE_VERSION = 1;
+const COMMAND_TIMEOUT_MS = 15000;
+const COMMAND_OUTPUT_LIMIT = 1024 * 1024;
 let winDpapi = null;
 
 async function loadWinDpapi() {
@@ -51,7 +53,13 @@ function bufferFromDataBlob(api, blob) {
   return Buffer.from(api.koffi.decode(blob.pbData, 'uint8_t', blob.cbData));
 }
 
-function runPowerShell(script, stdin, preferPwsh = true) {
+function appendLimited(current, chunk) {
+  const next = current + chunk;
+  if (next.length > COMMAND_OUTPUT_LIMIT) return next.slice(0, COMMAND_OUTPUT_LIMIT);
+  return next;
+}
+
+function runPowerShell(script, stdin, preferPwsh = true, timeoutMs = COMMAND_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const exe = preferPwsh ? 'pwsh' : 'powershell';
     const args = ['-NoProfile', '-NonInteractive', '-Command', script];
@@ -59,15 +67,22 @@ function runPowerShell(script, stdin, preferPwsh = true) {
     let settled = false;
     let out = '';
     let err = '';
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new Error(`${exe} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
     child.stdout.setEncoding('utf-8');
     child.stderr.setEncoding('utf-8');
-    child.stdout.on('data', chunk => { out += chunk; });
-    child.stderr.on('data', chunk => { err += chunk; });
+    child.stdout.on('data', chunk => { out = appendLimited(out, chunk); });
+    child.stderr.on('data', chunk => { err = appendLimited(err, chunk); });
     child.on('error', error => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       if (preferPwsh && error?.code === 'ENOENT') {
-        runPowerShell(script, stdin, false).then(resolve, reject);
+        runPowerShell(script, stdin, false, timeoutMs).then(resolve, reject);
       } else {
         reject(error);
       }
@@ -75,10 +90,11 @@ function runPowerShell(script, stdin, preferPwsh = true) {
     child.on('close', code => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       if (code === 0) {
         resolve(out);
       } else if (preferPwsh) {
-        runPowerShell(script, stdin, false).then(resolve, reject);
+        runPowerShell(script, stdin, false, timeoutMs).then(resolve, reject);
       } else {
         reject(new Error((err || `PowerShell exited with ${code}`).trim()));
       }
@@ -87,17 +103,32 @@ function runPowerShell(script, stdin, preferPwsh = true) {
   });
 }
 
-function runCommand(file, args, stdin = '') {
+function runCommand(file, args, stdin = '', timeoutMs = COMMAND_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new Error(`${file} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
     child.stdout.setEncoding('utf-8');
     child.stderr.setEncoding('utf-8');
-    child.stdout.on('data', chunk => { out += chunk; });
-    child.stderr.on('data', chunk => { err += chunk; });
-    child.on('error', reject);
+    child.stdout.on('data', chunk => { out = appendLimited(out, chunk); });
+    child.stderr.on('data', chunk => { err = appendLimited(err, chunk); });
+    child.on('error', error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
     child.on('close', code => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code === 0) resolve(out);
       else reject(new Error((err || out || `${file} exited with ${code}`).trim()));
     });

@@ -8,6 +8,7 @@ export const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 export const SECRETS_FILE = path.join(DATA_DIR, 'secrets.bin');
 export const CURSORS_FILE = path.join(DATA_DIR, 'cursors.json');
 const DEFAULT_LOG_FILE = './outputs/.tmp/wx-summary.log';
+let SETTINGS_SAVE_QUEUE = Promise.resolve();
 
 export function defaultSettings() {
   return {
@@ -108,7 +109,6 @@ export async function loadSecrets({ file = SECRETS_FILE } = {}) {
     return { secrets: { api_key: parsed.api_key || '', manual_key: parsed.manual_key || '' }, invalid: false };
   } catch (e) {
     if (e?.code === 'ENOENT') return { secrets: { api_key: '', manual_key: '' }, invalid: false };
-    await fsp.rm(file, { force: true }).catch(() => {});
     return { secrets: { api_key: '', manual_key: '' }, invalid: true, error: e?.message || String(e) };
   }
 }
@@ -120,7 +120,7 @@ export async function saveSecrets(secrets) {
     manual_key: secrets.manual_key || '',
   };
   const encrypted = await protectText(JSON.stringify(filtered));
-  const tmp = path.join(DATA_DIR, `secrets.${process.pid}.${Date.now()}.tmp`);
+  const tmp = path.join(DATA_DIR, `secrets.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
   try {
     await fsp.writeFile(tmp, encrypted);
     await fsp.rename(tmp, SECRETS_FILE);
@@ -131,7 +131,7 @@ export async function saveSecrets(secrets) {
 }
 
 export async function loadSettings({ includeSecrets = false } = {}) {
-  const raw = await readJson(SETTINGS_FILE, {});
+  const raw = await readJson(SETTINGS_FILE, {}, { strict: true });
   const merged = normalizeSettings(deepMerge(defaultSettings(), raw));
   const secretState = await loadSecrets();
   merged.llm.api_key_set = !!secretState.secrets.api_key;
@@ -298,6 +298,16 @@ export function validateSettingsObject(settings, { requireBaseUrl = false } = {}
 }
 
 export async function saveSettingsPatch(patch) {
+  return withSettingsSaveLock(() => saveSettingsPatchUnlocked(patch));
+}
+
+async function withSettingsSaveLock(action) {
+  const run = SETTINGS_SAVE_QUEUE.then(action, action);
+  SETTINGS_SAVE_QUEUE = run.catch(() => {});
+  return run;
+}
+
+async function saveSettingsPatchUnlocked(patch) {
   const current = await loadSettings({ includeSecrets: true });
   const nextPatch = cloneJson(patch || {});
   const nextSecrets = {

@@ -1,12 +1,13 @@
 import { discoverWeixinEnvironment } from '../wxenv/discovery.js';
 import { probeWxKey, scanLocalWeixinKeyCandidates } from '../wxkey/index.js';
 import { collectMessagesFromWxDb, listChatroomsFromWxDb } from '../wxdb/index.js';
-import { loadSettings, saveSettingsPatch, splitManualKeys } from '../config/settings.js';
+import { loadSettings, splitManualKeys } from '../config/settings.js';
 import { redactSecrets } from '../summarizer/llm.js';
 
 let REAL_GROUP_CACHE = null;
 let DB_KEY_CANDIDATE_CACHE = null;
 let WEIXIN_ENV_CACHE = { at: 0, result: null, promise: null };
+let VERIFIED_RAW_KEY_CACHE = [];
 const DB_KEY_CANDIDATE_CACHE_MS = 2 * 60 * 1000;
 const WEIXIN_ENV_CACHE_MS = 30 * 1000;
 const MESSAGE_SEARCH_FIELDS = ['time', 'sender', 'type', 'content'];
@@ -272,6 +273,7 @@ async function dbRawKeyCandidateBundle({ memoryScan = true } = {}) {
     platform: process.platform,
     memoryScan,
     manual,
+    verified_hashes: VERIFIED_RAW_KEY_CACHE.map(key => key.slice(0, 12)),
     local_hashes: local?.candidate_hashes || [],
     local_file_count: Number(local?.file_stats?.scanned || 0),
   });
@@ -286,11 +288,12 @@ async function dbRawKeyCandidateBundle({ memoryScan = true } = {}) {
   const scan = memoryScan
     ? await probeWxKey({ scan: true, include_raw: true, scan_all_processes: false })
     : null;
-  const rawKeys = uniqueStrings([...manual, ...(local?.raw_candidates || []), ...(scan?._raw_candidates || [])]);
+  const rawKeys = uniqueStrings([...manual, ...VERIFIED_RAW_KEY_CACHE, ...(local?.raw_candidates || []), ...(scan?._raw_candidates || [])]);
   const diagnostics = {
     cache_hit: false,
     memory_scan_attempted: !!memoryScan,
     manual_key_count: manual.length,
+    verified_key_count: VERIFIED_RAW_KEY_CACHE.length,
     local_candidate_count: Number(local?.unique_candidate_count || local?.candidate_count || 0),
     local_file_count: Number(local?.file_stats?.scanned || 0),
     memory_candidate_count: Number(scan?.unique_candidate_count || scan?.candidate_count || 0),
@@ -313,12 +316,33 @@ async function dbRawKeyCandidateBundle({ memoryScan = true } = {}) {
 async function rememberVerifiedRawKeys(keys = []) {
   const verified = uniqueStrings(keys).filter(isPersistableManualKey);
   if (!verified.length) return;
-  const settings = await loadSettings({ includeSecrets: true }).catch(() => null);
-  const existing = splitManualKeys(settings?.wechat?.manual_key);
-  const merged = uniqueStrings([...verified, ...existing]).filter(isPersistableManualKey).slice(0, 50);
-  if (merged.length === existing.length && merged.every((key, index) => key === existing[index])) return;
-  await saveSettingsPatch({ wechat: { manual_key: merged.join('\n') } });
-  DB_KEY_CANDIDATE_CACHE = null;
+  VERIFIED_RAW_KEY_CACHE = uniqueStrings([...verified, ...VERIFIED_RAW_KEY_CACHE])
+    .filter(isPersistableManualKey)
+    .slice(0, 50);
+  if (!DB_KEY_CANDIDATE_CACHE) {
+    DB_KEY_CANDIDATE_CACHE = {
+      key: `verified:${Date.now()}`,
+      at: Date.now(),
+      rawKeys: verified.slice(0, 50),
+      diagnostics: {
+        cache_hit: false,
+        memory_scan_attempted: false,
+        manual_key_count: 0,
+        local_candidate_count: verified.length,
+        total_candidate_count: verified.length,
+      },
+    };
+    return;
+  }
+  DB_KEY_CANDIDATE_CACHE.rawKeys = uniqueStrings([...verified, ...(DB_KEY_CANDIDATE_CACHE.rawKeys || [])])
+    .filter(isPersistableManualKey)
+    .slice(0, 50);
+  DB_KEY_CANDIDATE_CACHE.at = Date.now();
+  DB_KEY_CANDIDATE_CACHE.diagnostics = {
+    ...(DB_KEY_CANDIDATE_CACHE.diagnostics || {}),
+    verified_key_count: DB_KEY_CANDIDATE_CACHE.rawKeys.length,
+    total_candidate_count: Math.max(Number(DB_KEY_CANDIDATE_CACHE.diagnostics?.total_candidate_count || 0), DB_KEY_CANDIDATE_CACHE.rawKeys.length),
+  };
 }
 
 function isPersistableManualKey(key) {

@@ -5,19 +5,20 @@ export async function ensureDir(dir) {
   await fsp.mkdir(dir, { recursive: true });
 }
 
-export async function readJson(file, fallback) {
+export async function readJson(file, fallback, { strict = false } = {}) {
   try {
     const raw = await fsp.readFile(file, 'utf-8');
     return JSON.parse(raw);
   } catch (e) {
     if (e?.code === 'ENOENT') return fallback;
+    if (strict) throw e;
     return fallback;
   }
 }
 
 export async function writeJsonAtomic(file, data) {
   await ensureDir(path.dirname(file));
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
     await fsp.writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8');
     await fsp.rename(tmp, file);

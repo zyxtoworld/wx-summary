@@ -30,6 +30,7 @@ const LAUNCHER_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'launcher-weixin-binar
 const SAVE_RENDER_BODY_LIMIT = 120 * 1024 * 1024;
 const MAX_ACTIVE_DIGEST_REQUESTS = 6;
 const DIGEST_BATCH_SETTINGS_TTL_MS = 2 * 60 * 60 * 1000;
+const MAX_DIGEST_BATCH_SETTINGS = 20;
 const SERVICE_STARTED_AT = new Date();
 let ACTIVE_SERVER = null;
 let ACTIVE_PORT = null;
@@ -124,6 +125,7 @@ async function loadDigestBatchSettings(batchId) {
   }
   const settings = await loadSettings({ includeSecrets: true });
   DIGEST_BATCH_SETTINGS.set(id, { settings, created_at: now });
+  trimDigestBatchSettings();
   return settings;
 }
 
@@ -132,6 +134,16 @@ function cleanupDigestBatchSettings(now = Date.now()) {
     if (!item?.created_at || now - item.created_at > DIGEST_BATCH_SETTINGS_TTL_MS) {
       DIGEST_BATCH_SETTINGS.delete(id);
     }
+  }
+  trimDigestBatchSettings();
+}
+
+function trimDigestBatchSettings() {
+  while (DIGEST_BATCH_SETTINGS.size > MAX_DIGEST_BATCH_SETTINGS) {
+    const oldest = [...DIGEST_BATCH_SETTINGS.entries()]
+      .sort((a, b) => Number(a[1]?.created_at || 0) - Number(b[1]?.created_at || 0))[0]?.[0];
+    if (!oldest) break;
+    DIGEST_BATCH_SETTINGS.delete(oldest);
   }
 }
 
@@ -454,6 +466,12 @@ async function currentAssetVersion() {
 
 async function readBody(req, maxBytes = 20 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length'] || 0);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      reject(Object.assign(new Error('Request body too large'), { status: 413 }));
+      req.destroy();
+      return;
+    }
     const chunks = [];
     let size = 0;
     req.on('data', chunk => {
@@ -495,6 +513,18 @@ function assertApiAccess(req, parsedUrl) {
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
     assertJsonMutationRequest(req);
   }
+}
+
+async function sanitizedLogTail(limit = 200, loadedSettings = null) {
+  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 200));
+  const settings = loadedSettings || await loadSettings();
+  let logFile = path.join(TMP_DIR, 'wx-summary.log');
+  try {
+    logFile = resolveInsideTmp(settings.logging.file || './outputs/.tmp/wx-summary.log', 'logging.file');
+  } catch {}
+  const log = await fsp.readFile(logFile, 'utf-8').catch(() => '');
+  const lines = log.split(/\r?\n/).map(line => sanitizeText(line)).filter(Boolean).slice(-safeLimit);
+  return lines.length ? lines : (await readLogTail(safeLimit)).map(line => sanitizeText(line)).filter(Boolean);
 }
 
 async function postSaveSettingsWarnings(patch) {
@@ -816,15 +846,14 @@ async function handleApi(req, res, parsedUrl) {
     return sendJson(res, 200, { ok: true });
   }
 
+  if (pathname === '/api/logs' && req.method === 'GET') {
+    const limit = parsedUrl.searchParams.get('limit') || 200;
+    return sendJson(res, 200, { ok: true, log_tail: await sanitizedLogTail(limit) });
+  }
+
   if (pathname === '/api/diagnostics' && req.method === 'GET') {
     const settings = await loadSettings();
-    let logFile = path.join(TMP_DIR, 'wx-summary.log');
-    try {
-      logFile = resolveInsideTmp(settings.logging.file || './outputs/.tmp/wx-summary.log', 'logging.file');
-    } catch {}
-    const log = await fsp.readFile(logFile, 'utf-8').catch(() => '');
-    const lines = log.split(/\r?\n/).map(line => sanitizeText(line)).filter(Boolean).slice(-200);
-    const logTail = lines.length ? lines : (await readLogTail(200)).map(line => sanitizeText(line)).filter(Boolean);
+    const logTail = await sanitizedLogTail(200, settings);
     const currentBinary = await getWeixinBinaryEvidence().catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) }));
     const weixinModules = await getWeixinModuleEvidence().catch(e => ({ ok: false, error: sanitizeText(e?.message || String(e)) }));
     const mediaTools = await probeMediaTools().catch(e => ({ error: sanitizeText(e?.message || String(e)) }));

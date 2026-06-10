@@ -50,26 +50,28 @@ async function api(path, opts = {}) {
 }
 
 // ---------- 主题 ----------
+function effectiveAppTheme() {
+  const selected = document.documentElement.dataset.theme;
+  if (selected === 'dark' || selected === 'light') return selected;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function paintThemeToggle() {
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.textContent = effectiveAppTheme() === 'dark' ? '🌙' : '☀';
+}
+
 function applySystemTheme() {
   const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
   document.body.classList.toggle('is-dark', isDark);
-  const btn = document.getElementById('theme-toggle');
-  if (btn) btn.textContent = isDark ? '🌙' : '☀';
+  paintThemeToggle();
 }
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applySystemTheme);
 applySystemTheme();
 
 document.getElementById('theme-toggle').addEventListener('click', () => {
-  const cur = document.documentElement.dataset.theme;
-  if (cur === 'dark') {
-    document.documentElement.dataset.theme = 'light';
-    document.body.classList.remove('is-dark');
-    document.getElementById('theme-toggle').textContent = '☀';
-  } else {
-    document.documentElement.dataset.theme = 'dark';
-    document.body.classList.add('is-dark');
-    document.getElementById('theme-toggle').textContent = '🌙';
-  }
+  document.documentElement.dataset.theme = effectiveAppTheme() === 'dark' ? 'light' : 'dark';
+  paintThemeToggle();
 });
 
 // ---------- 路由 ----------
@@ -414,6 +416,15 @@ function ensureCustomRangeDefaults() {
   _state_digest.customUntil = _state_digest.customUntil || r.until;
 }
 
+function normalizeCustomRangeMinutes() {
+  for (const key of ['customSince', 'customUntil']) {
+    const parsed = parseLocalDateTime(_state_digest[key]);
+    if (!parsed) continue;
+    parsed.setMinutes(Math.floor(parsed.getMinutes() / 5) * 5, 0, 0);
+    _state_digest[key] = fmtDateTime(parsed);
+  }
+}
+
 function paintCustomRangeFields() {
   const start = document.getElementById('range-start-text');
   const end = document.getElementById('range-end-text');
@@ -517,7 +528,8 @@ function outputDirLooksInsideProject(dir, projectRoot) {
 function updateCustomRangeDate(dateText) {
   const current = parseLocalDateTime(_state_digest.customRangeSide === 'since' ? _state_digest.customSince : _state_digest.customUntil) || new Date();
   const [y, m, d] = String(dateText).split('-').map(Number);
-  const next = new Date(y, m - 1, d, current.getHours(), current.getMinutes(), 0, 0);
+  const minute = Math.floor(current.getMinutes() / 5) * 5;
+  const next = new Date(y, m - 1, d, current.getHours(), minute, 0, 0);
   commitCustomRangeSide(next);
 }
 
@@ -747,6 +759,7 @@ async function renderDigest() {
   const $qr = document.getElementById('quick-range');
   const $cr = document.getElementById('custom-range');
   setupCustomRangePicker();
+  syncDigestControlsFromState();
   $qr.addEventListener('click', e => {
     const btn = e.target.closest('button[data-range]');
     if (!btn) return;
@@ -765,20 +778,29 @@ async function renderDigest() {
   document.querySelectorAll('.chip-input').forEach(box => {
     const name = box.dataset.name;
     const inp = box.querySelector('input');
-    function addChip(v) {
+    function removeChip(span, value) {
+      _state_digest.filters[name] = _state_digest.filters[name].filter(x => x !== value);
+      span.remove();
+    }
+    function renderChip(value) {
+      const span = document.createElement('span');
+      span.className = 'chip';
+      span.append(document.createTextNode(value + ' '));
+      const close = document.createElement('span');
+      close.className = 'x';
+      close.textContent = '×';
+      span.append(close);
+      close.addEventListener('click', () => removeChip(span, value));
+      box.insertBefore(span, inp);
+    }
+    function addChip(v, { syncState = true } = {}) {
       v = v.trim();
       if (!v) return;
       if (_state_digest.filters[name].includes(v)) return;
-      _state_digest.filters[name].push(v);
-      const span = document.createElement('span');
-      span.className = 'chip';
-      span.innerHTML = `${v} <span class="x">×</span>`;
-      span.querySelector('.x').addEventListener('click', () => {
-        _state_digest.filters[name] = _state_digest.filters[name].filter(x => x !== v);
-        span.remove();
-      });
-      box.insertBefore(span, inp);
+      if (syncState) _state_digest.filters[name].push(v);
+      renderChip(v);
     }
+    (_state_digest.filters[name] || []).forEach(v => renderChip(v));
     box._commitPendingChip = () => {
       const value = inp.value.trim();
       if (!value) return;
@@ -793,8 +815,7 @@ async function renderDigest() {
         const last = box.querySelectorAll('.chip');
         if (last.length) {
           const v = last[last.length - 1].textContent.trim().replace(/×$/, '').trim();
-          _state_digest.filters[name] = _state_digest.filters[name].filter(x => x !== v);
-          last[last.length - 1].remove();
+          removeChip(last[last.length - 1], v);
         }
       }
     });
@@ -806,6 +827,10 @@ async function renderDigest() {
       if (cb.checked) _state_digest.filters.excludeTypes.add(cb.value);
       else _state_digest.filters.excludeTypes.delete(cb.value);
     });
+  });
+  document.getElementById('min-messages')?.addEventListener('change', e => {
+    _state_digest.minMessages = Math.max(1, parseInt(e.target.value || '5', 10) || 5);
+    e.target.value = _state_digest.minMessages;
   });
 
   // 生成按钮
@@ -874,6 +899,31 @@ async function renderDigest() {
 
   restoreDigestOutputs();
   ensureKeyboardShortcuts();
+}
+
+function syncDigestControlsFromState() {
+  const activeRange = document.querySelector(`#quick-range button[data-range="${_state_digest.rangeKey}"]`)
+    || document.querySelector('#quick-range button[data-range="last1d"]');
+  if (activeRange) {
+    document.querySelectorAll('#quick-range button[data-range]').forEach(button => {
+      button.classList.toggle('active', button === activeRange);
+    });
+    _state_digest.rangeKey = activeRange.dataset.range || 'last1d';
+  }
+  const customRange = document.getElementById('custom-range');
+  if (_state_digest.rangeKey === 'custom') {
+    customRange?.classList.remove('hidden');
+    ensureCustomRangeDefaults();
+    normalizeCustomRangeMinutes();
+    paintCustomRangeFields();
+  } else {
+    customRange?.classList.add('hidden');
+  }
+  document.querySelectorAll('input[name="ex"]').forEach(cb => {
+    cb.checked = _state_digest.filters.excludeTypes.has(cb.value);
+  });
+  const minMessages = document.getElementById('min-messages');
+  if (minMessages) minMessages.value = _state_digest.minMessages;
 }
 
 function applyDigestRenderDefaults(renderSettings = {}) {
@@ -1452,8 +1502,8 @@ async function toggleProgressLog() {
   status.className = 'status';
   status.textContent = '正在读取日志...';
   try {
-    const diag = await api('/api/diagnostics');
-    const lines = Array.isArray(diag.log_tail) ? diag.log_tail.slice(-80) : [];
+    const result = await api('/api/logs?limit=80');
+    const lines = Array.isArray(result.log_tail) ? result.log_tail.slice(-80) : [];
     log.textContent = lines.length ? lines.join('\n') : '暂无可显示的运行日志。';
     log.classList.remove('hidden');
     status.className = 'status';
@@ -1594,7 +1644,7 @@ function digestQuotesForRender(d = {}) {
 function digestLinksForRender(d = {}) {
   const links = Array.isArray(d.links) ? d.links : [];
   return links
-    .filter(link => link && !isLowValueDigestLink(link) && isRenderableDigestUrl(link.url))
+    .filter(link => link && isRenderableDigestUrl(link.url))
     .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
     .slice(0, 12);
 }
@@ -2224,8 +2274,10 @@ async function renderHistory() {
   }
   function paint(filter = '') {
     const f = filter.trim().toLowerCase();
-    $grid.innerHTML = list
-      .filter(it => !f || historySearchText(it).includes(f))
+    const filtered = list.filter(it => !f || historySearchText(it).includes(f));
+    $empty.classList.toggle('hidden', filtered.length > 0);
+    $empty.textContent = filtered.length ? '' : (f ? '没有匹配的历史摘要。' : '还没有摘要记录。回到「总结」页生成一个吧。');
+    $grid.innerHTML = filtered
       .map(it => {
         const version = historyItemCacheBust(it);
         return `
@@ -2589,6 +2641,7 @@ async function renderSettings() {
   // 群与调度
   const $wl = document.getElementById('s-whitelist');
   let groups = [];
+  let groupsLoaded = false;
   let schedulerOverrides = Array.isArray(s.scheduler.per_group) ? s.scheduler.per_group.map(item => ({
     group: item.group || item.group_id || '',
     keywords: Array.isArray(item.keywords) ? item.keywords : String(item.keywords || '').split(/[,，]/).map(x => x.trim()).filter(Boolean),
@@ -2596,9 +2649,10 @@ async function renderSettings() {
   })).filter(item => item.group && (item.keywords.length || item.min_messages)) : [];
   try {
     groups = await api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`);
+    groupsLoaded = true;
   } catch (e) {
     groups = [];
-    $wl.innerHTML = `<p class="empty">读取本机微信群列表失败：${escapeHtml(e.message || '未知错误')}</p>`;
+    $wl.innerHTML = `<p class="empty">读取本机微信群列表失败：${escapeHtml(e.message || '未知错误')}。保存调度设置时会保留原白名单，不会清空。</p>`;
   }
   function paintWl() {
     if (!groups.length) return;
@@ -2673,9 +2727,11 @@ async function renderSettings() {
   }
   api('/api/scheduler/status').then(r => paintSchedulerStatus(r.scheduler)).catch(() => paintSchedulerStatus({ enabled: !!s.scheduler.enabled }));
   document.getElementById('s-save-groups').addEventListener('click', async () => {
-    const wl = [...document.querySelectorAll('#s-whitelist input:checked')].map(i => i.value);
+    const wl = groupsLoaded
+      ? [...document.querySelectorAll('#s-whitelist input:checked')].map(i => i.value)
+      : (Array.isArray(s.groups?.whitelist) ? s.groups.whitelist : []);
     schedulerStatus.className = 'status';
-    schedulerStatus.textContent = '保存中...';
+    schedulerStatus.textContent = groupsLoaded ? '保存中...' : '保存中（保留原白名单）...';
     try {
       await api('/api/settings', {
         method: 'PUT',
@@ -2691,7 +2747,7 @@ async function renderSettings() {
         },
       });
       schedulerStatus.className = 'status ok';
-      schedulerStatus.textContent = '✓ 已保存白名单与调度设置';
+      schedulerStatus.textContent = groupsLoaded ? '✓ 已保存白名单与调度设置' : '✓ 已保存调度设置，原白名单已保留';
       const r = await api('/api/scheduler/status').catch(() => null);
       if (r?.scheduler) paintSchedulerStatus(r.scheduler);
     } catch (e) {
@@ -2961,8 +3017,10 @@ async function renderSetup() {
   const $back = document.getElementById('setup-back');
   const $next = document.getElementById('setup-next');
   const wizardData = { llm: {}, wechat: {}, whitelist: new Set() };
+  let setupPaintSeq = 0;
 
   function paint() {
+    const paintSeq = ++setupPaintSeq;
     $step.textContent = step;
     $back.disabled = step === 1;
     $next.textContent = step === 4 ? '完成' : '下一步';
@@ -3032,7 +3090,13 @@ async function renderSetup() {
         <span class="status" id="w-key-status"></span>`;
     } else if (step === 4) {
       $title.textContent = '选择群白名单';
+      $next.disabled = true;
+      $next.textContent = '读取群列表...';
+      $body.innerHTML = '<p class="muted small">正在读取本机微信群列表...</p>';
       api(`/api/groups?account=${encodeURIComponent(selectedAccountId())}`).then(groups => {
+        if (step !== 4 || paintSeq !== setupPaintSeq) return;
+        $next.disabled = false;
+        $next.textContent = '完成';
         $body.innerHTML = `
           <p class="muted small">勾选你常看的群，加入白名单。也可以全部跳过。</p>
           <div class="setup-whitelist-tools">
@@ -3076,7 +3140,10 @@ async function renderSetup() {
         });
         paintWhitelist();
       }).catch(e => {
-        $body.innerHTML = `<p class="status err">读取本机微信群列表失败：${escapeHtml(e.message || '未知错误')}</p>`;
+        if (step !== 4 || paintSeq !== setupPaintSeq) return;
+        $next.disabled = false;
+        $next.textContent = '跳过白名单并完成';
+        $body.innerHTML = `<p class="status err">读取本机微信群列表失败：${escapeHtml(e.message || '未知错误')}</p><p class="muted small">可以返回重试，也可以跳过白名单先完成配置。</p>`;
       });
     }
   }

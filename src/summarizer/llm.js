@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import net from 'node:net';
 import { normalizeBaseUrl, rememberModels } from '../config/settings.js';
 
 const MODEL_CACHE = new Map();
@@ -233,7 +234,12 @@ async function testOpenAiChat({ base_url, api_key, model, timeout_ms }) {
     timeout_ms,
     api_key,
   });
-  const text = json?.choices?.[0]?.message?.content;
+  const choice = json?.choices?.[0] || {};
+  const finishReason = String(choice.finish_reason || '').toLowerCase();
+  if (finishReason === 'length' || finishReason === 'max_tokens') {
+    throw httpError(502, 'Model output was truncated by token limit');
+  }
+  const text = choice.message?.content;
   if (!text) throw httpError(502, 'Chat returned empty content');
   return text;
 }
@@ -395,7 +401,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     signal,
     onProgress,
   });
-  assertDigestPublishable(raw);
+  assertDigestPublishable(raw, { messageCount: messages.length });
 
   return normalizeDigest(raw, {
     groupName,
@@ -802,7 +808,7 @@ function dedupeLinks(links) {
 
 function publicDigestLinks(links, limit = 12) {
   return arrayOf(links)
-    .filter(link => !isLowValueDigestLink(link))
+    .filter(link => isAnalyzableWebLinkUrl(link?.url))
     .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
     .slice(0, limit);
 }
@@ -1353,6 +1359,7 @@ function isIgnoredWebLinkUrl(value) {
     const parsed = new URL(String(value || '').trim());
     const host = parsed.hostname.toLowerCase();
     const pathname = parsed.pathname.toLowerCase();
+    if (isPrivateOrLocalHost(host)) return true;
     if (host === 'mp.weixin.qq.com' && (pathname.startsWith('/mp/wappoc_appmsgcaptcha') || pathname.startsWith('/mp/waerrpage'))) return true;
     if (host === 'support.weixin.qq.com' && (pathname.startsWith('/cgi-bin/mmsupport-bin/readtemplate') || pathname.startsWith('/update'))) return true;
     if (host === 'wxapp.tenpay.com' && pathname.startsWith('/mmpayhb/')) return true;
@@ -1360,6 +1367,35 @@ function isIgnoredWebLinkUrl(value) {
   } catch {
     return true;
   }
+}
+
+function isPrivateOrLocalHost(hostname = '') {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (host === 'localhost' || host === 'localhost.localdomain' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
+  if (host === 'metadata.google.internal') return true;
+  const ipVersion = net.isIP(host);
+  if (ipVersion === 4) {
+    const parts = host.split('.').map(Number);
+    const [a, b] = parts;
+    return a === 0
+      || a === 10
+      || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 100 && b >= 64 && b <= 127)
+      || a >= 224;
+  }
+  if (ipVersion === 6) {
+    return host === '::1'
+      || host === '::'
+      || host.startsWith('fc')
+      || host.startsWith('fd')
+      || host.startsWith('fe80:')
+      || host.startsWith('ff');
+  }
+  return false;
 }
 
 function isMediaContentType(contentType = '') {
@@ -2199,24 +2235,41 @@ function cleanupAiStyleText(value) {
   return text.replace(/\s+/g, ' ').trim();
 }
 
-function assertDigestPublishable(raw = {}) {
-  const report = digestPublishabilityReport(raw);
+function assertDigestPublishable(raw = {}, context = {}) {
+  const report = digestPublishabilityReport(raw, context);
   if (!report.blocked) return;
   throw httpError(
     502,
-    `AI 合并结果疑似把分段兜底或原始时间线写进了长图（${report.reason}）；为避免生成不可读或误导性的群总结，本次未保存。可稍后重试，或缩短时间范围再生成。`,
+    `AI 输出未通过成品质量检查（${report.reason}）；为避免生成空洞或误导性的群总结，本次未保存。可稍后重试，或缩短时间范围再生成。`,
   );
 }
 
-function digestPublishabilityReport(raw = {}) {
+function digestPublishabilityReport(raw = {}, context = {}) {
   const topics = arrayOf(raw?.topics);
+  const links = arrayOf(raw?.links);
+  const quotes = arrayOf(raw?.quotes);
+  const highlights = arrayOf(raw?.highlights).map(cleanField).filter(Boolean);
+  const messageCount = Number(context.messageCount || 0);
   const visibleTexts = digestQualityVisibleTexts(raw);
   const leakCount = visibleTexts.filter(text => DIGEST_FALLBACK_LEAK_RE.test(text)).length;
   const fallbackTopicCount = topics.filter(topic => DIGEST_FALLBACK_TOPIC_RE.test(`${topic?.title || ''} ${topic?.category || ''} ${topic?.summary || ''}`)).length;
   const badHeadline = DIGEST_BAD_HEADLINE_RE.test(cleanField(raw?.headline));
+  const effectiveTopics = topics.filter(topic => cleanField(topic?.title).length >= 2 && cleanField(topic?.summary).length >= 12);
+  const effectiveLinks = links.filter(link => isAnalyzableWebLinkUrl(link?.url));
+  const effectiveQuotes = quotes.filter(quote => cleanField(typeof quote === 'string' ? quote : quote?.text).length >= 4);
+  const sparse = messageCount >= 5
+    && effectiveTopics.length === 0
+    && effectiveLinks.length === 0
+    && effectiveQuotes.length === 0
+    && highlights.length === 0;
+  const veryThin = messageCount >= 20
+    && effectiveTopics.length === 0
+    && highlights.length < 2;
   const repeatedFallback = fallbackTopicCount >= 3 || (fallbackTopicCount >= 2 && fallbackTopicCount >= Math.ceil(Math.max(1, topics.length) * 0.25));
-  const blocked = (badHeadline && leakCount > 0) || repeatedFallback || leakCount >= 4;
+  const blocked = sparse || veryThin || (badHeadline && leakCount > 0) || repeatedFallback || leakCount >= 4;
   const reason = [
+    sparse ? '模型返回内容过空' : '',
+    veryThin ? '话题提炼不足' : '',
     badHeadline ? '标题像分段兜底' : '',
     leakCount ? `正文命中 ${leakCount} 处兜底/原始时间线痕迹` : '',
     fallbackTopicCount ? `${fallbackTopicCount}/${Math.max(1, topics.length)} 个话题像失败分段` : '',
@@ -2298,7 +2351,12 @@ async function callOpenAI({ settings, model, system, user, intro, blocks = [], s
     api_key: settings.llm.api_key,
     signal,
   }));
-  const text = json?.choices?.[0]?.message?.content;
+  const choice = json?.choices?.[0] || {};
+  const finishReason = String(choice.finish_reason || '').toLowerCase();
+  if (finishReason === 'length' || finishReason === 'max_tokens') {
+    throw httpError(502, 'Model output was truncated by token limit');
+  }
+  const text = choice.message?.content;
   if (!text) throw httpError(502, 'Model returned empty content');
   return text;
 }
@@ -2327,6 +2385,10 @@ async function callAnthropic({ settings, model, system, user, intro, blocks = []
   const text = Array.isArray(json?.content)
     ? json.content.map(part => part.text || '').join('\n').trim()
     : '';
+  const stopReason = String(json?.stop_reason || '').toLowerCase();
+  if (stopReason === 'max_tokens') {
+    throw httpError(502, 'Model output was truncated by token limit');
+  }
   if (!text) throw httpError(502, 'Model returned empty content');
   return text;
 }
