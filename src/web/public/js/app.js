@@ -2503,6 +2503,8 @@ async function copyCanvas() {
     setTimeout(() => btn.textContent = old, 1500);
   } catch (e) {
     const digestId = _state_digest.lastSavedItem?.digest_id;
+    const browserError = compactErrorSummary(e?.message || '');
+    let systemError = '';
     if (digestId) {
       try {
         const copied = await api('/api/copy-image', { method: 'POST', body: { digest_id: digestId } });
@@ -2514,11 +2516,16 @@ async function copyCanvas() {
         }
         setTimeout(() => btn.textContent = old, 1500);
         return;
-      } catch {}
+      } catch (fallbackError) {
+        systemError = compactErrorSummary(fallbackError?.message || '');
+      }
     }
     if (status) {
       status.className = 'status err';
-      status.textContent = '复制失败：浏览器和系统剪贴板都拒绝写入，请改用「下载 PNG」。';
+      const details = [browserError && `浏览器：${browserError}`, systemError && `系统：${systemError}`].filter(Boolean).join('；');
+      status.textContent = details
+        ? `复制失败：${details}。请改用「下载 PNG」。`
+        : '复制失败：浏览器和系统剪贴板都拒绝写入，请改用「下载 PNG」。';
     }
   }
 }
@@ -2614,10 +2621,8 @@ function historyItemCacheBust(item = {}) {
 function showHistoryModal(item) {
   const imageUrl = historyImageUrl(item.digest_id, historyItemCacheBust(item));
   const serverRerenderSupported = supportsServerRerender();
-  const canRerender = !!item.digest_path && serverRerenderSupported;
-  const rerenderTitle = !item.digest_path
-    ? '旧记录缺少摘要 JSON，生成新摘要后可用'
-    : serverRerenderSupported
+  const canRerender = serverRerenderSupported;
+  const rerenderTitle = serverRerenderSupported
       ? ''
       : '当前系统不支持历史重新渲染；请回到总结页重新生成摘要长图';
   const modal = document.createElement('div');
@@ -2643,10 +2648,30 @@ function showHistoryModal(item) {
   modal.querySelector('[data-close]').addEventListener('click', () => modal.remove());
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
   const status = modal.querySelector('[data-status]');
-  modal.querySelector('[data-zoomable]').addEventListener('click', () => {
+  const image = modal.querySelector('[data-zoomable]');
+  const downloadButton = modal.querySelector('[data-download]');
+  const copyButton = modal.querySelector('[data-copy]');
+  const revealButton = modal.querySelector('[data-reveal]');
+  const disableImageActions = () => {
+    copyButton.disabled = true;
+    revealButton.disabled = true;
+    downloadButton.classList.add('disabled');
+    downloadButton.removeAttribute('href');
+    downloadButton.removeAttribute('download');
+    status.className = 'status err';
+    status.textContent = '长图加载失败：文件可能已被移动或删除。';
+  };
+  image.addEventListener('load', () => {
+    copyButton.disabled = false;
+    revealButton.disabled = false;
+  }, { once: true });
+  image.addEventListener('error', disableImageActions, { once: true });
+  if (image.complete && image.naturalWidth === 0) disableImageActions();
+  image.addEventListener('click', () => {
+    if (!image.complete || image.naturalWidth === 0) return;
     showImageZoomModal({ title: item.group, src: historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now()) });
   });
-  modal.querySelector('[data-reveal]').addEventListener('click', async () => {
+  revealButton.addEventListener('click', async () => {
     status.className = 'status';
     status.textContent = '正在打开文件夹...';
     try {
@@ -2658,7 +2683,7 @@ function showHistoryModal(item) {
       status.textContent = `打开失败：${e.message || '未知错误'}`;
     }
   });
-  modal.querySelector('[data-copy]').addEventListener('click', async () => {
+  copyButton.addEventListener('click', async () => {
     status.className = 'status';
     status.textContent = '复制中...';
     try {
@@ -2667,7 +2692,7 @@ function showHistoryModal(item) {
       status.className = 'status ok';
       const size = imageSizeLabel(copied);
       status.textContent = size ? `✓ 已复制到剪贴板（${size}）` : '✓ 已复制到剪贴板';
-    } catch {
+    } catch (browserError) {
       try {
         const copied = await api('/api/copy-image', { method: 'POST', body: { digest_id: item.digest_id } });
         status.className = 'status ok';
@@ -2675,7 +2700,11 @@ function showHistoryModal(item) {
         status.textContent = size ? `✓ 已通过系统剪贴板复制（${size}）` : '✓ 已通过系统剪贴板复制';
       } catch (e) {
         status.className = 'status err';
-        status.textContent = `复制失败：${e.message || '请下载 PNG'}`;
+        const details = [
+          browserError?.message && `浏览器：${compactErrorSummary(browserError.message)}`,
+          e?.message && `系统：${compactErrorSummary(e.message)}`,
+        ].filter(Boolean).join('；');
+        status.textContent = details ? `复制失败：${details}。请下载 PNG。` : '复制失败，请下载 PNG。';
       }
     }
   });
@@ -2711,7 +2740,7 @@ function historyThumbUrl(digestId, cacheBust = '') {
 
 async function copyImageUrlToClipboard(url) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error('image fetch failed');
+  if (!res.ok) throw new Error(parseHttpErrorMessage(await res.text(), res.status));
   const blob = await res.blob();
   await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
   if (typeof createImageBitmap === 'function') {

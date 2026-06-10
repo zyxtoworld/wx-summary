@@ -252,24 +252,80 @@ async function gracefulShutdown(code = 0) {
   process.exit(code);
 }
 
-function revealInFolder(targetPath) {
-  let child;
+function openerLaunchError(command, err) {
+  const message = sanitizeText(err?.message || String(err));
+  const out = new Error(`无法启动 ${command}：${message}`);
+  out.status = 500;
+  return out;
+}
+
+function launchDetachedOpener(command, args, options = {}, result = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(command, args, { detached: true, stdio: 'ignore', ...options });
+    } catch (err) {
+      reject(openerLaunchError(command, err));
+      return;
+    }
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off('spawn', onSpawn);
+    };
+    const onSpawn = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      child.unref();
+      resolve(result);
+    };
+    const onError = err => {
+      if (settled) {
+        logWarn('opener_late_error', { opener: command, error: sanitizeText(err?.message || String(err)) });
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(openerLaunchError(command, err));
+    };
+    child.once('spawn', onSpawn);
+    child.once('error', onError);
+    timer = setTimeout(onSpawn, 1000);
+  });
+}
+
+async function revealInFolder(targetPath) {
+  let command;
+  let args;
+  let options = {};
   let result;
   if (process.platform === 'win32') {
-    child = spawn('explorer.exe', ['/select,', targetPath], { detached: true, stdio: 'ignore', windowsHide: true });
+    command = 'explorer.exe';
+    args = ['/select,', targetPath];
+    options = { windowsHide: true };
     result = { platform: 'win32', opener: 'explorer.exe', mode: 'select' };
   } else if (process.platform === 'darwin') {
-    child = spawn('open', ['-R', targetPath], { detached: true, stdio: 'ignore' });
+    command = 'open';
+    args = ['-R', targetPath];
     result = { platform: 'darwin', opener: 'open', mode: 'reveal' };
   } else {
-    child = spawn('xdg-open', [path.dirname(targetPath)], { detached: true, stdio: 'ignore' });
+    command = 'xdg-open';
+    args = [path.dirname(targetPath)];
     result = { platform: process.platform, opener: 'xdg-open', mode: 'open_parent' };
   }
-  child.on('error', err => {
-    logWarn('reveal_in_folder_failed', { opener: result.opener, mode: result.mode, error: sanitizeText(err?.message || String(err)) });
-  });
-  child.unref();
-  return result;
+  return launchDetachedOpener(command, args, options, result);
+}
+
+async function openDirectoryInSystem(dir) {
+  if (process.platform === 'win32') {
+    return launchDetachedOpener('explorer.exe', [dir], { windowsHide: true }, { platform: 'win32', opener: 'explorer.exe', mode: 'open_dir' });
+  }
+  if (process.platform === 'darwin') {
+    return launchDetachedOpener('open', [dir], {}, { platform: 'darwin', opener: 'open', mode: 'open_dir' });
+  }
+  return launchDetachedOpener('xdg-open', [dir], {}, { platform: process.platform, opener: 'xdg-open', mode: 'open_dir' });
 }
 
 function copyPngToClipboard(targetPath) {
@@ -825,7 +881,7 @@ async function handleApi(req, res, parsedUrl) {
       target = item?.file_path || '';
     }
     const file = await assertRevealable(settings, target, { extensions: ['.png'] });
-    const reveal = revealInFolder(file);
+    const reveal = await revealInFolder(file);
     recordRevealEvidence(file, reveal);
     return sendJson(res, 200, { ok: true, reveal });
   }
@@ -869,14 +925,8 @@ async function handleApi(req, res, parsedUrl) {
       output: { ...settings.output, dir: requestedDir || settings.output?.dir },
     });
     await fsp.mkdir(dir, { recursive: true });
-    if (process.platform === 'win32') {
-      spawn('explorer.exe', [dir], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-    } else if (process.platform === 'darwin') {
-      spawn('open', [dir], { detached: true, stdio: 'ignore' }).unref();
-    } else {
-      spawn('xdg-open', [dir], { detached: true, stdio: 'ignore' }).unref();
-    }
-    return sendJson(res, 200, { ok: true });
+    const opener = await openDirectoryInSystem(dir);
+    return sendJson(res, 200, { ok: true, opener });
   }
 
   if (pathname === '/api/logs' && req.method === 'GET') {
