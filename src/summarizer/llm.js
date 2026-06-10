@@ -380,12 +380,8 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
         onProgress,
       });
     } catch (firstError) {
-      const chunks = splitMessages(
-        enriched,
-        llm.max_messages_per_call || DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL,
-        llm.max_input_chars || DEFAULT_FALLBACK_MAX_INPUT_CHARS,
-        llm.max_image_chars_per_call || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
-      );
+      const limits = digestChunkLimits(llm);
+      const chunks = splitMessages(enriched, limits.maxMessages, limits.maxChars, limits.maxMediaChars);
       if (!isLikelyChunkableFailure(firstError) || chunks.length <= 1) throw firstError;
 
       try {
@@ -1035,30 +1031,18 @@ function fallbackLinksFromChunk(chunk = []) {
 }
 
 function buildDigestChunkPlan(messages, llm = {}) {
-  const stats = {
-    messages: messages.length,
-    textChars: estimateMessageTextChars(messages),
-    mediaChars: estimateMediaPayloadChars(messages),
-  };
+  const { maxMessages, maxChars, maxMediaChars } = digestChunkLimits(llm);
+  const stats = estimateMessageBundleStats(messages);
   const reasons = [];
-  if (stats.messages > ADAPTIVE_CHUNK_MESSAGE_THRESHOLD) reasons.push(`${stats.messages} 条消息`);
-  if (stats.textChars > ADAPTIVE_CHUNK_TEXT_THRESHOLD) reasons.push(`约 ${stats.textChars} 字符输入`);
-  if (stats.mediaChars > ADAPTIVE_CHUNK_MEDIA_THRESHOLD) reasons.push(`约 ${Math.round(stats.mediaChars / 1024)}KB 媒体附件`);
+  if (stats.messages > maxMessages) reasons.push(`${stats.messages} 条消息超过每段 ${maxMessages}`);
+  if (stats.textChars > maxChars) reasons.push(`约 ${stats.textChars} 字符输入超过每段 ${maxChars}`);
+  if (stats.mediaChars > maxMediaChars) reasons.push(`约 ${Math.round(stats.mediaChars / 1024)}KB 媒体附件超过每段 ${Math.round(maxMediaChars / 1024)}KB`);
+  if (stats.messages > ADAPTIVE_CHUNK_MESSAGE_THRESHOLD && stats.messages <= maxMessages) reasons.push(`${stats.messages} 条消息`);
+  if (stats.textChars > ADAPTIVE_CHUNK_TEXT_THRESHOLD && stats.textChars <= maxChars) reasons.push(`约 ${stats.textChars} 字符输入`);
+  if (stats.mediaChars > ADAPTIVE_CHUNK_MEDIA_THRESHOLD && stats.mediaChars <= maxMediaChars) reasons.push(`约 ${Math.round(stats.mediaChars / 1024)}KB 媒体附件`);
   if (!reasons.length) return { useChunks: false, chunks: [messages], stats, reason: '' };
 
-  const maxMessages = Math.min(
-    Math.max(1, Number(llm.max_messages_per_call || DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL)),
-    ADAPTIVE_CHUNK_MAX_MESSAGES,
-  );
-  const maxChars = Math.min(
-    Math.max(1000, Number(llm.max_input_chars || DEFAULT_FALLBACK_MAX_INPUT_CHARS)),
-    ADAPTIVE_CHUNK_MAX_INPUT_CHARS,
-  );
-  const maxImageChars = Math.min(
-    Math.max(100000, Number(llm.max_image_chars_per_call || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL)),
-    DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
-  );
-  const chunks = splitMessages(messages, maxMessages, maxChars, maxImageChars);
+  const chunks = splitMessages(messages, maxMessages, maxChars, maxMediaChars);
   return {
     useChunks: chunks.length > 1,
     chunks,
@@ -1067,12 +1051,72 @@ function buildDigestChunkPlan(messages, llm = {}) {
   };
 }
 
+function digestChunkLimits(llm = {}) {
+  return {
+    maxMessages: Math.min(
+      Math.max(1, Number(llm.max_messages_per_call || DEFAULT_FALLBACK_MAX_MESSAGES_PER_CALL)),
+      ADAPTIVE_CHUNK_MAX_MESSAGES,
+    ),
+    maxChars: Math.min(
+      Math.max(1000, Number(llm.max_input_chars || DEFAULT_FALLBACK_MAX_INPUT_CHARS)),
+      ADAPTIVE_CHUNK_MAX_INPUT_CHARS,
+    ),
+    maxMediaChars: Math.min(
+      Math.max(100000, Number(llm.max_image_chars_per_call || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL)),
+      DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL,
+    ),
+  };
+}
+
 function estimateMessageTextChars(messages) {
-  return messages.reduce((n, msg) => n + formatMessageLine(msg).length + 1, 0);
+  return estimateMessageBundleStats(messages).textChars;
 }
 
 function estimateMediaPayloadChars(messages) {
   return messages.reduce((n, msg) => n + mediaPayloadChars(msg), 0);
+}
+
+function estimateMessageBundleStats(messages = []) {
+  let textChars = 0;
+  let imageChars = 0;
+  let audioChars = 0;
+  let imageCount = 0;
+  let audioCount = 0;
+  let linkPreviewCount = 0;
+  for (let index = 0; index < messages.length; index++) {
+    const cost = estimateMessageBundleItemCost(messages, index, { imageCount, audioCount });
+    textChars += cost.textChars;
+    imageChars += cost.imageChars;
+    audioChars += cost.audioChars;
+    imageCount += cost.imageCount;
+    audioCount += cost.audioCount;
+    linkPreviewCount += cost.linkPreviewCount;
+  }
+  return {
+    messages: messages.length,
+    textChars,
+    mediaChars: imageChars + audioChars,
+    imageChars,
+    audioChars,
+    imageCount,
+    audioCount,
+    linkPreviewCount,
+  };
+}
+
+function estimateMessageBundleItemCost(messages = [], index = 0, counters = {}) {
+  const msg = messages[index] || {};
+  const refs = messageBundleRefs(msg, counters.imageCount || 0, counters.audioCount || 0);
+  const context = messageNeedsContext(msg) ? buildNearbyChatContext(messages, index) : '';
+  const line = formatMessageLine(msg, { imageRef: refs.imageRef, audioRef: refs.audioRef, context });
+  return {
+    textChars: line.length + 1,
+    imageChars: refs.visualUrl ? refs.visualUrl.length : 0,
+    audioChars: refs.audioDataUrl ? refs.audioDataUrl.length : 0,
+    imageCount: refs.imageRef ? 1 : 0,
+    audioCount: refs.audioRef ? 1 : 0,
+    linkPreviewCount: Array.isArray(msg.link_previews) ? msg.link_previews.length : 0,
+  };
 }
 
 function digestChunkConcurrency(settings = {}) {
@@ -1092,32 +1136,42 @@ async function mapWithConcurrency(items, concurrency, worker) {
   await Promise.all(workers);
 }
 
-function splitMessages(messages, maxMessages, maxChars, maxImageChars = DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL) {
+function splitMessages(messages, maxMessages, maxChars, maxMediaChars = DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL) {
   const chunks = [];
   let cur = [];
   let chars = 0;
-  let imageChars = 0;
+  let mediaChars = 0;
+  let imageCount = 0;
+  let audioCount = 0;
   const messageLimit = Math.max(1, Number(maxMessages || 800));
   const charLimit = Math.max(1000, Number(maxChars || 60000));
-  const imageCharLimit = Math.max(100000, Number(maxImageChars || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL));
+  const mediaCharLimit = Math.max(100000, Number(maxMediaChars || DEFAULT_MAX_IMAGE_DATA_URL_CHARS_PER_CALL));
 
-  for (const msg of messages) {
-    const line = formatMessageLine(msg);
-    const dataUrlChars = mediaPayloadChars(msg);
+  for (let index = 0; index < messages.length; index++) {
+    const msg = messages[index];
+    const cost = estimateMessageBundleItemCost(messages, index, { imageCount, audioCount });
+    const dataUrlChars = cost.imageChars + cost.audioChars;
     const shouldSplit = cur.length && (
       cur.length >= messageLimit
-      || chars + line.length > charLimit
-      || (dataUrlChars > 0 && imageChars + dataUrlChars > imageCharLimit)
+      || chars + cost.textChars > charLimit
+      || (dataUrlChars > 0 && mediaChars + dataUrlChars > mediaCharLimit)
     );
     if (shouldSplit) {
       chunks.push(cur);
       cur = [];
       chars = 0;
-      imageChars = 0;
+      mediaChars = 0;
+      imageCount = 0;
+      audioCount = 0;
     }
+    const activeCost = shouldSplit
+      ? estimateMessageBundleItemCost(messages, index, { imageCount, audioCount })
+      : cost;
     cur.push(msg);
-    chars += line.length;
-    imageChars += dataUrlChars;
+    chars += activeCost.textChars;
+    mediaChars += activeCost.imageChars + activeCost.audioChars;
+    imageCount += activeCost.imageCount;
+    audioCount += activeCost.audioCount;
   }
   if (cur.length) chunks.push(cur);
   return chunks;
@@ -1140,42 +1194,33 @@ function formatMessageBundle(messages) {
 
   for (let index = 0; index < messages.length; index++) {
     const msg = messages[index];
-    const dataUrl = msg.media?.data_url || '';
-    const frameDataUrl = msg.media?.frame_data_url || '';
-    const audioDataUrl = msg.media?.audio_data_url || '';
-    const canAttachImage = msg.type === 'image' && dataUrl;
-    const canAttachFrame = (msg.type === 'video' || isVideoLikeMedia(msg.media)) && frameDataUrl;
-    const audioFormat = chatAudioFormatForModel(dataUrlMime(audioDataUrl) || msg.media?.mime);
-    const canAttachAudio = audioDataUrl && audioFormat && (msg.type === 'voice' || isAudioLikeMedia(msg.media));
-    const imageRef = canAttachImage ? `图片${imageCount + 1}` : (canAttachFrame ? `视频关键帧${imageCount + 1}` : '');
-    const audioRef = canAttachAudio ? `音频${audioCount + 1}` : '';
+    const refs = messageBundleRefs(msg, imageCount, audioCount);
     const context = messageNeedsContext(msg) ? buildNearbyChatContext(messages, index) : '';
-    const line = formatMessageLine(msg, { imageRef, audioRef, context });
+    const line = formatMessageLine(msg, { imageRef: refs.imageRef, audioRef: refs.audioRef, context });
     lines.push(line);
     textBuffer.push(line);
-    if (canAttachImage || canAttachFrame) {
+    if (refs.imageRef) {
       flushText();
-      const visualUrl = canAttachImage ? dataUrl : frameDataUrl;
       blocks.push({
         kind: 'image',
-        ref: imageRef,
-        data_url: visualUrl,
-        mime: (canAttachImage ? msg.media.mime : msg.media.frame_mime) || dataUrlMime(visualUrl),
+        ref: refs.imageRef,
+        data_url: refs.visualUrl,
+        mime: refs.visualMime,
       });
       imageCount++;
-      imageChars += visualUrl.length;
+      imageChars += refs.visualUrl.length;
     }
-    if (canAttachAudio) {
+    if (refs.audioRef) {
       flushText();
       blocks.push({
         kind: 'audio',
-        ref: audioRef,
-        data_url: audioDataUrl,
-        mime: msg.media.mime || dataUrlMime(audioDataUrl),
-        format: audioFormat,
+        ref: refs.audioRef,
+        data_url: refs.audioDataUrl,
+        mime: refs.audioMime,
+        format: refs.audioFormat,
       });
       audioCount++;
-      audioChars += audioDataUrl.length;
+      audioChars += refs.audioDataUrl.length;
     }
   }
   flushText();
@@ -1188,6 +1233,28 @@ function formatMessageBundle(messages) {
     imageChars,
     audioChars,
     linkPreviewCount: messages.reduce((n, msg) => n + (msg.link_previews?.length || 0), 0),
+  };
+}
+
+function messageBundleRefs(msg = {}, imageCount = 0, audioCount = 0) {
+  const dataUrl = msg.media?.data_url || '';
+  const frameDataUrl = msg.media?.frame_data_url || '';
+  const audioDataUrl = msg.media?.audio_data_url || '';
+  const canAttachImage = msg.type === 'image' && dataUrl;
+  const canAttachFrame = (msg.type === 'video' || isVideoLikeMedia(msg.media)) && frameDataUrl;
+  const audioFormat = chatAudioFormatForModel(dataUrlMime(audioDataUrl) || msg.media?.mime);
+  const canAttachAudio = audioDataUrl && audioFormat && (msg.type === 'voice' || isAudioLikeMedia(msg.media));
+  const visualUrl = canAttachImage ? dataUrl : (canAttachFrame ? frameDataUrl : '');
+  const imageRef = canAttachImage ? `图片${imageCount + 1}` : (canAttachFrame ? `视频关键帧${imageCount + 1}` : '');
+  const audioRef = canAttachAudio ? `音频${audioCount + 1}` : '';
+  return {
+    imageRef,
+    audioRef,
+    visualUrl,
+    visualMime: (canAttachImage ? msg.media?.mime : msg.media?.frame_mime) || dataUrlMime(visualUrl),
+    audioDataUrl: canAttachAudio ? audioDataUrl : '',
+    audioMime: msg.media?.mime || dataUrlMime(audioDataUrl),
+    audioFormat,
   };
 }
 
@@ -3114,6 +3181,7 @@ function sleep(ms, signal = null) {
 
 export const __llmInternals = {
   formatMessageBundle,
+  estimateMessageBundleStats,
   splitMessages,
   buildDigestChunkPlan,
   openAiUserContent,
