@@ -387,6 +387,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     signal,
     onProgress,
   });
+  assertDigestPublishable(raw);
 
   return normalizeDigest(raw, {
     groupName,
@@ -647,6 +648,15 @@ function mergeChunkSummariesLocally({ parts, groupName, since, until, error, all
       502,
       `AI 分段有 ${fallbackParts.length}/${Math.max(1, validParts.length)} 段未返回可用摘要，合并阶段也未能补回；为避免生成不完整或误导性的群总结，本次未保存长图。可稍后重试，或缩短时间范围再生成。`,
     );
+  }
+  if (fallbackParts.length && allowFallbackParts) {
+    const fallbackLimit = Math.max(1, Math.floor(validParts.length * 0.08));
+    if (fallbackParts.length > fallbackLimit || fallbackParts.length === validParts.length) {
+      throw httpError(
+        502,
+        `AI 分段仍有 ${fallbackParts.length}/${Math.max(1, validParts.length)} 段只剩原始时间线兜底；为避免把分段日志或媒体元信息堆成长图，本次未保存。可稍后重试，或缩短时间范围再生成。`,
+      );
+    }
   }
   const topics = [];
   const seenTopics = new Set();
@@ -2181,6 +2191,42 @@ function cleanupAiStyleText(value) {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+function assertDigestPublishable(raw = {}) {
+  const report = digestPublishabilityReport(raw);
+  if (!report.blocked) return;
+  throw httpError(
+    502,
+    `AI 合并结果疑似把分段兜底或原始时间线写进了长图（${report.reason}）；为避免生成不可读或误导性的群总结，本次未保存。可稍后重试，或缩短时间范围再生成。`,
+  );
+}
+
+function digestPublishabilityReport(raw = {}) {
+  const topics = arrayOf(raw?.topics);
+  const visibleTexts = digestQualityVisibleTexts(raw);
+  const leakCount = visibleTexts.filter(text => DIGEST_FALLBACK_LEAK_RE.test(text)).length;
+  const fallbackTopicCount = topics.filter(topic => DIGEST_FALLBACK_TOPIC_RE.test(`${topic?.title || ''} ${topic?.category || ''} ${topic?.summary || ''}`)).length;
+  const badHeadline = DIGEST_BAD_HEADLINE_RE.test(cleanField(raw?.headline));
+  const repeatedFallback = fallbackTopicCount >= 3 || (fallbackTopicCount >= 2 && fallbackTopicCount >= Math.ceil(Math.max(1, topics.length) * 0.25));
+  const blocked = (badHeadline && leakCount > 0) || repeatedFallback || leakCount >= 4;
+  const reason = [
+    badHeadline ? '标题像分段兜底' : '',
+    leakCount ? `正文命中 ${leakCount} 处兜底/原始时间线痕迹` : '',
+    fallbackTopicCount ? `${fallbackTopicCount}/${Math.max(1, topics.length)} 个话题像失败分段` : '',
+  ].filter(Boolean).join('，') || '命中成品质量闸门';
+  return { blocked, reason, leakCount, fallbackTopicCount, badHeadline };
+}
+
+function digestQualityVisibleTexts(raw = {}) {
+  return [
+    raw?.headline,
+    ...arrayOf(raw?.highlights),
+    ...arrayOf(raw?.topics).flatMap(item => [item?.title, item?.category, item?.summary]),
+    ...arrayOf(raw?.todos).flatMap(item => [item?.owner, item?.item, item?.deadline]),
+    ...arrayOf(raw?.links).flatMap(item => [item?.title, item?.summary || item?.description || item?.context]),
+    ...arrayOf(raw?.quotes).flatMap(item => (typeof item === 'string' ? [item] : [item?.text, item?.context])),
+  ].map(cleanField).filter(Boolean);
+}
+
 function withoutAudioBlocksForRetry(blocks = []) {
   return blocks
     .filter(block => block.kind !== 'audio')
@@ -2546,6 +2592,9 @@ function cleanField(value) {
 
 const INTERNAL_VISIBLE_ERROR_RE = /(?:_?raw_timeline|_fallback_chunk|Model returned empty content|Messages returned empty content|Encrypted content could not be decrypted|分段错误|raw timeline)/i;
 const DIGEST_WORK_REPORT_RE = /(?:根据聊天记录|根据群聊内容|以下是|总结如下|整体来看|综合来看|从聊天(?:内容)?看|从内容看|值得注意的是|可以看出|本时间窗|该议题|主要围绕|需处理|待确认|仍待确认|待验证|仍待验证|持续关注|继续关注|保持关注|风险[:：]|结果[:：]|结论[:：]|现状[:：]|行动清单|工作汇报|任务清单|处理事项|进展跟踪|仍需确认|工具运维问题)/i;
+const DIGEST_FALLBACK_LEAK_RE = /(?:_raw_timeline|raw_timeline|_fallback_chunk|分段兜底|原始时间线|少量消息仅保留元信息|本地文件待解封|md5=|未被模型稳定提炼|模型请求返回空内容|按分段摘要整理|无可直接附加的媒体块|时间范围：\d{4}-\d{2}-\d{2}.*?共\s*\d+\s*条消息|涉及内容：\d+\s*张图片\/视频关键帧)/i;
+const DIGEST_FALLBACK_TOPIC_RE = /(?:少量消息仅保留元信息|原始时间线|待合并|失败分段|未被模型稳定提炼|无可直接附加的媒体块|本地文件待解封|md5=)/i;
+const DIGEST_BAD_HEADLINE_RE = /(?:按分段摘要整理|重点见下方|原始时间线|分段摘要|分段兜底)/i;
 const TODO_ACTION_RE = /确认|处理|跟进|补充|整理|报名|提交|付款|测试|验证|联系|修复|发布|更新|迁移|查看|统计|安排|提醒|复盘|决定|对齐|收集|申请|注册|认领|补发|回复|开通|关闭|领取|报销|交付|检查|排查|推进|落实|回访|同步/;
 const CJK_RE = /[\u3400-\u9fff]/;
 const TODO_PLACEHOLDER_RE = /^(待认领|未指定|无|暂无|不明确|待定|未定|待确认)$/;
@@ -2851,4 +2900,6 @@ export const __llmInternals = {
   cleanupAiStyleText,
   cleanupDigestStyleLocally,
   digestNeedsHumanGroupChatStyle,
+  digestPublishabilityReport,
+  assertDigestPublishable,
 };
