@@ -203,7 +203,9 @@ export function normalizeSettings(settings) {
   s.scheduler.digest_window = normalizeDurationText(s.scheduler.digest_window, '4h');
   s.scheduler.min_messages_per_digest = finiteInteger(s.scheduler.min_messages_per_digest, 30, 1, 10000);
   s.scheduler.per_group = normalizePerGroupOverrides(s.scheduler.per_group);
+  if (!outputDirIsSafe(s.output.dir)) s.output.dir = defaults.output.dir;
   s.output.retention_days = finiteInteger(s.output.retention_days, 0, 0, 3650);
+  s.output.filename_pattern = normalizeFilenamePattern(s.output.filename_pattern, defaults.output.filename_pattern);
   s.render.width_px = finiteInteger(s.render.width_px, 1080, 320, 2160);
   s.render.dpi_scale = finiteInteger(s.render.dpi_scale, 2, 1, 4);
   s.web.host = '127.0.0.1';
@@ -301,6 +303,23 @@ function normalizeDurationText(value, fallback) {
   return durationToMs(raw) ? raw : fallback;
 }
 
+function outputDirIsSafe(value) {
+  try {
+    outputDirFromSettings({ output: { dir: value } });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeFilenamePattern(value, fallback) {
+  const raw = String(value || '').trim();
+  if (!raw || raw.length > 160) return fallback;
+  if (/[\\/]|(?:^|[.])\.(?:[.]|$)|[<>:"|?*\x00-\x1F]/.test(raw)) return fallback;
+  if (!/\{id8\}|\{group\}|\{since\}|\{until\}/.test(raw)) return fallback;
+  return /\.png$/i.test(raw) ? raw : `${raw}.png`;
+}
+
 export function validateSettingsObject(settings, { requireBaseUrl = false } = {}) {
   const errors = [];
   if (!['openai', 'anthropic'].includes(settings.llm.provider)) errors.push('llm.provider must be openai or anthropic');
@@ -312,10 +331,8 @@ export function validateSettingsObject(settings, { requireBaseUrl = false } = {}
       errors.push('llm.base_url must be a valid URL');
     }
   }
-  try {
-    outputDirFromSettings(settings);
-  } catch {
-    errors.push('output.dir must stay inside project root and outside outputs/.tmp');
+  if (!outputDirIsSafe(settings.output?.dir)) {
+    errors.push('output.dir must stay inside outputs/ and outside outputs/.tmp');
   }
   if (settings.web.host !== '127.0.0.1') errors.push('web.host is locked to 127.0.0.1');
   if (!durationToMs(settings.scheduler.default_interval)) errors.push('scheduler.default_interval must look like 30m, 4h, or 1d');
@@ -369,6 +386,11 @@ async function saveSettingsPatchUnlocked(patch) {
     delete nextPatch.wechat.clear_manual_key;
   }
 
+  if (nextPatch.output && Object.hasOwn(nextPatch.output, 'dir') && !outputDirIsSafe(nextPatch.output.dir)) {
+    const err = new Error('output.dir must stay inside outputs/ and outside outputs/.tmp');
+    err.status = 400;
+    throw err;
+  }
   const merged = normalizeSettings(deepMerge(stripSensitive(current), nextPatch));
   const validationErrors = validateSettingsObject(merged, { requireBaseUrl: !!nextPatch.llm });
   if (validationErrors.length) {

@@ -222,7 +222,7 @@
           <span class="muted small" id="s-apikey-mask"></span>
         </div>
         <div class="form-row inline">
-          <button class="btn" id="s-list-models">获取模型</button>
+          <button class="btn" id="s-list-models" disabled>获取模型</button>
           <span class="status" id="s-model-status"></span>
         </div>
         <div class="form-row"><label>模型</label>
@@ -240,8 +240,8 @@
           <span class="muted small">多账号池可调高；单账号建议 1</span>
         </div>
         <div class="form-row inline">
-          <button class="btn" id="s-test-llm">测试连通</button>
-          <button class="btn btn-primary" id="s-save-llm">保存</button>
+          <button class="btn" id="s-test-llm" disabled>测试连通</button>
+          <button class="btn btn-primary" id="s-save-llm" disabled>保存</button>
           <span class="status" id="s-llm-status"></span>
         </div>
       </section>
@@ -311,7 +311,7 @@
         <div class="form-row"><label>输出目录</label>
           <input id="s-outdir" type="text" />
           <button class="btn btn-ghost" id="s-open-outdir" disabled>打开</button>
-          <span class="muted small">必须在项目根之下</span>
+          <span class="muted small">必须在 outputs/ 下，避免摘要索引和 JSON 混入源码目录</span>
         </div>
         <div class="form-row"><label>保留天数</label>
           <input id="s-retention" type="number" min="0" />

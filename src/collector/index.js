@@ -95,6 +95,9 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
   if (!group_id) {
     throw Object.assign(new Error('请先选择一个本机微信会话。'), { status: 400 });
   }
+  if (!since) {
+    throw Object.assign(new Error('请先选择要总结的起始时间，避免误读全部历史消息。'), { status: 400 });
+  }
 
   try {
     throwIfAborted(signal);

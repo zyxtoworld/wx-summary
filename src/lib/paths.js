@@ -39,9 +39,9 @@ export function resolveInsideTmp(inputPath, label = 'path') {
 
 export function outputDirFromSettings(settings) {
   const resolved = resolveInsideProject(settings?.output?.dir || './outputs/digests', 'output.dir');
-  if (path.resolve(resolved) === PROJECT_ROOT) {
-    const err = new Error('output.dir must be a subdirectory inside project root');
-    err.code = 'PATH_IS_PROJECT_ROOT';
+  if (!isInside(OUTPUTS_DIR, resolved)) {
+    const err = new Error('output.dir must stay inside outputs/');
+    err.code = 'PATH_OUTSIDE_OUTPUTS';
     err.status = 400;
     throw err;
   }

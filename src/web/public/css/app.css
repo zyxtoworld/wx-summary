@@ -60,7 +60,7 @@ body {
 
 /* ------- Topbar ------- */
 .topbar {
-  height: var(--topbar-h);
+  min-height: var(--topbar-h);
   display: flex;
   align-items: center;
   gap: var(--gap-4);
@@ -218,6 +218,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
   font-size: 12px; padding: 0;
 }
 .link-btn:hover { text-decoration: underline; }
+.link-btn:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.55;
+  text-decoration: none;
+}
 
 /* ------- Digest page layout ------- */
 .page-digest {
@@ -901,9 +907,13 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 
 @media (max-width: 640px) {
   .topbar {
-    padding: 0 var(--gap-3);
+    height: auto;
+    padding: var(--gap-2) var(--gap-3);
     gap: var(--gap-2);
+    flex-wrap: wrap;
+    align-content: center;
   }
+  .brand { flex: 0 0 auto; }
   .brand-name,
   .badge {
     display: none;
@@ -911,12 +921,22 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
   .nav {
     margin-left: 0;
     gap: 2px;
+    order: 3;
+    flex: 1 0 100%;
   }
   .nav a {
+    flex: 1;
+    text-align: center;
     padding: 6px 8px;
   }
+  .topbar-right {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
   .account-switcher {
-    max-width: 132px;
+    flex: 1 1 auto;
+    min-width: 92px;
+    max-width: none;
   }
   main {
     padding: var(--gap-3);

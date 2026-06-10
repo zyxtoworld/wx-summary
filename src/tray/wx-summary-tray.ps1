@@ -25,6 +25,19 @@ function Show-StartupError {
   [System.Windows.Forms.MessageBox]::Show($Message, (Utf8Label 'd3gtc3VtbWFyeSDlkK/liqjlpLHotKU='), 'OK', 'Error') | Out-Null
 }
 
+function Assert-Node20 {
+  param($Command)
+  if (-not $Command) {
+    throw 'node not found. Please install Node.js 20+ and restart wx-summary.'
+  }
+  $majorText = & $Command.Source -p "Number(process.versions.node.split('.')[0])" 2>$null
+  $major = 0
+  if (-not [int]::TryParse([string]$majorText, [ref]$major) -or $major -lt 20) {
+    $version = & $Command.Source -v 2>$null
+    throw "Node.js 20+ is required. Current version: $($version -join ' ')"
+  }
+}
+
 function Read-ServerUrl {
   if (-not (Test-Path $RuntimeFile)) { return $ServerUrl }
   try {
@@ -157,7 +170,7 @@ try {
   New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
   $node = Get-Command node -ErrorAction SilentlyContinue
-  if (-not $node) { throw (Utf8Label '5pyq5om+5YiwIG5vZGXjgILor7flhYjlronoo4UgTm9kZS5qcyAyMCsg5ZCO6YeN5paw5Y+M5Ye75ZCv5Yqo44CC') }
+  Assert-Node20 $node
 
   Write-LauncherWeixinEvidence
 

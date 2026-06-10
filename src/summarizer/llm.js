@@ -3307,9 +3307,13 @@ function isTransientError(err) {
 
 function isLikelyChunkableFailure(err) {
   const status = Number(err?.status || 0);
-  if ([400, 408, 413, 414, 422, 429, 500, 502, 503, 504].includes(status)) return true;
   const message = String(err?.message || '').toLowerCase();
-  return /context|token|too large|payload|request entity|timeout|timed out|length|maximum|max|rate|overload|capacity|temporarily unavailable|service unavailable|api_error|网络请求失败|服务暂时不可用|临时不可用|暂时不可用/.test(message);
+  const inputTooLarge = /context|token|too large|payload|request entity|length|maximum|max(?:imum)?\s*(?:context|tokens?|input)|上下文|输入过大|内容过长/.test(message);
+  const providerConfigError = /response_format|json_schema|schema|tool_choice|unsupported|not supported|does not support|invalid (?:parameter|value|type)|unknown parameter|unrecognized|api key|authentication|permission|credentials|base url|endpoint|鉴权|权限|不支持/.test(message);
+  if ([413, 414].includes(status)) return true;
+  if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+  if ([400, 422].includes(status)) return inputTooLarge && !providerConfigError;
+  return inputTooLarge || /timeout|timed out|rate|overload|capacity|temporarily unavailable|service unavailable|api_error|网络请求失败|服务暂时不可用|临时不可用|暂时不可用/.test(message);
 }
 
 function isLikelyRecoverableChunkFailure(err) {

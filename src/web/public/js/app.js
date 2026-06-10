@@ -549,16 +549,16 @@ function outputDirLooksInsideProject(dir, projectRoot) {
   const normalized = normalizePathForUi(raw);
   if (!isAbsolutePathForUi(raw)) {
     const rel = normalizeRelativePathForUi(raw).toLowerCase();
-    return rel !== '.'
-      && rel !== ''
+    return (rel === 'outputs' || rel.startsWith('outputs/'))
       && !rel.split('/').includes('..')
       && rel !== 'outputs/.tmp'
       && !rel.startsWith('outputs/.tmp/');
   }
   const root = normalizePathForUi(projectRoot).toLowerCase();
   const full = normalizePathForUi(raw).toLowerCase();
+  const outputs = root ? `${root}/outputs` : '';
   const tmp = root ? `${root}/outputs/.tmp` : '';
-  return !!root && full !== root && full.startsWith(root + '/') && full !== tmp && !full.startsWith(`${tmp}/`);
+  return !!root && (full === outputs || full.startsWith(`${outputs}/`)) && full !== tmp && !full.startsWith(`${tmp}/`);
 }
 
 function updateCustomRangeDate(dateText) {
@@ -643,6 +643,10 @@ function digestGroupCacheFresh(cache) {
   return Number(cache?.fetchedAt || 0) > 0 && Date.now() - Number(cache.fetchedAt || 0) < DIGEST_GROUP_CACHE_TTL_MS;
 }
 
+function digestGroupCacheHasData(cache) {
+  return Array.isArray(cache?.groups) && cache.groups.length > 0;
+}
+
 async function fetchDigestGroups(accountId = selectedAccountId(), { force = false } = {}) {
   const cache = getDigestGroupCache(accountId);
   if (!force && digestGroupCacheFresh(cache)) return cache.groups;
@@ -706,9 +710,10 @@ async function renderDigest() {
   let groups = [];
   let groupStatusText = '';
   const groupCache = getDigestGroupCache(accountId);
-  const hasCachedGroups = digestGroupCacheFresh(groupCache);
+  const cacheHasGroups = digestGroupCacheHasData(groupCache);
+  const cacheIsFresh = digestGroupCacheFresh(groupCache);
   try {
-    const rawGroups = hasCachedGroups ? groupCache.groups : await fetchDigestGroups(accountId, { force: true });
+    const rawGroups = cacheHasGroups ? groupCache.groups : await fetchDigestGroups(accountId, { force: true });
     if (routeSeq !== _routeSeq) return;
     groups = decorateDigestGroups(rawGroups, digestSettings);
   } catch (e) {
@@ -733,11 +738,16 @@ async function renderDigest() {
   }
   function paint(filter = '') {
     const f = filter.trim().toLowerCase();
-    $list.innerHTML = groups
-      .filter(g => {
+    const visibleGroups = groups.filter(g => {
         if (!f) return true;
         return [g.name, g.pinyin, g.pinyin_initial, g.id].some(v => String(v || '').toLowerCase().includes(f));
-      })
+      });
+    if (!visibleGroups.length) {
+      $list.innerHTML = `<li class="loading">${groups.length ? '没有匹配的群。' : '本机没有可显示的群。'}</li>`;
+      updateSelectedCount();
+      return;
+    }
+    $list.innerHTML = visibleGroups
       .map(g => `
         <li data-id="${g.id}" class="${[
           _state_digest.selectedGroups.has(g.id) ? 'selected' : '',
@@ -769,8 +779,8 @@ async function renderDigest() {
   }
   paint();
   document.getElementById('group-search').addEventListener('input', e => paint(e.target.value));
-  if (hasCachedGroups && !digestGroupCacheFresh(groupCache)) {
-    setGroupStatus('刷新中');
+  if (cacheHasGroups && !cacheIsFresh) {
+    setGroupStatus('后台更新中');
     fetchDigestGroups(accountId, { force: true })
       .then(rawGroups => {
         if (!isCurrentDigestView()) return;
@@ -780,7 +790,7 @@ async function renderDigest() {
       })
       .catch(e => {
         if (!isCurrentDigestView()) return;
-        setGroupStatus('');
+        setGroupStatus(`后台更新失败：${e.message || '未知错误'}`);
         if (!groups.length) {
           notice.classList.remove('hidden');
           notice.innerHTML = `<strong>读取群列表失败</strong><span>${escapeHtml(e.message || '无法读取本机微信群列表。')}</span>`;
@@ -892,7 +902,7 @@ async function renderDigest() {
       onSave: async selection => {
         applyDigestRenderSelection(selection);
         drawDigestCanvas(_state_digest.lastDigest);
-        if (!_state_digest.lastSavedItem?.digest_id) return null;
+        if (!_state_digest.lastSavedItem?.digest_id) return { previewOnly: true };
         const r = await api('/api/rerender-history', {
           method: 'POST',
           body: {
@@ -1142,7 +1152,7 @@ function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigest
     try {
       const result = typeof onSave === 'function' ? await onSave({ ...selection }) : null;
       panelStatus.className = 'status ok';
-      panelStatus.textContent = result ? '✓ 已重新渲染' : '✓ 已更新预览';
+      panelStatus.textContent = result?.previewOnly ? '✓ 已更新当前预览，未写入历史' : (result ? '✓ 已重新渲染' : '✓ 已更新预览');
       if (statusTarget) {
         statusTarget.className = 'status ok';
         statusTarget.textContent = panelStatus.textContent;
@@ -1374,7 +1384,7 @@ async function generateDigest({ previewText = false } = {}) {
   let groups;
   try {
     const cache = getDigestGroupCache(accountId);
-    groups = digestGroupCacheFresh(cache) ? cache.groups : await fetchDigestGroups(accountId, { force: true });
+    groups = digestGroupCacheHasData(cache) ? cache.groups : await fetchDigestGroups(accountId, { force: true });
   } catch (e) {
     _state_digest.generating = false;
     if (generateButton) generateButton.disabled = false;
@@ -2488,15 +2498,30 @@ async function copyCanvas() {
 async function renderHistory() {
   $app.appendChild(tplOf('tpl-history'));
   const historyRouteSeq = _routeSeq;
-  const list = await api('/api/history');
-  if (historyRouteSeq !== _routeSeq) return;
   const $grid = document.getElementById('history-grid');
   const $empty = document.getElementById('history-empty');
   const $search = document.getElementById('history-search');
+  $empty.textContent = '正在读取历史摘要...';
+  $empty.classList.remove('hidden');
+  $search.disabled = true;
+  let list = [];
+  try {
+    list = await api('/api/history');
+  } catch (e) {
+    if (historyRouteSeq !== _routeSeq) return;
+    $empty.innerHTML = `读取历史摘要失败：${escapeHtml(e.message || '未知错误')} <button class="link-btn" id="history-retry" type="button">重试</button>`;
+    document.getElementById('history-retry')?.addEventListener('click', route);
+    return;
+  } finally {
+    if (historyRouteSeq === _routeSeq) $search.disabled = false;
+  }
+  if (historyRouteSeq !== _routeSeq) return;
   if (!list.length) {
+    $empty.textContent = '还没有摘要记录。回到「总结」页生成一个吧。';
     $empty.classList.remove('hidden');
     return;
   }
+  $empty.classList.add('hidden');
   const itemById = new Map(list.map(item => [String(item.digest_id || ''), item]));
   const searchById = new Map(list.map(item => [String(item.digest_id || ''), historySearchText(item)]));
   $grid.innerHTML = list
@@ -2920,6 +2945,7 @@ async function renderSettings() {
       $st.textContent = '✗ 保存失败：' + e.message;
     }
   }));
+  llmActionButtons.forEach(button => { button.disabled = false; });
 
   // 群与调度
   const $wl = document.getElementById('s-whitelist');
@@ -3040,26 +3066,32 @@ async function renderSettings() {
   api('/api/scheduler/status').then(r => paintSchedulerStatus(r.scheduler)).catch(() => paintSchedulerStatus({ enabled: !!s.scheduler.enabled }));
   const saveGroupsButton = document.getElementById('s-save-groups');
   const runSchedulerButton = document.getElementById('s-run-scheduler');
-  saveGroupsButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
+  function schedulerSettingsPayload() {
     const wl = groupsLoaded
       ? [...document.querySelectorAll('#s-whitelist input:checked')].map(i => i.value)
       : (Array.isArray(s.groups?.whitelist) ? s.groups.whitelist : []);
+    return {
+      groups: { whitelist: wl },
+      scheduler: {
+        enabled: document.getElementById('s-scheduler').checked,
+        default_interval: getDurationControlValue('s-scheduler-interval', '30m'),
+        digest_window: getDurationControlValue('s-scheduler-window', '4h'),
+        min_messages_per_digest: parseInt(document.getElementById('s-scheduler-min').value || '30', 10),
+        per_group: schedulerOverrides,
+      },
+    };
+  }
+  async function saveSchedulerSettings() {
+    return api('/api/settings', {
+      method: 'PUT',
+      body: schedulerSettingsPayload(),
+    });
+  }
+  saveGroupsButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
     schedulerStatus.className = 'status';
     schedulerStatus.textContent = groupsLoaded ? '保存中...' : '保存中（保留原白名单）...';
     try {
-      await api('/api/settings', {
-        method: 'PUT',
-        body: {
-          groups: { whitelist: wl },
-          scheduler: {
-            enabled: document.getElementById('s-scheduler').checked,
-            default_interval: getDurationControlValue('s-scheduler-interval', '30m'),
-            digest_window: getDurationControlValue('s-scheduler-window', '4h'),
-            min_messages_per_digest: parseInt(document.getElementById('s-scheduler-min').value || '30', 10),
-            per_group: schedulerOverrides,
-          },
-        },
-      });
+      await saveSchedulerSettings();
       schedulerStatus.className = 'status ok';
       schedulerStatus.textContent = groupsLoaded ? '✓ 已保存白名单与调度设置' : '✓ 已保存调度设置，原白名单已保留';
       const r = await api('/api/scheduler/status').catch(() => null);
@@ -3071,8 +3103,10 @@ async function renderSettings() {
   }));
   runSchedulerButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
     schedulerStatus.className = 'status';
-    schedulerStatus.textContent = '检查中...';
+    schedulerStatus.textContent = groupsLoaded ? '先保存当前设置，再检查...' : '先保存当前设置（保留原白名单），再检查...';
     try {
+      await saveSchedulerSettings();
+      schedulerStatus.textContent = '检查中...';
       const r = await api('/api/scheduler/run-once', { method: 'POST', body: {} });
       paintSchedulerStatus(r.scheduler);
     } catch (e) {
@@ -3107,7 +3141,7 @@ async function renderSettings() {
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
       $st.className = 'status err';
-      $st.textContent = '✗ 输出目录必须在项目根之下，且不能位于 outputs/.tmp';
+      $st.textContent = '✗ 输出目录必须在 outputs/ 下，且不能位于 outputs/.tmp';
       return;
     }
     $st.className = 'status';
@@ -3126,7 +3160,7 @@ async function renderSettings() {
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
       $st.className = 'status err';
-      $st.textContent = '✗ 输出目录必须在项目根之下，且不能位于 outputs/.tmp';
+      $st.textContent = '✗ 输出目录必须在 outputs/ 下，且不能位于 outputs/.tmp';
       return;
     }
     $st.className = 'status';

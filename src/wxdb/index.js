@@ -772,9 +772,13 @@ export async function copyDbFile(account, dbFile) {
     throw err;
   }
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const copyId = [
+    new Date().toISOString().replace(/[:.]/g, '-'),
+    process.pid,
+    crypto.randomUUID().slice(0, 8),
+  ].join('-');
   const category = path.basename(path.dirname(source));
-  const targetDir = path.join(TMP_DIR, 'db', account.id, timestamp, category);
+  const targetDir = path.join(TMP_DIR, 'db', account.id, copyId, category);
   await ensureDir(targetDir);
   const target = path.join(targetDir, path.basename(source));
   await fsp.copyFile(source, target);
@@ -881,15 +885,20 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
   const sinceTs = toUnixSeconds(since, 0);
   const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000));
   const out = [];
+  const shardErrors = [];
+  let readableShards = 0;
+  let matchingShards = 0;
 
   for (const file of dbFiles) {
     throwIfAborted(signal);
     let opened = null;
     try {
       opened = await openCopiedSqlCipherDb(account, file.path, raw_keys);
+      readableShards++;
       throwIfAborted(signal);
       const exists = opened.db.prepare('select name from sqlite_master where type = ? and name = ?').get(['table', tableName]);
       if (!exists) continue;
+      matchingShards++;
       const rows = opened.db.prepare(`
         select local_id, server_id, local_type, sort_seq, real_sender_id, create_time,
                message_content, compress_content, packed_info_data
@@ -931,11 +940,26 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
           group: group_id,
         });
       }
-    } catch {
-      // Some message shards may not have a matching key candidate yet.
+    } catch (e) {
+      if (e?.status === 499 || signal?.aborted) throw e;
+      shardErrors.push({
+        name: file.name,
+        error: String(e?.message || e || '未知错误').slice(0, 180),
+      });
     } finally {
       if (opened) await opened.close();
     }
+  }
+
+  if (shardErrors.length) {
+    const sample = shardErrors.slice(0, 3).map(item => `${item.name}: ${item.error}`).join('；');
+    const err = new Error(
+      readableShards === 0
+        ? `所有微信消息分片都读取失败，无法确认消息完整性。请检查数据库 key 或微信版本。${sample ? `失败示例：${sample}` : ''}`
+        : `有 ${shardErrors.length} 个微信消息分片读取失败，已停止生成以避免漏数据。${sample ? `失败示例：${sample}` : ''}`,
+    );
+    err.status = readableShards === 0 ? 502 : 409;
+    throw err;
   }
 
   out.sort((a, b) => a.timestamp - b.timestamp || a.sort_seq - b.sort_seq || a.local_id - b.local_id || String(a.id || '').localeCompare(String(b.id || '')));
@@ -952,6 +976,8 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
     table: tableName,
     messages: out,
     scanned_message_count: scannedCount,
+    readable_shard_count: readableShards,
+    matching_shard_count: matchingShards,
     truncated: false,
   };
 }

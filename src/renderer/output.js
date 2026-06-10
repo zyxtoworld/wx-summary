@@ -18,7 +18,7 @@ export async function saveRenderedPng({ settings, digest, png_data_url }) {
   const day = localDate(createdAt);
   const dir = path.join(base, day);
   await ensureDir(dir);
-  const filename = await uniqueFilename(dir, buildFilename(digest));
+  const filename = await uniqueFilename(dir, buildFilename(digest, settings.output?.filename_pattern));
   const filePath = path.join(dir, filename);
   const digestPath = digestJsonPathForPng(filePath);
   await writeBinaryAtomic(filePath, buffer);
@@ -346,12 +346,18 @@ function withHistoryWriteLock(action) {
   return run;
 }
 
-function buildFilename(digest) {
-  const group = sanitizeName(digest.group || 'digest');
-  const since = compactTime(digest.since);
-  const until = compactTime(digest.until);
-  const id8 = String(digest.digest_id || '00000000').slice(0, 8);
-  return `${group}__${since}_${until}__${id8}.png`;
+function buildFilename(digest, pattern = '') {
+  const id8 = String(digest.digest_id || '00000000').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) || '00000000';
+  const tokens = {
+    group: sanitizeName(digest.group || 'digest'),
+    since: compactTime(digest.since),
+    until: compactTime(digest.until),
+    id8,
+  };
+  const template = String(pattern || '{group}__{since}_{until}__{id8}.png').trim();
+  const rendered = template.replace(/\{(group|since|until|id8)\}/g, (_, key) => tokens[key] || '');
+  const safe = sanitizeFilename(rendered || `${tokens.group}__${tokens.since}_${tokens.until}__${tokens.id8}.png`);
+  return /\.png$/i.test(safe) ? safe : `${safe}.png`;
 }
 
 function sanitizeName(name) {
@@ -359,6 +365,19 @@ function sanitizeName(name) {
     .replace(/[^\p{Unified_Ideograph}a-zA-Z0-9_]+/gu, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 40) || 'digest';
+}
+
+function sanitizeFilename(name) {
+  const ext = path.extname(String(name || '')).toLowerCase() === '.png' ? '.png' : '';
+  const stem = String(name || '')
+    .replace(/\.[pP][nN][gG]$/, '')
+    .replace(/[\\/]+/g, '_')
+    .replace(/[<>:"|?*\x00-\x1F]+/g, '_')
+    .replace(/^\.+|\.+$/g, '')
+    .replace(/_+/g, '_')
+    .slice(0, 120)
+    .replace(/^_+|_+$/g, '') || 'digest';
+  return `${stem}${ext}`;
 }
 
 function compactTime(value) {

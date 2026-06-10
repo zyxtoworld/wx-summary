@@ -62,6 +62,7 @@ pnpm-debug.log*
 *.tmp
 *.bak
 *.old
+*.digest.json
 
 # Local media, screenshots and chat attachments. Force-add explicitly sanitized
 # public assets if the project later needs icons or documentation images.

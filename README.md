@@ -58,10 +58,12 @@ macOS 可双击 `启动.command` 或在终端运行：
 ```text
 data/settings.json
 data/secrets.bin
+data/cursors.json
 outputs/
 ```
 
 `data/settings.json` 保存普通设置；API Key 和微信手动 key 会加密保存到 `data/secrets.bin`，不会写入 `settings.json`。
+摘要长图、历史索引和摘要 JSON 只允许保存在 `outputs/` 目录下，避免混入源码目录被误提交。
 
 ## 隐私边界
 
@@ -69,6 +71,7 @@ outputs/
 
 - `data/settings.json`
 - `data/secrets.bin`
+- `data/cursors.json`
 - `data/*weixin*baseline*.json`
 - `outputs/`
 - `node_modules/`
@@ -76,11 +79,13 @@ outputs/
 - 真实 API Key、手动数据库 key、本机路径、群 ID、群成员名单、聊天内容
 
 `.gitignore` 已默认忽略上述路径和常见运行产物。公开仓库只保留 `data/settings.example.json` 作为示例配置。
+如果要发布源码包，请使用干净 clone 或 `git archive HEAD`；不要直接压缩当前工作目录，避免把本机 `data/`、`outputs/`、`node_modules/`、`.git/` 一起带出去。
 
 程序的数据读取边界：
 
 - 聊天内容、群成员昵称、文件名、图片/视频/语音元信息来自本机微信数据库副本或本地文件。
 - 内存扫描只用只读权限寻找解密所需 key 候选，不从内存提取聊天内容或图片内容。
+- 外部明文本地 key 缓存同样敏感；优先在设置页填写手动 key，让程序加密保存到 `data/secrets.bin`。
 - 真实读取失败会报错，不会用演示数据伪装成真实摘要。
 - 摘要发送给 AI 前会按设置对手机号、身份证号、银行卡号等做脱敏。
 - 你选择的聊天内容和媒体分析输入会发送到你配置的 AI 端点；请确认端点和模型供应商符合你的隐私要求。
