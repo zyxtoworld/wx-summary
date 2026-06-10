@@ -88,6 +88,7 @@ async function route() {
   const rawHash = location.hash.replace(/^#/, '') || '/digest';
   const hash = rawHash.split('?')[0] || '/digest';
   const fn = routes[hash] || renderDigest;
+  if (fn !== renderDigest) abortActiveDigest('切换页面');
   closeTransientOverlays();
   // 设置导航 active
   document.querySelectorAll('.nav a').forEach(a => {
@@ -1410,6 +1411,7 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.abortReason = '';
   const controller = new AbortController();
   _state_digest.abortController = controller;
+  const digestRouteSeq = _routeSeq;
   const accountId = selectedAccountId();
   const generateButton = document.getElementById('btn-generate');
   const previewButton = document.getElementById('btn-preview-text');
@@ -1466,7 +1468,7 @@ async function generateDigest({ previewText = false } = {}) {
   try {
     const cache = getDigestGroupCache(accountId);
     groups = digestGroupCacheHasData(cache) ? cache.groups : await fetchDigestGroups(accountId, { force: true });
-    if (routeSeq !== _routeSeq || controller.signal.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+    if (digestRouteSeq !== _routeSeq || controller.signal.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   } catch (e) {
     const abortReason = _state_digest.abortReason;
     if (_state_digest.abortController === controller) {
@@ -1477,7 +1479,7 @@ async function generateDigest({ previewText = false } = {}) {
     }
     if (generateButton) generateButton.disabled = false;
     if (previewButton) previewButton.disabled = false;
-    if (routeSeq !== _routeSeq) return;
+    if (digestRouteSeq !== _routeSeq) return;
     if ($progress && $stages && $fill) {
       $progress.classList.remove('hidden');
       $fill.style.width = '0%';
@@ -1641,7 +1643,7 @@ async function generateDigest({ previewText = false } = {}) {
     });
 
     await runClientPool(targets, prepareConcurrency, async (target, i) => {
-      if (controller.signal.aborted) return;
+      if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
       upsertStage(groupStage(i, { name: 'fetching', label: '拉取消息/解析媒体', status: 'running' }));
       try {
         const digest = await runSingleDigestRequest({
@@ -1662,15 +1664,15 @@ async function generateDigest({ previewText = false } = {}) {
           renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
         } else {
           await enqueueRender(async () => {
-            if (controller.signal.aborted) return;
+            if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
             const livePreviewCard = document.getElementById('preview-card');
             if (livePreviewCard) livePreviewCard.classList.remove('hidden');
             const canvas = drawDigestCanvas(digest);
-            if (controller.signal.aborted) return;
+            if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
             upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
             try {
               const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal });
-              if (controller.signal.aborted) return;
+              if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
               digest.file_path = saved.item.file_path;
               const revealButton = document.getElementById('btn-reveal');
@@ -2305,12 +2307,14 @@ function drawDigestCanvas(d, targetCanvas = null) {
         for (const t of todos) {
           c.fillStyle = COLORS.text;
           c.font = font(500, 17);
-          c.fillText(renderSafeText(`• ${t.item}`), padding + cardInset, yy); yy += s(34);
+          const itemLines = wrapText(c, `• ${t.item}`, W - padding * 2 - cardInset * 2, font(500, 17));
+          for (const ln of itemLines) { c.fillText(renderSafeText(ln), padding + cardInset, yy); yy += s(31); }
           const meta = [cleanTodoMetaForRender(t.owner), cleanTodoMetaForRender(t.deadline)].filter(Boolean).join(' · ');
           if (meta) {
             c.fillStyle = COLORS.meta;
             c.font = font(400, 14);
-            c.fillText(renderSafeText(`  ${meta}`), padding + bodyIndent, yy); yy += s(24);
+            const metaLines = wrapText(c, meta, W - padding * 2 - bodyIndent - cardInset, font(400, 14));
+            for (const ln of metaLines) { c.fillText(renderSafeText(ln), padding + bodyIndent, yy); yy += s(24); }
           }
           yy += s(10);
         }
@@ -2772,6 +2776,13 @@ function showHistoryModal(item) {
   const downloadButton = modal.querySelector('[data-download]');
   const copyButton = modal.querySelector('[data-copy]');
   const revealButton = modal.querySelector('[data-reveal]');
+  const restoreImageActions = () => {
+    copyButton.disabled = false;
+    revealButton.disabled = false;
+    downloadButton.classList.remove('disabled');
+    downloadButton.href = historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now());
+    downloadButton.setAttribute('download', '');
+  };
   const disableImageActions = () => {
     copyButton.disabled = true;
     revealButton.disabled = true;
@@ -2781,11 +2792,11 @@ function showHistoryModal(item) {
     status.className = 'status err';
     status.textContent = '长图加载失败：文件可能已被移动或删除。';
   };
-  image.addEventListener('load', () => {
-    copyButton.disabled = false;
-    revealButton.disabled = false;
-  }, { once: true });
-  image.addEventListener('error', disableImageActions, { once: true });
+  const watchHistoryImage = () => {
+    image.addEventListener('load', restoreImageActions, { once: true });
+    image.addEventListener('error', disableImageActions, { once: true });
+  };
+  watchHistoryImage();
   if (image.complete && image.naturalWidth === 0) disableImageActions();
   image.addEventListener('click', () => {
     if (!image.complete || image.naturalWidth === 0) return;
@@ -2840,8 +2851,11 @@ function showHistoryModal(item) {
         });
         Object.assign(item, r.item || {});
         const freshUrl = historyImageUrl(item.digest_id, Date.now());
-        modal.querySelector('img').src = freshUrl;
-        modal.querySelector('[data-download]').href = freshUrl;
+        watchHistoryImage();
+        image.src = freshUrl;
+        downloadButton.href = freshUrl;
+        downloadButton.setAttribute('download', '');
+        downloadButton.classList.remove('disabled');
         return r;
       },
     });
@@ -2934,6 +2948,23 @@ async function renderSettings() {
       long_context_model: longModel || model,
     };
   }
+  function currentModelRequestIdentity() {
+    return {
+      provider: selectedProvider(),
+      base_url: normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value),
+      api_key: document.getElementById('s-apikey').value.trim(),
+    };
+  }
+  function currentModelListIdentity() {
+    const identity = currentModelRequestIdentity();
+    return {
+      ...identity,
+      api_key: identity.api_key ? `typed:${identity.api_key}` : (s.llm.api_key_set ? 'saved' : ''),
+    };
+  }
+  function sameLlmIdentity(a, b) {
+    return JSON.stringify(a || {}) === JSON.stringify(b || {});
+  }
   function clearLlmCapabilitySnapshot() {
     lastLlmCapabilitySnapshot = null;
   }
@@ -3024,7 +3055,9 @@ async function renderSettings() {
     fillModelSelects();
     syncCustomModel('model');
     syncCustomModel('long');
+    modelListIdentity = currentModelListIdentity();
   }
+  let modelListIdentity = currentModelListIdentity();
   fillModelSelects();
   document.getElementById('s-model-custom').checked = !!s.llm.custom_model;
   document.getElementById('s-model-long-custom').checked = !!s.llm.custom_long_context_model;
@@ -3032,10 +3065,13 @@ async function renderSettings() {
   syncCustomModel('long');
   document.getElementById('s-model-custom').addEventListener('change', () => { syncCustomModel('model'); clearLlmCapabilitySnapshot(); });
   document.getElementById('s-model-long-custom').addEventListener('change', () => { syncCustomModel('long'); clearLlmCapabilitySnapshot(); });
-  const llmIdentityInputs = [
+  const llmEndpointInputs = [
     ...document.querySelectorAll('input[name="s-provider"]'),
     document.getElementById('s-baseurl'),
     document.getElementById('s-apikey'),
+  ];
+  const llmIdentityInputs = [
+    ...llmEndpointInputs,
     document.getElementById('s-model'),
     document.getElementById('s-model-select'),
     document.getElementById('s-model-long'),
@@ -3044,6 +3080,19 @@ async function renderSettings() {
   llmIdentityInputs.forEach(input => {
     input?.addEventListener('input', clearLlmCapabilitySnapshot);
     input?.addEventListener('change', clearLlmCapabilitySnapshot);
+  });
+  function markModelListMaybeStale() {
+    pendingUnlistedModelConfirm = '';
+    clearLlmCapabilitySnapshot();
+    const status = document.getElementById('s-model-status');
+    if (availableModels.length && !sameLlmIdentity(modelListIdentity, currentModelListIdentity()) && status) {
+      status.className = 'status warn';
+      status.textContent = '端点或密钥已变化，请重新获取模型列表。';
+    }
+  }
+  llmEndpointInputs.forEach(input => {
+    input?.addEventListener('input', markModelListMaybeStale);
+    input?.addEventListener('change', markModelListMaybeStale);
   });
 
   document.getElementById('s-apikey-toggle').addEventListener('click', () => {
@@ -3060,26 +3109,17 @@ async function renderSettings() {
     $st.className = 'status';
     $st.textContent = '获取中...';
     try {
-      const key = document.getElementById('s-apikey').value.trim();
-      const requestIdentity = {
-        provider: selectedProvider(),
-        base_url: normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value),
-        api_key: key,
-      };
+      const requestIdentity = currentModelRequestIdentity();
       const payload = { provider: requestIdentity.provider, base_url: requestIdentity.base_url, persist: true };
-      if (key) payload.api_key = key;
+      if (requestIdentity.api_key) payload.api_key = requestIdentity.api_key;
       const r = await api('/api/list-models', { method: 'POST', body: payload });
-      const currentIdentity = {
-        provider: selectedProvider(),
-        base_url: normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value),
-        api_key: document.getElementById('s-apikey').value.trim(),
-      };
-      if (JSON.stringify(currentIdentity) !== JSON.stringify(requestIdentity)) {
+      if (!sameLlmIdentity(currentModelRequestIdentity(), requestIdentity)) {
         $st.className = 'status warn';
         $st.textContent = '端点或密钥已变化，旧模型列表结果已忽略。';
         return;
       }
       availableModels = r.models || [];
+      modelListIdentity = currentModelListIdentity();
       clearLlmCapabilitySnapshot();
       fillModelSelects();
       $st.className = 'status ok';
@@ -3141,6 +3181,13 @@ async function renderSettings() {
       return;
     }
     const availableIds = new Set(availableModels.map(m => m.id));
+    const modelListCurrent = sameLlmIdentity(modelListIdentity, currentModelListIdentity());
+    const staleModelList = availableModels.length && !modelListCurrent;
+    if (staleModelList && (!customModel || (longModel && !customLongModel))) {
+      $st.className = 'status warn';
+      $st.textContent = '⚠ 端点或密钥已变化，请重新获取模型列表后保存；如果确认模型可用，可以开启自定义模型后保存。';
+      return;
+    }
     const unlisted = [];
     if (availableIds.size && !customModel && !availableIds.has(model)) unlisted.push(model);
     if (availableIds.size && longModel && !customLongModel && !availableIds.has(longModel)) unlisted.push(longModel);
@@ -3161,7 +3208,7 @@ async function renderSettings() {
         custom_model: customModel,
         custom_long_context_model: customLongModel,
         ai_concurrency: aiConcurrency,
-        available_models: availableModels,
+        available_models: modelListCurrent ? availableModels : [],
       },
     };
     const capabilities = currentCapabilitySnapshotForSave();
@@ -3701,6 +3748,19 @@ async function renderSetup() {
   const $next = document.getElementById('setup-next');
   const wizardData = { llm: {}, wechat: {}, whitelist: new Map() };
   let setupPaintSeq = 0;
+  function normalizeSetupBaseUrl(value) {
+    return String(value || '').trim().replace(/\/+$/, '');
+  }
+  function setupLlmIdentityFromDom() {
+    return {
+      provider: document.querySelector('input[name="w-provider"]:checked')?.value || 'openai',
+      base_url: normalizeSetupBaseUrl(document.getElementById('w-base')?.value || ''),
+      api_key: document.getElementById('w-key')?.value.trim() || '',
+    };
+  }
+  function sameSetupLlmIdentity(a, b) {
+    return JSON.stringify(a || {}) === JSON.stringify(b || {});
+  }
 
   function paint() {
     const paintSeq = ++setupPaintSeq;
@@ -3745,20 +3805,48 @@ async function renderSetup() {
         <div class="form-row"><label>长上下文模型</label><select id="w-model-long">${models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('') || '<option value="">请先获取模型</option>'}</select></div>`;
       if (wizardData.llm.model) document.getElementById('w-model').value = wizardData.llm.model;
       if (wizardData.llm.long_context_model) document.getElementById('w-model-long').value = wizardData.llm.long_context_model;
+      const markSetupModelsStale = () => {
+        const $st = document.getElementById('w-status');
+        if (wizardData.llm.available_models?.length && !sameSetupLlmIdentity(wizardData.llm.model_identity, setupLlmIdentityFromDom())) {
+          wizardData.llm.available_models = [];
+          wizardData.llm.model = '';
+          wizardData.llm.long_context_model = '';
+          document.getElementById('w-model').innerHTML = '<option value="">请重新获取模型</option>';
+          document.getElementById('w-model-long').innerHTML = '<option value="">请重新获取模型</option>';
+          if ($st) {
+            $st.className = 'status warn';
+            $st.textContent = '端点或密钥已变化，请重新获取模型列表。';
+          }
+        }
+      };
+      [
+        ...document.querySelectorAll('input[name="w-provider"]'),
+        document.getElementById('w-base'),
+        document.getElementById('w-key'),
+      ].forEach(input => {
+        input?.addEventListener('input', markSetupModelsStale);
+        input?.addEventListener('change', markSetupModelsStale);
+      });
       const listButton = document.getElementById('w-list');
       listButton.addEventListener('click', () => withBusyButtons(listButton, async () => {
         const $st = document.getElementById('w-status');
         $st.className = 'status'; $st.textContent = '获取中...';
         try {
-          const provider = document.querySelector('input[name="w-provider"]:checked')?.value || 'openai';
+          const requestIdentity = setupLlmIdentityFromDom();
           const r = await api('/api/list-models', {
             method: 'POST',
-            body: { provider, base_url: document.getElementById('w-base').value, api_key: document.getElementById('w-key').value },
+            body: { provider: requestIdentity.provider, base_url: requestIdentity.base_url, api_key: requestIdentity.api_key },
           });
-          wizardData.llm.provider = provider;
-          wizardData.llm.base_url = document.getElementById('w-base').value;
-          wizardData.llm.api_key = document.getElementById('w-key').value;
+          if (!sameSetupLlmIdentity(setupLlmIdentityFromDom(), requestIdentity)) {
+            $st.className = 'status warn';
+            $st.textContent = '端点或密钥已变化，旧模型列表结果已忽略。';
+            return;
+          }
+          wizardData.llm.provider = requestIdentity.provider;
+          wizardData.llm.base_url = requestIdentity.base_url;
+          wizardData.llm.api_key = requestIdentity.api_key;
           wizardData.llm.available_models = r.models || [];
+          wizardData.llm.model_identity = requestIdentity;
           wizardData.llm.model = wizardData.llm.available_models[0]?.id || '';
           wizardData.llm.long_context_model = wizardData.llm.model;
           $st.className = 'status ok'; $st.textContent = `✓ 获取到 ${wizardData.llm.available_models.length} 个模型`;
@@ -3854,6 +3942,7 @@ async function renderSetup() {
       wizardData.llm.provider = provider;
       wizardData.llm.model = document.getElementById('w-model').value;
       wizardData.llm.long_context_model = document.getElementById('w-model-long').value;
+      const currentIdentity = setupLlmIdentityFromDom();
       if (!wizardData.llm.base_url || !wizardData.llm.api_key) {
         const $st = document.getElementById('w-status');
         if ($st) {
@@ -3867,6 +3956,14 @@ async function renderSetup() {
         if ($st) {
           $st.className = 'status err';
           $st.textContent = '✗ 请先点击「获取模型」并选择模型';
+        }
+        return;
+      }
+      if (!sameSetupLlmIdentity(wizardData.llm.model_identity, currentIdentity)) {
+        const $st = document.getElementById('w-status');
+        if ($st) {
+          $st.className = 'status warn';
+          $st.textContent = '端点或密钥已变化，请重新获取模型列表。';
         }
         return;
       }
@@ -3897,7 +3994,8 @@ async function renderSetup() {
     }
     if (step === 4) {
       const wl = [...wizardData.whitelist.values()];
-      const payload = { llm: wizardData.llm, groups: { whitelist: wl } };
+      const { model_identity: _modelIdentity, ...llmPayload } = wizardData.llm;
+      const payload = { llm: llmPayload, groups: { whitelist: wl } };
       if (wizardData.wechat.manual_key) payload.wechat = { manual_key: wizardData.wechat.manual_key };
       $next.disabled = true;
       const oldText = $next.textContent;

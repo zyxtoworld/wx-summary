@@ -975,6 +975,13 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
     padding: var(--gap-2);
     justify-content: flex-start;
   }
+  .modal-backdrop {
+    padding: var(--gap-2);
+  }
+  .image-modal,
+  .zoom-modal {
+    width: calc(100vw - var(--gap-2) * 2);
+  }
   .page-head {
     align-items: stretch;
     flex-direction: column;
