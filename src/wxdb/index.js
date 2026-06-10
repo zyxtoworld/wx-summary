@@ -122,6 +122,19 @@ function throwIfAborted(signal) {
   if (signal?.aborted) throw abortError();
 }
 
+function markMediaEnrichmentFailure(msg, error, fallbackReason = '媒体解析失败') {
+  if (!msg?.media) return;
+  if (msg.media.payload_omitted_reason) return;
+  const detail = String(error?.message || error || '').replace(/\s+/g, ' ').trim();
+  const reason = detail ? `${fallbackReason}：${detail}` : fallbackReason;
+  msg.media.payload_omitted_reason = reason.slice(0, 160);
+}
+
+function markMediaPayloadMissing(msg, reason) {
+  if (!msg?.media || msg.media.payload_omitted_reason) return;
+  msg.media.payload_omitted_reason = String(reason || '媒体内容未能转换为可发送给 AI 的格式').slice(0, 160);
+}
+
 export async function probeWxDb(input = '') {
   const accountId = typeof input === 'string' ? input : (input?.account_id || '');
   const rawKeys = typeof input === 'object' && Array.isArray(input.raw_keys) ? input.raw_keys : [];
@@ -1141,138 +1154,183 @@ async function enrichMessageMedia(account, rawKeys, messages, signal) {
 
     for (const msg of mediaMessages) {
       throwIfAborted(signal);
-      if (msg.type === 'image' && msg.media.md5) {
-        const row = (imageStmt ? imageStmt.get([msg.media.md5]) : null) || findImageByFileKey(imageByNameStmt, msg.media.file_key);
-        let localPath = '';
-        if (row) {
-          msg.media.file_name = msg.media.file_name || String(row.file_name || '');
-          msg.media.size = msg.media.size || Number(row.file_size || 0);
-          const d1 = dirName(row.dir1);
-          const d2 = dirName(row.dir2);
-          localPath = d1 && d2 && row.file_name
-            ? path.join(account.account_root, 'msg', 'attach', d1, d2, 'Img', String(row.file_name))
-            : '';
-        }
-        if (!localPath && msg.media.file_key) {
-          localPath = await findLocalImagePathByFileKey(account, msg.media.file_key, localImageSearch, msg);
+      try {
+        if (msg.type === 'image') {
+          const row = (imageStmt && msg.media.md5 ? imageStmt.get([msg.media.md5]) : null)
+            || findImageByFileKey(imageByNameStmt, msg.media.file_key)
+            || findImageByFileName(imageByNameStmt, msg.media.file_name);
+          let localPath = '';
+          if (row) {
+            msg.media.file_name = msg.media.file_name || String(row.file_name || '');
+            msg.media.size = msg.media.size || Number(row.file_size || 0);
+            const d1 = dirName(row.dir1);
+            const d2 = dirName(row.dir2);
+            localPath = d1 && d2 && row.file_name
+              ? path.join(account.account_root, 'msg', 'attach', d1, d2, 'Img', String(row.file_name))
+              : '';
+          }
+          if (!localPath && msg.media.file_key) {
+            localPath = await findLocalImagePathByFileKey(account, msg.media.file_key, localImageSearch, msg);
+            if (localPath) {
+              msg.media.file_name = msg.media.file_name || path.basename(localPath);
+              const st = await fsp.stat(localPath).catch(() => null);
+              if (st?.isFile()) msg.media.size = msg.media.size || st.size;
+            }
+          }
+          if (!localPath && msg.media.file_name) {
+            localPath = await findLocalImagePathByFileName(account, msg.media.file_name, msg);
+            if (localPath) {
+              msg.media.file_name = msg.media.file_name || path.basename(localPath);
+              const st = await fsp.stat(localPath).catch(() => null);
+              if (st?.isFile()) msg.media.size = msg.media.size || st.size;
+            }
+          }
           if (localPath) {
-            msg.media.file_name = msg.media.file_name || path.basename(localPath);
-            const st = await fsp.stat(localPath).catch(() => null);
-            if (st?.isFile()) msg.media.size = msg.media.size || st.size;
+            msg.media.local_available = await exists(localPath);
+            if (msg.media.local_available) {
+              imageJobs.push({ msg, localPath });
+              try {
+                imageSamples.push(...await readImageValidationSamples(localPath));
+              } catch (e) {
+                if (e?.status === 499 || signal?.aborted) throw e;
+                markMediaEnrichmentFailure(msg, e, '图片解密样本读取失败');
+              }
+            }
           }
-        }
-        if (localPath) {
-          msg.media.local_available = await exists(localPath);
-          if (msg.media.local_available) {
-            imageJobs.push({ msg, localPath });
-            imageSamples.push(...await readImageValidationSamples(localPath));
+        } else if (msg.type === 'file') {
+          const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
+            || (fileByNameStmt && msg.media.file_name ? fileByNameStmt.get([msg.media.file_name]) : null);
+          if (row) {
+            msg.media.file_name = msg.media.file_name || String(row.file_name || '');
+            msg.media.size = msg.media.size || Number(row.file_size || 0);
+            const localPath = await resolveAttachPath(account, dirName(row.dir1), dirName(row.dir2), row.file_name, ['File', 'Video', 'Audio'])
+              || await findLocalMessageFilePath(account, row.file_name, msg);
+            if (localPath) {
+              msg.media.local_available = true;
+              msg.media.local_path_hint = path.basename(localPath);
+              msg.media.ext = msg.media.ext || path.extname(localPath).slice(1).toLowerCase();
+              if (isVideoLike(msg.media)) videoJobs.push({ msg, localPath });
+              else if (isAudioLike(msg.media)) audioJobs.push({ msg, localPath });
+            }
+          } else if (msg.media.file_name) {
+            const localPath = await findLocalMessageFilePath(account, msg.media.file_name, msg);
+            if (localPath) {
+              msg.media.local_available = true;
+              msg.media.local_path_hint = path.basename(localPath);
+              msg.media.ext = msg.media.ext || path.extname(localPath).slice(1).toLowerCase();
+              const st = await fsp.stat(localPath).catch(() => null);
+              if (st?.isFile()) msg.media.size = msg.media.size || st.size;
+              if (isVideoLike(msg.media)) videoJobs.push({ msg, localPath });
+              else if (isAudioLike(msg.media)) audioJobs.push({ msg, localPath });
+            }
           }
-        }
-      } else if (msg.type === 'file') {
-        const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
-          || (fileByNameStmt && msg.media.file_name ? fileByNameStmt.get([msg.media.file_name]) : null);
-        if (row) {
-          msg.media.file_name = msg.media.file_name || String(row.file_name || '');
-          msg.media.size = msg.media.size || Number(row.file_size || 0);
-          const localPath = await resolveAttachPath(account, dirName(row.dir1), dirName(row.dir2), row.file_name, ['File', 'Video', 'Audio'])
-            || await findLocalMessageFilePath(account, row.file_name, msg);
+          msg.content = formatFileContent(msg.media);
+        } else if (msg.type === 'video') {
+          const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
+            || (fileByNameStmt && msg.media.file_name ? fileByNameStmt.get([msg.media.file_name]) : null);
+          let localPath = '';
+          if (row) {
+            msg.media.file_name = msg.media.file_name || String(row.file_name || '');
+            msg.media.size = msg.media.size || Number(row.file_size || 0);
+            localPath = await resolveAttachPath(account, dirName(row.dir1), dirName(row.dir2), row.file_name, ['Video', 'File'])
+              || await findLocalMessageFilePath(account, row.file_name, msg);
+          }
+          if (!localPath && msg.media.file_key) {
+            localPath = await findLocalVideoPathByFileKey(account, msg.media.file_key, msg);
+            if (localPath) {
+              msg.media.file_name = msg.media.file_name || path.basename(localPath);
+              const st = await fsp.stat(localPath).catch(() => null);
+              if (st?.isFile()) msg.media.size = msg.media.size || st.size;
+            }
+          }
           if (localPath) {
             msg.media.local_available = true;
             msg.media.local_path_hint = path.basename(localPath);
-            msg.media.ext = msg.media.ext || path.extname(localPath).slice(1).toLowerCase();
-            if (isVideoLike(msg.media)) videoJobs.push({ msg, localPath });
-            else if (isAudioLike(msg.media)) audioJobs.push({ msg, localPath });
+            videoJobs.push({ msg, localPath });
           }
-        } else if (msg.media.file_name) {
-          const localPath = await findLocalMessageFilePath(account, msg.media.file_name, msg);
+          msg.content = formatVideoContent(msg.media);
+        } else if (msg.type === 'voice') {
+          const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
+            || (fileByNameStmt && msg.media.file_name ? fileByNameStmt.get([msg.media.file_name]) : null)
+            || findFileByFileKey(fileByNameStmt, msg.media.file_key, VOICE_FILE_EXTENSIONS);
+          let localPath = '';
+          if (row) {
+            msg.media.file_name = msg.media.file_name || String(row.file_name || '');
+            msg.media.size = msg.media.size || Number(row.file_size || 0);
+            localPath = await resolveAttachPath(account, dirName(row.dir1), dirName(row.dir2), row.file_name, ['Voice', 'Audio', 'File'])
+              || await findLocalVoicePathByFileName(account, row.file_name, msg);
+          }
+          if (!localPath && msg.media.file_name) {
+            localPath = await findLocalVoicePathByFileName(account, msg.media.file_name, msg);
+          }
+          if (!localPath && msg.media.file_key) {
+            localPath = await findLocalVoicePathByFileKey(account, msg.media.file_key, msg);
+          }
           if (localPath) {
             msg.media.local_available = true;
             msg.media.local_path_hint = path.basename(localPath);
+            msg.media.file_name = msg.media.file_name || path.basename(localPath);
             msg.media.ext = msg.media.ext || path.extname(localPath).slice(1).toLowerCase();
             const st = await fsp.stat(localPath).catch(() => null);
             if (st?.isFile()) msg.media.size = msg.media.size || st.size;
-            if (isVideoLike(msg.media)) videoJobs.push({ msg, localPath });
-            else if (isAudioLike(msg.media)) audioJobs.push({ msg, localPath });
+            audioJobs.push({ msg, localPath });
           }
+          msg.content = formatVoiceContent(msg.media);
         }
-        msg.content = formatFileContent(msg.media);
-      } else if (msg.type === 'video') {
-        const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
-          || (fileByNameStmt && msg.media.file_name ? fileByNameStmt.get([msg.media.file_name]) : null);
-        let localPath = '';
-        if (row) {
-          msg.media.file_name = msg.media.file_name || String(row.file_name || '');
-          msg.media.size = msg.media.size || Number(row.file_size || 0);
-          localPath = await resolveAttachPath(account, dirName(row.dir1), dirName(row.dir2), row.file_name, ['Video', 'File'])
-            || await findLocalMessageFilePath(account, row.file_name, msg);
-        }
-        if (!localPath && msg.media.file_key) {
-          localPath = await findLocalVideoPathByFileKey(account, msg.media.file_key, msg);
-          if (localPath) {
-            msg.media.file_name = msg.media.file_name || path.basename(localPath);
-            const st = await fsp.stat(localPath).catch(() => null);
-            if (st?.isFile()) msg.media.size = msg.media.size || st.size;
-          }
-        }
-        if (localPath) {
-          msg.media.local_available = true;
-          msg.media.local_path_hint = path.basename(localPath);
-          videoJobs.push({ msg, localPath });
-        }
-        msg.content = formatVideoContent(msg.media);
-      } else if (msg.type === 'voice') {
-        const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
-          || (fileByNameStmt && msg.media.file_name ? fileByNameStmt.get([msg.media.file_name]) : null)
-          || findFileByFileKey(fileByNameStmt, msg.media.file_key, VOICE_FILE_EXTENSIONS);
-        let localPath = '';
-        if (row) {
-          msg.media.file_name = msg.media.file_name || String(row.file_name || '');
-          msg.media.size = msg.media.size || Number(row.file_size || 0);
-          localPath = await resolveAttachPath(account, dirName(row.dir1), dirName(row.dir2), row.file_name, ['Voice', 'Audio', 'File'])
-            || await findLocalVoicePathByFileName(account, row.file_name, msg);
-        }
-        if (!localPath && msg.media.file_name) {
-          localPath = await findLocalVoicePathByFileName(account, msg.media.file_name, msg);
-        }
-        if (!localPath && msg.media.file_key) {
-          localPath = await findLocalVoicePathByFileKey(account, msg.media.file_key, msg);
-        }
-        if (localPath) {
-          msg.media.local_available = true;
-          msg.media.local_path_hint = path.basename(localPath);
-          msg.media.file_name = msg.media.file_name || path.basename(localPath);
-          msg.media.ext = msg.media.ext || path.extname(localPath).slice(1).toLowerCase();
-          const st = await fsp.stat(localPath).catch(() => null);
-          if (st?.isFile()) msg.media.size = msg.media.size || st.size;
-          audioJobs.push({ msg, localPath });
-        }
-        msg.content = formatVoiceContent(msg.media);
+      } catch (e) {
+        if (e?.status === 499 || signal?.aborted) throw e;
+        markMediaEnrichmentFailure(msg, e, '媒体定位失败');
       }
     }
 
-    const imageKeys = await getImageKeyCandidatesForSamples(imageSamples);
+    let imageKeys = [];
+    try {
+      imageKeys = await getImageKeyCandidatesForSamples(imageSamples);
+    } catch (e) {
+      if (e?.status === 499 || signal?.aborted) throw e;
+      for (const job of imageJobs) markMediaEnrichmentFailure(job.msg, e, '图片解密 key 扫描失败');
+    }
     for (const job of imageJobs) {
       throwIfAborted(signal);
-      const data = await readImageDataUrlIfUsable(job.localPath, imageKeys);
-      if (data) Object.assign(job.msg.media, data);
+      try {
+        const data = await readImageDataUrlIfUsable(job.localPath, imageKeys);
+        if (data) Object.assign(job.msg.media, data);
+        else markMediaPayloadMissing(job.msg, '本地图片已定位，但未能解密成可发送给 AI 的图片');
+      } catch (e) {
+        if (e?.status === 499 || signal?.aborted) throw e;
+        markMediaEnrichmentFailure(job.msg, e, '图片解密失败');
+      }
       job.msg.content = formatImageContent(job.msg.media);
     }
     for (const job of videoJobs) {
       throwIfAborted(signal);
-      const frame = await readVideoFrameDataUrlIfUsable(job.localPath);
-      if (frame) Object.assign(job.msg.media, { frame_data_url: frame.data_url, frame_mime: frame.mime });
+      try {
+        const frame = await readVideoFrameDataUrlIfUsable(job.localPath);
+        if (frame) Object.assign(job.msg.media, { frame_data_url: frame.data_url, frame_mime: frame.mime });
+        else markMediaPayloadMissing(job.msg, '本地视频已定位，但未能抽取可发送给 AI 的关键帧');
+      } catch (e) {
+        if (e?.status === 499 || signal?.aborted) throw e;
+        markMediaEnrichmentFailure(job.msg, e, '视频关键帧提取失败');
+      }
       job.msg.content = job.msg.type === 'file' ? formatFileContent(job.msg.media) : formatVideoContent(job.msg.media);
     }
     for (const job of audioJobs) {
       throwIfAborted(signal);
-      const audio = await readAudioDataUrlIfUsable(job.localPath);
-      if (audio) Object.assign(job.msg.media, audio);
+      try {
+        const audio = await readAudioDataUrlIfUsable(job.localPath);
+        if (audio) Object.assign(job.msg.media, audio);
+        else markMediaPayloadMissing(job.msg, '本地语音/音频已定位，但未能转换成可发送给 AI 的音频');
+      } catch (e) {
+        if (e?.status === 499 || signal?.aborted) throw e;
+        markMediaEnrichmentFailure(job.msg, e, '音频读取/转码失败');
+      }
       job.msg.content = job.msg.type === 'voice' ? formatVoiceContent(job.msg.media) : formatFileContent(job.msg.media);
     }
-  } catch {
-    // Media enrichment is best-effort; XML metadata is still useful for the summary prompt.
+  } catch (e) {
+    if (e?.status === 499 || signal?.aborted) throw e;
+    for (const msg of mediaMessages) markMediaEnrichmentFailure(msg, e, '媒体解析流程失败');
   } finally {
-    if (hardlink) await hardlink.close();
+    if (hardlink) await hardlink.close().catch(() => {});
   }
 }
 
@@ -2150,6 +2208,16 @@ function findImageByFileKey(stmt, fileKey) {
   return null;
 }
 
+function findImageByFileName(stmt, fileName) {
+  const name = safeLocalFileName(fileName);
+  if (!stmt || !name) return null;
+  for (const candidate of imageCandidateNamesFromFileName(name)) {
+    const row = stmt.get([candidate]);
+    if (row) return row;
+  }
+  return null;
+}
+
 function findFileByFileKey(stmt, fileKey, extensions = []) {
   const key = String(fileKey || '').trim().toLowerCase();
   if (!stmt || !/^[a-f0-9]{32}$/.test(key)) return null;
@@ -2169,6 +2237,14 @@ async function findLocalImagePathByFileKey(account, fileKey, cache = {}, msg = n
   return cache.index.get(key) || '';
 }
 
+async function findLocalImagePathByFileName(account, fileName, msg = null) {
+  const safeName = safeLocalFileName(fileName);
+  if (!safeName) return '';
+  const direct = await findLocalImagePathByConversationFileName(account, safeName, msg);
+  if (direct) return direct;
+  return await findLocalImagePathByBoundedNameSearch(account, safeName, msg);
+}
+
 async function findLocalImagePathByConversation(account, key, msg) {
   const conversationDir = conversationStorageDir(msg?.group || msg?.sender);
   const monthDir = messageMonthDir(msg);
@@ -2179,6 +2255,59 @@ async function findLocalImagePathByConversation(account, key, msg) {
     if (await exists(candidate)) return candidate;
   }
   return '';
+}
+
+async function findLocalImagePathByConversationFileName(account, fileName, msg) {
+  const conversationDir = conversationStorageDir(msg?.group || msg?.sender);
+  const monthDir = messageMonthDir(msg);
+  if (!conversationDir || !monthDir) return '';
+  const dir = path.join(account.account_root, 'msg', 'attach', conversationDir, monthDir, 'Img');
+  for (const name of imageCandidateNamesFromFileName(fileName)) {
+    const candidate = path.join(dir, name);
+    if (await exists(candidate)) return candidate;
+  }
+  return '';
+}
+
+async function findLocalImagePathByBoundedNameSearch(account, fileName, msg) {
+  const monthDir = messageMonthDir(msg);
+  if (!monthDir) return '';
+  const targets = new Set(imageCandidateNamesFromFileName(fileName).map(name => name.toLowerCase()));
+  if (!targets.size) return '';
+  const root = path.join(account.account_root, 'msg', 'attach');
+  const stack = [root];
+  let visited = 0;
+  const deadline = Date.now() + LOCAL_IMAGE_INDEX_MAX_MS;
+  while (stack.length && visited < LOCAL_IMAGE_INDEX_MAX_ENTRIES && Date.now() < deadline) {
+    const dir = stack.pop();
+    const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      visited++;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const lower = entry.name.toLowerCase();
+        if (entry.name === monthDir || lower === 'img' || /^[a-f0-9]{32}$/i.test(entry.name)) stack.push(full);
+      } else if (entry.isFile() && targets.has(entry.name.toLowerCase())) {
+        return full;
+      }
+      if (visited >= LOCAL_IMAGE_INDEX_MAX_ENTRIES || Date.now() >= deadline) break;
+    }
+  }
+  return '';
+}
+
+function imageCandidateNamesFromFileName(fileName) {
+  const name = safeLocalFileName(fileName);
+  if (!name) return [];
+  const base = name.replace(/\.(?:dat|jpe?g|png|webp|heic|heif|gif)$/i, '');
+  const withDat = /\.dat$/i.test(name) ? '' : `${name}.dat`;
+  return uniqueStrings([
+    name,
+    withDat,
+    `${base}.dat`,
+    `${base}_h.dat`,
+    `${base}_t.dat`,
+  ]);
 }
 
 async function buildLocalImageFileIndex(account) {
