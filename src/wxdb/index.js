@@ -795,6 +795,7 @@ export async function copyDbFile(account, dbFile) {
   await ensureDir(targetDir);
   const target = path.join(targetDir, path.basename(source));
   await fsp.copyFile(source, target);
+  const sidecars = await copyDbSidecars(source, target);
   const copied = await fsp.stat(target);
   const header = await readHeader(target);
   return {
@@ -805,7 +806,27 @@ export async function copyDbFile(account, dbFile) {
     sha256_16: await sha256Prefix(target),
     encrypted_like: !header.equals(SQLITE_HEADER),
     sqlite_header: header.equals(SQLITE_HEADER),
+    sidecars,
   };
+}
+
+async function copyDbSidecars(source, target) {
+  const sidecars = [];
+  for (const suffix of ['-wal', '-shm']) {
+    const from = `${source}${suffix}`;
+    const to = `${target}${suffix}`;
+    const st = await fsp.stat(from).catch(() => null);
+    if (!st?.isFile()) continue;
+    await fsp.copyFile(from, to);
+    const copied = await fsp.stat(to).catch(() => null);
+    sidecars.push({
+      name: path.basename(from),
+      suffix,
+      bytes: copied?.size || st.size || 0,
+      last_write_time: st.mtime.toISOString(),
+    });
+  }
+  return sidecars;
 }
 
 export async function readDbInventory(accountId = '') {
@@ -1740,6 +1761,12 @@ async function decryptWeixinV4DbToPlaintext(dbPath, keyHex) {
     await output.close().catch(() => {});
     if (failed) await fsp.rm(target, { force: true }).catch(() => {});
   }
+  try {
+    await mergeWeixinV4WalIntoPlaintext(dbPath, target, material);
+  } catch (e) {
+    await fsp.rm(target, { force: true }).catch(() => {});
+    throw e;
+  }
   return target;
 }
 
@@ -1751,6 +1778,99 @@ async function readExactly(handle, buffer, offset, length, position) {
     total += res.bytesRead;
   }
   return total;
+}
+
+async function mergeWeixinV4WalIntoPlaintext(dbPath, plainPath, material) {
+  const walPath = `${dbPath}-wal`;
+  const st = await fsp.stat(walPath).catch(() => null);
+  if (!st?.isFile() || st.size < 32) return null;
+
+  const input = await fsp.open(walPath, 'r');
+  let output = null;
+  try {
+    const header = Buffer.alloc(32);
+    const headerBytes = await readExactly(input, header, 0, header.length, 0);
+    if (headerBytes !== header.length) return null;
+    const magic = header.readUInt32BE(0);
+    if (magic !== 0x377f0682 && magic !== 0x377f0683) return null;
+    const pageSize = header.readUInt32BE(8);
+    if (pageSize !== WEIXIN_V4_PAGE_SIZE) {
+      throw new Error(`Weixin v4 WAL page size ${pageSize || 'unknown'} is not supported`);
+    }
+    const checksumLittleEndian = magic === 0x377f0682;
+    const salt1 = header.readUInt32BE(16);
+    const salt2 = header.readUInt32BE(20);
+    let checksum = walChecksum(header.subarray(0, 24), checksumLittleEndian);
+
+    const frameSize = 24 + pageSize;
+    const frameCount = Math.floor((st.size - header.length) / frameSize);
+    if (frameCount <= 0) return null;
+
+    const frameHeader = Buffer.alloc(24);
+    const encryptedPage = Buffer.allocUnsafe(pageSize);
+    const frames = [];
+    let lastCommitIndex = -1;
+    let lastCommitDbPages = 0;
+    for (let i = 0; i < frameCount; i++) {
+      const frameOffset = header.length + i * frameSize;
+      const read = await readExactly(input, frameHeader, 0, frameHeader.length, frameOffset);
+      if (read !== frameHeader.length) break;
+      const pageNumber = frameHeader.readUInt32BE(0);
+      const commitDbPages = frameHeader.readUInt32BE(4);
+      if (frameHeader.readUInt32BE(8) !== salt1 || frameHeader.readUInt32BE(12) !== salt2) break;
+      const pageRead = await readExactly(input, encryptedPage, 0, pageSize, frameOffset + frameHeader.length);
+      if (pageRead !== pageSize) break;
+      const nextChecksum = walChecksum(frameHeader.subarray(0, 8), checksumLittleEndian, [...checksum]);
+      walChecksum(encryptedPage, checksumLittleEndian, nextChecksum);
+      if (frameHeader.readUInt32BE(16) !== nextChecksum[0] || frameHeader.readUInt32BE(20) !== nextChecksum[1]) break;
+      checksum = nextChecksum;
+      if (pageNumber < 1) continue;
+      frames.push({
+        pageNumber,
+        commitDbPages,
+        pageOffset: frameOffset + frameHeader.length,
+      });
+      if (commitDbPages > 0) {
+        lastCommitIndex = frames.length - 1;
+        lastCommitDbPages = commitDbPages;
+      }
+    }
+    if (lastCommitIndex < 0) return null;
+
+    output = await fsp.open(plainPath, 'r+');
+    for (const frame of frames.slice(0, lastCommitIndex + 1)) {
+      const read = await readExactly(input, encryptedPage, 0, pageSize, frame.pageOffset);
+      if (read !== pageSize) break;
+      const plainPage = decryptWeixinV4Page(encryptedPage, material, frame.pageNumber);
+      await output.write(plainPage, 0, plainPage.length, (frame.pageNumber - 1) * pageSize);
+    }
+    if (lastCommitDbPages > 0) {
+      await output.truncate(lastCommitDbPages * pageSize);
+    }
+    return {
+      frame_count: frameCount,
+      committed_frame_count: lastCommitIndex + 1,
+      commit_db_pages: lastCommitDbPages,
+    };
+  } catch (e) {
+    throw new Error(`合并微信数据库 WAL 增量失败：${e?.message || e}`);
+  } finally {
+    await input.close().catch(() => {});
+    await output?.close().catch(() => {});
+  }
+}
+
+function walChecksum(buffer, littleEndian, checksum = [0, 0]) {
+  let s0 = checksum[0] >>> 0;
+  let s1 = checksum[1] >>> 0;
+  const readUInt32 = littleEndian ? Buffer.prototype.readUInt32LE : Buffer.prototype.readUInt32BE;
+  for (let i = 0; i + 7 < buffer.length; i += 8) {
+    s0 = (s0 + readUInt32.call(buffer, i) + s1) >>> 0;
+    s1 = (s1 + readUInt32.call(buffer, i + 4) + s0) >>> 0;
+  }
+  checksum[0] = s0;
+  checksum[1] = s1;
+  return checksum;
 }
 
 function decryptWeixinV4Page(page, material, pageNumber) {
