@@ -2817,34 +2817,50 @@ async function renderSettings() {
     lastLlmCapabilitySnapshot = null;
   }
   function capabilitySnapshotMatches(snapshot, identity = currentLlmIdentity()) {
+    const snapshotLongModel = snapshot?.long_context_model || snapshot?.long_context?.model || snapshot?.model;
     return !!snapshot
       && snapshot.provider === identity.provider
       && normalizeSettingsBaseUrl(snapshot.base_url) === identity.base_url
       && snapshot.model === identity.model
-      && (snapshot.long_context_model || snapshot.model) === identity.long_context_model;
+      && snapshotLongModel === identity.long_context_model
+      && (!identity.long_context_model || identity.long_context_model === identity.model || snapshot.long_context?.model === identity.long_context_model);
   }
-  function capabilitySnapshotFromTest(result = {}) {
-    const identity = currentLlmIdentity();
-    const snapshot = {
-      provider: result.provider || selectedProvider(),
-      base_url: normalizeSettingsBaseUrl(result.base_url || document.getElementById('s-baseurl').value),
-      model: result.model || identity.model,
-      long_context_model: identity.long_context_model,
-      checked_at: result.checked_at || new Date().toISOString(),
-    };
-    for (const item of Array.isArray(result.capabilities) ? result.capabilities : []) {
+  function addCapabilityItems(target, items = []) {
+    for (const item of Array.isArray(items) ? items : []) {
       if (!item?.name) continue;
-      snapshot[item.name] = {
+      target[item.name] = {
         ok: !!item.ok,
         latency_ms: Number(item.latency_ms || 0) || 0,
       };
-      if (!item.ok && item.error) snapshot[item.name].error = String(item.error).slice(0, 300);
+      if (!item.ok && item.error) target[item.name].error = String(item.error).slice(0, 300);
+    }
+  }
+  function capabilitySnapshotFromTest(result = {}) {
+    const identity = currentLlmIdentity();
+    const modelResults = Array.isArray(result.model_results) && result.model_results.length
+      ? result.model_results
+      : [{ role: 'model', model: result.model, checked_at: result.checked_at, capabilities: result.capabilities || [] }];
+    const baseResult = modelResults.find(item => item.role === 'model') || modelResults[0] || {};
+    const longResult = modelResults.find(item => item.role === 'long_context');
+    const snapshot = {
+      provider: result.provider || selectedProvider(),
+      base_url: normalizeSettingsBaseUrl(result.base_url || document.getElementById('s-baseurl').value),
+      model: baseResult.model || result.model || identity.model,
+      long_context_model: identity.long_context_model,
+      checked_at: result.checked_at || baseResult.checked_at || new Date().toISOString(),
+    };
+    addCapabilityItems(snapshot, baseResult.capabilities || result.capabilities || []);
+    if (identity.long_context_model && identity.long_context_model !== identity.model) {
+      snapshot.long_context = {
+        model: longResult?.model || identity.long_context_model,
+        checked_at: longResult?.checked_at || result.checked_at || new Date().toISOString(),
+      };
+      addCapabilityItems(snapshot.long_context, longResult?.capabilities || []);
     }
     return snapshot;
   }
   function currentCapabilitySnapshotForSave() {
     const identity = currentLlmIdentity();
-    if (identity.long_context_model && identity.long_context_model !== identity.model) return null;
     return capabilitySnapshotMatches(lastLlmCapabilitySnapshot, identity) ? lastLlmCapabilitySnapshot : null;
   }
   function fillModelSelects() {
@@ -2943,18 +2959,23 @@ async function renderSettings() {
     try {
       const key = document.getElementById('s-apikey').value.trim();
       const customModel = document.getElementById('s-model-custom').checked;
+      const customLongModel = document.getElementById('s-model-long-custom').checked;
       const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
-      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, model };
+      const longModel = customLongModel ? document.getElementById('s-model-long').value.trim() : document.getElementById('s-model-long-select').value;
+      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, model, long_context_model: longModel || model };
       if (key) payload.api_key = key;
       const r = await api('/api/test-llm', {
         method: 'POST',
         body: payload,
       });
       lastLlmCapabilitySnapshot = capabilitySnapshotFromTest(r);
-      const okItems = (r.capabilities || []).filter(item => item.ok).map(formatCapabilityStatus);
-      const badItems = (r.capabilities || []).filter(item => !item.ok).map(formatCapabilityStatus);
-      $st.className = r.ok ? (badItems.length ? 'status warn' : 'status ok') : 'status err';
-      $st.textContent = `${r.ok ? '✓' : '✗'} 连通测试 ${r.latency_ms}ms：${[...okItems, ...badItems].join('；') || '无结果'}`;
+      const modelResults = Array.isArray(r.model_results) && r.model_results.length
+        ? r.model_results
+        : [{ role: 'model', model: r.model, ok: r.ok, capabilities: r.capabilities || [] }];
+      const resultText = modelResults.map(formatModelConnectivityResult).join('；');
+      const hasCapabilityFailures = modelResults.some(result => (result.capabilities || []).some(item => !item.ok));
+      $st.className = r.ok ? (hasCapabilityFailures ? 'status warn' : 'status ok') : (r.partial_ok ? 'status warn' : 'status err');
+      $st.textContent = `${r.ok ? '✓' : (r.partial_ok ? '⚠' : '✗')} 连通测试 ${r.latency_ms}ms：${resultText || '无结果'}`;
     } catch (e) {
       $st.className = 'status err'; $st.textContent = '✗ 失败：' + e.message;
     }
@@ -3453,6 +3474,15 @@ function formatCapabilityStatus(item = {}) {
           : (item.name || '能力');
   if (item.ok) return `${name} OK (${item.latency_ms}ms)`;
   return `${name} 失败：${item.error || '未知错误'}`;
+}
+
+function formatModelConnectivityResult(result = {}) {
+  const role = result.role === 'long_context' ? '长上下文模型' : '主模型';
+  const model = result.model ? ` ${result.model}` : '';
+  const okItems = (result.capabilities || []).filter(item => item.ok).map(formatCapabilityStatus);
+  const badItems = (result.capabilities || []).filter(item => !item.ok).map(formatCapabilityStatus);
+  const mark = result.ok ? (badItems.length ? '部分通过' : 'OK') : '失败';
+  return `${role}${model} ${mark}：${[...okItems, ...badItems].join('，') || '无能力结果'}`;
 }
 
 // ---------- 首次启动向导 ----------

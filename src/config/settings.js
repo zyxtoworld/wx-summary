@@ -261,9 +261,33 @@ function normalizeLlmCapabilities(value) {
   if (baseUrl) out.base_url = baseUrl;
   const model = String(value.model || '').trim();
   if (model) out.model = model.slice(0, 200);
+  const longContextModel = String(value.long_context_model || value.long_context?.model || '').trim();
+  if (longContextModel) out.long_context_model = longContextModel.slice(0, 200);
   const checkedAt = String(value.checked_at || '').trim();
   if (checkedAt && !Number.isNaN(Date.parse(checkedAt))) out.checked_at = new Date(checkedAt).toISOString();
+  copyLlmCapabilityItems(value, out);
+  const longContext = normalizeLlmCapabilityGroup(value.long_context);
+  if (Object.keys(longContext).length) {
+    if (!longContext.model && out.long_context_model) longContext.model = out.long_context_model;
+    out.long_context = longContext;
+  }
+  return out;
+}
+
+function normalizeLlmCapabilityGroup(value) {
+  if (!plainObject(value)) return {};
+  const out = {};
+  const model = String(value.model || '').trim();
+  if (model) out.model = model.slice(0, 200);
+  const checkedAt = String(value.checked_at || '').trim();
+  if (checkedAt && !Number.isNaN(Date.parse(checkedAt))) out.checked_at = new Date(checkedAt).toISOString();
+  copyLlmCapabilityItems(value, out);
+  return out;
+}
+
+function copyLlmCapabilityItems(source, out) {
   for (const key of ['chat', 'responses', 'responses_web_search', 'messages']) {
+    const value = source || {};
     const item = value[key];
     if (!plainObject(item) || typeof item.ok !== 'boolean') continue;
     out[key] = {
@@ -273,7 +297,6 @@ function normalizeLlmCapabilities(value) {
     const error = String(item.error || '').trim();
     if (error && !item.ok) out[key].error = error.slice(0, 300);
   }
-  return out;
 }
 
 function finiteNumber(value, fallback, min, max) {

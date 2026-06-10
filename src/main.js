@@ -713,23 +713,46 @@ async function handleApi(req, res, parsedUrl) {
     const baseUrl = normalizeBaseUrl(body.base_url || current.llm.base_url);
     const apiKey = body.api_key || current.llm.api_key;
     const model = body.model || current.llm.model || current.llm.available_models?.[0]?.id || '';
+    const longContextModel = body.long_context_model || current.llm.long_context_model || model;
+    const targets = [{ role: 'model', model }];
+    if (longContextModel && longContextModel !== model) targets.push({ role: 'long_context', model: longContextModel });
     const started = Date.now();
-    const result = await testLlmConnectivity({
-      provider,
-      base_url: baseUrl,
-      api_key: apiKey,
-      model,
-      timeout_ms: Math.min(Number(current.llm.timeout_ms || 15000), 15000),
-    });
+    const timeoutMs = Math.min(Number(current.llm.timeout_ms || 15000), 15000);
+    const modelResults = await Promise.all(targets.map(async target => ({
+      role: target.role,
+      ...(await testLlmConnectivity({
+        provider,
+        base_url: baseUrl,
+        api_key: apiKey,
+        model: target.model,
+        timeout_ms: timeoutMs,
+      })),
+    })));
+    const result = modelResults[0];
     logInfo('llm_connectivity_checked', {
       provider,
       base_url: baseUrl,
       model,
-      ok: result.ok,
+      long_context_model: longContextModel || '',
+      ok: modelResults.every(item => item.ok),
       latency_ms: Date.now() - started,
-      capabilities: result.capabilities?.map(item => ({ name: item.name, ok: item.ok, latency_ms: item.latency_ms })),
+      results: modelResults.map(item => ({
+        role: item.role,
+        model: item.model,
+        ok: item.ok,
+        capabilities: item.capabilities?.map(capability => ({ name: capability.name, ok: capability.ok, latency_ms: capability.latency_ms })),
+      })),
     });
-    return sendJson(res, 200, { ...result, latency_ms: Date.now() - started });
+    const allOk = modelResults.every(item => item.ok);
+    const anyOk = modelResults.some(item => item.ok);
+    return sendJson(res, 200, {
+      ...result,
+      ok: allOk,
+      partial_ok: anyOk && !allOk,
+      long_context_model: longContextModel || '',
+      latency_ms: Date.now() - started,
+      model_results: modelResults,
+    });
   }
 
   if (pathname === '/api/wechat/status' && req.method === 'GET') {

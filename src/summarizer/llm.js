@@ -2128,16 +2128,15 @@ function rememberAiWebSearchSupport(settings = {}, supported) {
 function savedAiWebSearchSupport(settings = {}) {
   const cap = settings?.llm?.capabilities;
   if (!cap || typeof cap !== 'object') return undefined;
-  const model = settings?.llm?.long_context_model || settings?.llm?.model || '';
   const baseModel = settings?.llm?.model || '';
-  const longModel = settings?.llm?.long_context_model || '';
-  const modelMatches = cap.model === model
-    || (cap.model === baseModel && (!longModel || longModel === baseModel));
+  const longModel = settings?.llm?.long_context_model || baseModel;
   const sameIdentity = cap.provider === settings?.llm?.provider
     && normalizeBaseUrl(cap.base_url || '') === normalizeBaseUrl(settings?.llm?.base_url || '')
-    && (!cap.model || modelMatches);
+    && (!cap.model || cap.model === baseModel);
   if (!sameIdentity) return undefined;
-  const item = cap.responses_web_search || cap.web_search_preview || cap.web_search;
+  const source = longModel && longModel !== baseModel ? cap.long_context : cap;
+  if (longModel && longModel !== baseModel && (!source || typeof source !== 'object' || source.model !== longModel)) return undefined;
+  const item = source.responses_web_search || source.web_search_preview || source.web_search;
   if (!item || typeof item !== 'object' || typeof item.ok !== 'boolean') return undefined;
   return item.ok;
 }
