@@ -2469,23 +2469,23 @@ async function copyCanvas() {
 // ---------- 历史页 ----------
 async function renderHistory() {
   $app.appendChild(tplOf('tpl-history'));
+  const historyRouteSeq = _routeSeq;
   const list = await api('/api/history');
+  if (historyRouteSeq !== _routeSeq) return;
   const $grid = document.getElementById('history-grid');
   const $empty = document.getElementById('history-empty');
+  const $search = document.getElementById('history-search');
   if (!list.length) {
     $empty.classList.remove('hidden');
     return;
   }
-  function paint(filter = '') {
-    const f = filter.trim().toLowerCase();
-    const filtered = list.filter(it => !f || historySearchText(it).includes(f));
-    $empty.classList.toggle('hidden', filtered.length > 0);
-    $empty.textContent = filtered.length ? '' : (f ? '没有匹配的历史摘要。' : '还没有摘要记录。回到「总结」页生成一个吧。');
-    $grid.innerHTML = filtered
-      .map(it => {
-        const version = historyItemCacheBust(it);
-        return `
-        <div class="history-item" data-id="${it.digest_id}">
+  const itemById = new Map(list.map(item => [String(item.digest_id || ''), item]));
+  const searchById = new Map(list.map(item => [String(item.digest_id || ''), historySearchText(item)]));
+  $grid.innerHTML = list
+    .map(it => {
+      const version = historyItemCacheBust(it);
+      return `
+        <div class="history-item" data-id="${escapeHtml(it.digest_id)}">
           <div class="history-thumb"><img loading="lazy" decoding="async" src="${historyThumbUrl(it.digest_id, version)}" alt="${escapeHtml(it.group)}" /></div>
           <div class="history-meta">
             <div class="gname">${escapeHtml(it.group)}</div>
@@ -2493,25 +2493,36 @@ async function renderHistory() {
             <div class="time muted">${escapeHtml(it.model)} · ${it.message_count || 0} 条</div>
           </div>
         </div>`;
-      }).join('');
-    document.querySelectorAll('.history-thumb img').forEach(img => {
-      const thumb = img.closest('.history-thumb');
-      const markLoaded = () => thumb?.classList.add('loaded');
-      const markError = () => thumb?.classList.add('error');
-      img.addEventListener('load', markLoaded, { once: true });
-      img.addEventListener('error', markError, { once: true });
-      if (img.complete && img.naturalWidth > 0) markLoaded();
-      else if (img.complete) markError();
+    }).join('');
+  document.querySelectorAll('.history-thumb img').forEach(img => {
+    const thumb = img.closest('.history-thumb');
+    const markLoaded = () => thumb?.classList.add('loaded');
+    const markError = () => thumb?.classList.add('error');
+    img.addEventListener('load', markLoaded, { once: true });
+    img.addEventListener('error', markError, { once: true });
+    if (img.complete && img.naturalWidth > 0) markLoaded();
+    else if (img.complete) markError();
+  });
+  const historyCards = [...document.querySelectorAll('.history-item')];
+  historyCards.forEach(el => {
+    el.addEventListener('click', () => {
+      const item = itemById.get(String(el.dataset.id || ''));
+      if (item) showHistoryModal(item);
     });
-    document.querySelectorAll('.history-item').forEach(el => {
-      el.addEventListener('click', () => {
-        const item = list.find(x => x.digest_id === el.dataset.id);
-        if (item) showHistoryModal(item);
-      });
+  });
+  function paint(filter = '') {
+    const f = filter.trim().toLowerCase();
+    let visible = 0;
+    historyCards.forEach(el => {
+      const matched = !f || (searchById.get(String(el.dataset.id || '')) || '').includes(f);
+      el.classList.toggle('hidden', !matched);
+      if (matched) visible++;
     });
+    $empty.classList.toggle('hidden', visible > 0);
+    $empty.textContent = visible ? '' : (f ? '没有匹配的历史摘要。' : '还没有摘要记录。回到「总结」页生成一个吧。');
   }
-  paint();
-  document.getElementById('history-search').addEventListener('input', e => paint(e.target.value));
+  paint($search?.value || '');
+  $search?.addEventListener('input', e => paint(e.target.value));
 }
 
 function historySearchText(item = {}) {
