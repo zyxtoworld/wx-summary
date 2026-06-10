@@ -344,7 +344,8 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   const normalized = sourceMessages.map(m => redactStructuredValue(m, settings.privacy));
   const enriched = await enrichMessagesWithLinkPreviews(normalized, settings.link_preview, settings, signal, onProgress);
   throwIfAborted(signal);
-  const chunkableMessages = prepareMessagesForChunking(enriched, llm);
+  const contextualMessages = attachGlobalNearbyContexts(enriched);
+  const chunkableMessages = prepareMessagesForChunking(contextualMessages, llm);
   const plan = buildDigestChunkPlan(chunkableMessages, llm);
   let raw;
   if (plan.useChunks) {
@@ -383,7 +384,7 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
         groupName,
         since,
         until,
-        messageBundle: formatMessageBundle(enriched),
+        messageBundle: formatMessageBundle(contextualMessages),
         mode: 'final/full',
         signal,
         onProgress,
@@ -1275,7 +1276,7 @@ function estimateMessageBundleStats(messages = []) {
 function estimateMessageBundleItemCost(messages = [], index = 0, counters = {}) {
   const msg = messages[index] || {};
   const refs = messageBundleRefs(msg, counters.imageCount || 0, counters.audioCount || 0);
-  const context = messageNeedsContext(msg) ? buildNearbyChatContext(messages, index) : '';
+  const context = messageContextForBundle(messages, index);
   const line = formatMessageLine(msg, { imageRef: refs.imageRef, audioRef: refs.audioRef, context });
   return {
     textChars: line.length + 1,
@@ -1363,7 +1364,7 @@ function formatMessageBundle(messages) {
   for (let index = 0; index < messages.length; index++) {
     const msg = messages[index];
     const refs = messageBundleRefs(msg, imageCount, audioCount);
-    const context = messageNeedsContext(msg) ? buildNearbyChatContext(messages, index) : '';
+    const context = messageContextForBundle(messages, index);
     const line = formatMessageLine(msg, { imageRef: refs.imageRef, audioRef: refs.audioRef, context });
     lines.push(line);
     textBuffer.push(line);
@@ -1445,6 +1446,22 @@ function messageNeedsContext(msg = {}) {
     || isVideoLikeMedia(msg.media)
     || isAudioLikeMedia(msg.media)
   );
+}
+
+function attachGlobalNearbyContexts(messages = []) {
+  if (!Array.isArray(messages) || !messages.length) return [];
+  return messages.map((msg, index) => {
+    if (!messageNeedsContext(msg)) return msg;
+    const context = buildNearbyChatContext(messages, index);
+    if (!context) return msg;
+    return { ...msg, _global_context_hint: context };
+  });
+}
+
+function messageContextForBundle(messages = [], index = 0) {
+  const msg = messages[index] || {};
+  if (!messageNeedsContext(msg)) return '';
+  return cleanField(msg._global_context_hint) || buildNearbyChatContext(messages, index);
 }
 
 function formatMessageLine(m, { imageRef = '', audioRef = '', context = '' } = {}) {
@@ -3377,6 +3394,7 @@ function sleep(ms, signal = null) {
 export const __llmInternals = {
   formatMessageBundle,
   prepareMessagesForChunking,
+  attachGlobalNearbyContexts,
   estimateMessageBundleStats,
   splitMessages,
   splitChunkForRecovery,
