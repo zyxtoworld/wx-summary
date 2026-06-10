@@ -1966,6 +1966,23 @@ async function callJsonModel({ settings, model, groupName, since, until, message
         });
         continue;
       }
+      if (
+        (imageCount || audioCount)
+        && !mediaTextRetryUsed
+        && attempt >= 1
+        && activeBlocks.some(block => block.kind === 'image' || block.kind === 'audio')
+        && isTransientError(e)
+      ) {
+        activeBlocks = withoutMediaBlocksForTextOnlyRetry(activeBlocks);
+        mediaTextRetryUsed = true;
+        audioRetryUsed = true;
+        notifyProgress(onProgress, {
+          phase: 'llm_media_retry',
+          label: 'AI 总结 · 媒体兜底',
+          detail: `任务 ${mode || 'summary'} 媒体分段临时不可用，改用文本和媒体元信息重试`,
+        });
+        continue;
+      }
       if (!parseRetryUsed && isJsonParseError(e)) {
         parseRetryUsed = true;
         await sleep(300, signal);
@@ -2748,14 +2765,17 @@ function httpError(status, message) {
 }
 
 function isTransientError(err) {
-  return [408, 425, 429, 500, 502, 503, 504].includes(Number(err?.status || 0));
+  const status = Number(err?.status || 0);
+  if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+  const message = String(err?.message || '').toLowerCase();
+  return /temporarily unavailable|temporary unavailable|service unavailable|api_error|overload|capacity|timeout|timed out|网络请求失败|服务暂时不可用|临时不可用|暂时不可用/.test(message);
 }
 
 function isLikelyChunkableFailure(err) {
   const status = Number(err?.status || 0);
   if ([400, 408, 413, 414, 422, 429, 500, 502, 503, 504].includes(status)) return true;
   const message = String(err?.message || '').toLowerCase();
-  return /context|token|too large|payload|request entity|timeout|timed out|length|maximum|max|rate|overload|capacity|网络请求失败/.test(message);
+  return /context|token|too large|payload|request entity|timeout|timed out|length|maximum|max|rate|overload|capacity|temporarily unavailable|service unavailable|api_error|网络请求失败|服务暂时不可用|临时不可用|暂时不可用/.test(message);
 }
 
 function isLikelyRecoverableChunkFailure(err) {
@@ -2821,6 +2841,7 @@ export const __llmInternals = {
   extractResponsesText,
   extractMessageLinkTargets,
   enrichMessagesWithLinkPreviews,
+  isTransientError,
   isLikelyChunkableFailure,
   isLikelyRecoverableChunkFailure,
   isModelEmptyContentError,
