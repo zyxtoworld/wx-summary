@@ -423,12 +423,20 @@ function probeExplorerSelection(targetPath) {
   });
 }
 
-function recordClipboardCopyEvidence(file, copied) {
+function normalizedClipboardSize(value) {
+  const width = Number(value?.width || 0);
+  const height = Number(value?.height || 0);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return null;
+  return { width, height };
+}
+
+function recordClipboardCopyEvidence(file, copied = {}) {
   LAST_CLIPBOARD_COPY_EVIDENCE = {
     copied_at: new Date().toISOString(),
     relative_path: projectRelativePath(file),
-    clipboard: copied?.clipboard || null,
+    clipboard: normalizedClipboardSize(copied?.clipboard),
     platform: process.platform,
+    method: sanitizeText(copied?.method || 'system_clipboard'),
   };
   return LAST_CLIPBOARD_COPY_EVIDENCE;
 }
@@ -836,6 +844,22 @@ async function handleApi(req, res, parsedUrl) {
     return sendJson(res, 200, { ok: true, clipboard: evidence.clipboard });
   }
 
+  if (pathname === '/api/record-clipboard-copy' && req.method === 'POST') {
+    const body = await readBody(req);
+    const settings = await loadSettings();
+    let target = body.path || '';
+    if (body.digest_id) {
+      const item = await findHistoryItem(settings, body.digest_id);
+      target = item?.file_path || '';
+    }
+    const file = await assertRevealable(settings, target, { extensions: ['.png'] });
+    const evidence = recordClipboardCopyEvidence(file, {
+      clipboard: body.clipboard,
+      method: body.method || 'browser_clipboard',
+    });
+    return sendJson(res, 200, { ok: true, clipboard: evidence.clipboard });
+  }
+
   if (pathname === '/api/open-output' && req.method === 'POST') {
     const body = await readBody(req);
     const settings = await loadSettings();
@@ -981,8 +1005,8 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
     && (
       weixinBinary.prelaunch_to_current_unchanged === true
       || weixinBinary.launcher_to_current_unchanged === true
-      || weixinBinary.launcher_pre_node?.fresh_for_this_service === false
     );
+  const d5SecretEvidenceReady = !!secrets.invalid;
   const externalAgeMs = Number(weixinBinary.external_user_baseline?.age_vs_service_start_ms);
   const externalBeforeServiceStart = Number.isFinite(externalAgeMs) && externalAgeMs >= -30_000;
   const externalBaselineMatched = weixinBinary.external_to_current_unchanged === true && externalBeforeServiceStart;
@@ -1031,8 +1055,8 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       ready_for_user_confirmation: !!clipboardEvidence,
       software_evidence_status: clipboardEvidence ? 'ready_for_user_paste_confirmation' : 'needs_local_copy_action',
       software_evidence_summary: clipboardEvidence
-        ? `最近一次系统剪贴板写入：${clipboardEvidence.relative_path || '未知文件'}${clipboardSize ? `，尺寸 ${clipboardSize}` : ''}。`
-        : '本轮服务还没有成功复制 PNG 到系统剪贴板的动作证据。',
+        ? `最近一次剪贴板写入：${clipboardEvidence.relative_path || '未知文件'}${clipboardSize ? `，尺寸 ${clipboardSize}` : ''}。`
+        : '本轮服务还没有成功复制 PNG 到剪贴板的动作证据。',
       evidence_available: [platform === 'win32' ? 'Windows 剪贴板 fallback 支持' : '浏览器剪贴板复制需人工确认', 'local_action_evidence.last_clipboard_copy'],
       latest_evidence: clipboardEvidence,
       next_step: '在 Edge 或 Chrome 中复制长图后，实际 Ctrl+V 到微信窗口并发送。',
@@ -1056,12 +1080,12 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       title: `跨系统用户 ${secretLabel}`,
       status: 'needs_user_confirmation',
       user_confirmation_required: true,
-      ready_for_user_confirmation: true,
-      software_evidence_status: 'bad_secret_file_path_tested_external_user_needed',
+      ready_for_user_confirmation: d5SecretEvidenceReady,
+      software_evidence_status: d5SecretEvidenceReady ? 'bad_secret_detected_external_user_needed' : 'needs_bad_secret_or_external_user_test',
       software_evidence_summary: secrets.invalid
         ? `当前用户已检测到 ${secretLabel} 密钥不可解并会回到向导；真实跨系统用户仍需人工切换确认。`
-        : `当前用户 ${secretLabel} 密钥可读；坏密钥文件路径已由验收脚本覆盖，真实跨系统用户仍需人工切换确认。`,
-      evidence_available: ['坏密钥文件清理测试', 'secrets.invalid', '向导提示'],
+        : `当前用户 ${secretLabel} 密钥可读；本轮诊断没有坏密钥或跨系统用户切换证据。`,
+      evidence_available: ['secrets.invalid', '向导提示'],
       next_step: '换另一个系统用户登录后，确认密钥解密失败会回到向导，且不展示旧密文。',
     },
   ];

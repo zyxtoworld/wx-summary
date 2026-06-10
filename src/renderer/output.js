@@ -149,6 +149,15 @@ export async function assertRevealable(settings, targetPath, { extensions = [] }
     err.status = 404;
     throw err;
   }
+  const [realBase, realTarget] = await Promise.all([
+    fsp.realpath(base).catch(() => ''),
+    fsp.realpath(resolved).catch(() => ''),
+  ]);
+  if (!realBase || !realTarget || !isInside(realBase, realTarget)) {
+    const err = new Error('path outside output dir');
+    err.status = 403;
+    throw err;
+  }
   return resolved;
 }
 

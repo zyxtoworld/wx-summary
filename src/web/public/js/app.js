@@ -1387,6 +1387,7 @@ async function generateDigest({ previewText = false } = {}) {
   $textPreviewStatus.textContent = '';
   $revealButton.disabled = true;
   $revealButton.title = '保存后可用';
+  _state_digest.lastDigest = null;
   _state_digest.lastSavedItem = null;
   _state_digest.lastTextMarkdown = '';
   _state_digest.lastTextTitle = '';
@@ -2467,6 +2468,18 @@ function imageSizeLabel(size) {
   return width > 0 && height > 0 ? `${width}×${height}` : '';
 }
 
+async function recordBrowserClipboardCopy({ digestId, clipboard } = {}) {
+  if (!digestId) return null;
+  return api('/api/record-clipboard-copy', {
+    method: 'POST',
+    body: {
+      digest_id: digestId,
+      clipboard,
+      method: 'browser_clipboard',
+    },
+  }).catch(() => null);
+}
+
 async function copyCanvas() {
   const c = document.getElementById('digest-canvas');
   const blob = await new Promise(r => c.toBlob(r, 'image/png'));
@@ -2480,6 +2493,7 @@ async function copyCanvas() {
       status.textContent = '复制中...';
     }
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    void recordBrowserClipboardCopy({ digestId: _state_digest.lastSavedItem?.digest_id, clipboard: canvasSize });
     btn.textContent = '✓ 已复制';
     if (status) {
       status.className = 'status ok';
@@ -2649,6 +2663,7 @@ function showHistoryModal(item) {
     status.textContent = '复制中...';
     try {
       const copied = await copyImageUrlToClipboard(historyImageUrl(item.digest_id, Date.now()));
+      void recordBrowserClipboardCopy({ digestId: item.digest_id, clipboard: copied });
       status.className = 'status ok';
       const size = imageSizeLabel(copied);
       status.textContent = size ? `✓ 已复制到剪贴板（${size}）` : '✓ 已复制到剪贴板';
@@ -2759,24 +2774,33 @@ async function renderSettings() {
   }
   function currentLlmIdentity() {
     const customModel = document.getElementById('s-model-custom')?.checked;
+    const customLongModel = document.getElementById('s-model-long-custom')?.checked;
     const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
+    const longModel = customLongModel ? document.getElementById('s-model-long').value.trim() : document.getElementById('s-model-long-select').value;
     return {
       provider: selectedProvider(),
       base_url: normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value),
       model,
+      long_context_model: longModel || model,
     };
+  }
+  function clearLlmCapabilitySnapshot() {
+    lastLlmCapabilitySnapshot = null;
   }
   function capabilitySnapshotMatches(snapshot, identity = currentLlmIdentity()) {
     return !!snapshot
       && snapshot.provider === identity.provider
       && normalizeSettingsBaseUrl(snapshot.base_url) === identity.base_url
-      && snapshot.model === identity.model;
+      && snapshot.model === identity.model
+      && (snapshot.long_context_model || snapshot.model) === identity.long_context_model;
   }
   function capabilitySnapshotFromTest(result = {}) {
+    const identity = currentLlmIdentity();
     const snapshot = {
       provider: result.provider || selectedProvider(),
       base_url: normalizeSettingsBaseUrl(result.base_url || document.getElementById('s-baseurl').value),
-      model: result.model || currentLlmIdentity().model,
+      model: result.model || identity.model,
+      long_context_model: identity.long_context_model,
       checked_at: result.checked_at || new Date().toISOString(),
     };
     for (const item of Array.isArray(result.capabilities) ? result.capabilities : []) {
@@ -2790,7 +2814,9 @@ async function renderSettings() {
     return snapshot;
   }
   function currentCapabilitySnapshotForSave() {
-    return capabilitySnapshotMatches(lastLlmCapabilitySnapshot) ? lastLlmCapabilitySnapshot : null;
+    const identity = currentLlmIdentity();
+    if (identity.long_context_model && identity.long_context_model !== identity.model) return null;
+    return capabilitySnapshotMatches(lastLlmCapabilitySnapshot, identity) ? lastLlmCapabilitySnapshot : null;
   }
   function fillModelSelects() {
     const modelIds = new Set(availableModels.map(m => m.id));
@@ -2838,8 +2864,21 @@ async function renderSettings() {
   document.getElementById('s-model-long-custom').checked = !!s.llm.custom_long_context_model;
   syncCustomModel('model');
   syncCustomModel('long');
-  document.getElementById('s-model-custom').addEventListener('change', () => syncCustomModel('model'));
-  document.getElementById('s-model-long-custom').addEventListener('change', () => syncCustomModel('long'));
+  document.getElementById('s-model-custom').addEventListener('change', () => { syncCustomModel('model'); clearLlmCapabilitySnapshot(); });
+  document.getElementById('s-model-long-custom').addEventListener('change', () => { syncCustomModel('long'); clearLlmCapabilitySnapshot(); });
+  const llmIdentityInputs = [
+    ...document.querySelectorAll('input[name="s-provider"]'),
+    document.getElementById('s-baseurl'),
+    document.getElementById('s-apikey'),
+    document.getElementById('s-model'),
+    document.getElementById('s-model-select'),
+    document.getElementById('s-model-long'),
+    document.getElementById('s-model-long-select'),
+  ];
+  llmIdentityInputs.forEach(input => {
+    input?.addEventListener('input', clearLlmCapabilitySnapshot);
+    input?.addEventListener('change', clearLlmCapabilitySnapshot);
+  });
 
   document.getElementById('s-apikey-toggle').addEventListener('click', () => {
     const inp = document.getElementById('s-apikey');
@@ -2860,6 +2899,7 @@ async function renderSettings() {
       if (key) payload.api_key = key;
       const r = await api('/api/list-models', { method: 'POST', body: payload });
       availableModels = r.models || [];
+      clearLlmCapabilitySnapshot();
       fillModelSelects();
       $st.className = 'status ok';
       $st.textContent = `✓ 已获取 ${availableModels.length} 个模型`;
@@ -2939,7 +2979,7 @@ async function renderSettings() {
       },
     };
     const capabilities = currentCapabilitySnapshotForSave();
-    if (capabilities) payload.llm.capabilities = capabilities;
+    payload.llm.capabilities = capabilities || null;
     if (apiKey) payload.llm.api_key = apiKey;
     $st.className = 'status';
     $st.textContent = '保存中...';
@@ -3432,8 +3472,8 @@ async function renderSetup() {
             <label><input type="radio" name="w-provider" value="anthropic" ${wizardData.llm.provider === 'anthropic' ? 'checked' : ''} /> Anthropic</label>
           </div>
         </div>
-        <div class="form-row"><label>Base URL</label><input id="w-base" type="text" placeholder="https://your-endpoint/v1" value="${wizardData.llm.base_url || ''}" /></div>
-        <div class="form-row"><label>API Key</label><input id="w-key" type="password" placeholder="sk-..." value="${wizardData.llm.api_key || ''}" /></div>
+        <div class="form-row"><label>Base URL</label><input id="w-base" type="text" placeholder="https://your-endpoint/v1" value="${escapeHtml(wizardData.llm.base_url || '')}" /></div>
+        <div class="form-row"><label>API Key</label><input id="w-key" type="password" placeholder="sk-..." value="${escapeHtml(wizardData.llm.api_key || '')}" /></div>
         <div class="form-row inline"><button class="btn" id="w-list">获取模型</button><span class="status" id="w-status"></span></div>
         <div class="form-row"><label>模型</label><select id="w-model">${models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('') || '<option value="">请先获取模型</option>'}</select></div>
         <div class="form-row"><label>长上下文模型</label><select id="w-model-long">${models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('') || '<option value="">请先获取模型</option>'}</select></div>`;
