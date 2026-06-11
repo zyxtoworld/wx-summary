@@ -201,7 +201,7 @@ async function executeSchedulerTick({ reason, force = false }) {
     }
   }
   if (!result.checked && !result.failed) {
-    return { ...result, skipped: true, detail: ambiguousRefs.length ? 'ambiguous_group_refs' : 'no_whitelisted_groups' };
+    return { ...result, skipped: 0, detail: ambiguousRefs.length ? 'ambiguous_group_refs' : 'no_whitelisted_groups' };
   }
   return result;
 }

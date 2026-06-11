@@ -3699,17 +3699,17 @@ async function renderSettings() {
     if (view.last_result) {
       const r = view.last_result;
       if (r.generated !== undefined) {
-          const itemSummary = schedulerItemsSummary(r.items);
-          const skippedCount = Number(r.skipped || 0);
-          const failedCount = Number(r.failed || 0);
-          const detail = [
-            `生成 ${r.generated || 0}`,
-            r.checked !== undefined ? `检查 ${r.checked}` : '',
-            skippedCount > 0 ? `跳过 ${skippedCount}` : '',
-            failedCount > 0 ? `失败 ${failedCount}` : '',
-            r.detail ? schedulerDetailLabel(r.detail) : '',
-            itemSummary,
-          ].filter(Boolean).join(' / ');
+        const itemSummary = schedulerItemsSummary(r.items);
+        const skippedCount = Number(r.skipped || 0);
+        const failedCount = Number(r.failed || 0);
+        const detail = [
+          `生成 ${r.generated || 0}`,
+          r.checked !== undefined ? `检查 ${r.checked}` : '',
+          skippedCount > 0 ? `跳过 ${skippedCount}` : '',
+          failedCount > 0 ? `失败 ${failedCount}` : '',
+          r.detail ? schedulerDetailLabel(r.detail) : '',
+          itemSummary,
+        ].filter(Boolean).join(' / ');
         bits.push(`上次 ${detail}`);
       } else if (r.detail) {
         bits.push(`上次 ${schedulerDetailLabel(r.detail)}`);
