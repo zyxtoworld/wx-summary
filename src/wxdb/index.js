@@ -1005,7 +1005,7 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
     detail: `发现 ${dbFiles.length} 个 message_*.db`,
   });
   const sinceTs = toUnixSeconds(since, 0, '起始时间');
-  const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000), '结束时间');
+  const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000), '结束时间', { endOfMinuteWhenSecondsMissing: true });
   if (sinceTs > untilTs) {
     throw Object.assign(new Error('起始时间不能晚于结束时间。'), { status: 400 });
   }
@@ -2165,14 +2165,15 @@ function normalizeWxTimestamp(value) {
   return n > 10_000_000_000 ? n : n * 1000;
 }
 
-function toUnixSeconds(value, fallback, label = '时间') {
+function toUnixSeconds(value, fallback, label = '时间', { endOfMinuteWhenSecondsMissing = false } = {}) {
   const text = String(value || '').trim();
   if (!text || text === 'now') return fallback;
   const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
   if (!match) {
     throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm 或 YYYY-MM-DD HH:mm:ss。`), { status: 400 });
   }
-  const [, y, mo, d, h, mi, s = '0'] = match;
+  const [, y, mo, d, h, mi, rawSeconds] = match;
+  const s = rawSeconds ?? (endOfMinuteWhenSecondsMissing ? '59' : '0');
   const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
   const valid = date.getFullYear() === Number(y)
     && date.getMonth() === Number(mo) - 1
@@ -2207,38 +2208,41 @@ function formatMessageTime(value) {
 function normalizeMessageContent(value, localType, extra = {}) {
   const decoded = decodeMessagePayload(value);
   const split = splitSenderPrefix(decoded);
-  const body = split.body.trim();
+  const fallbackDecoded = decodeMessagePayload(extra.compress_content);
+  const fallbackSplit = splitSenderPrefix(fallbackDecoded);
+  const body = split.body.trim() || fallbackSplit.body.trim();
+  const sender = split.sender || fallbackSplit.sender;
   const typeCode = baseLocalType(localType);
 
   if (typeCode === 1 && body) {
-    return { type: 'text', sender: split.sender, content: body || '[空文本]' };
+    return { type: 'text', sender, content: body || '[空文本]' };
   }
   if (typeCode === 3) {
     const media = parseImageMedia(body, extra.packed_info_data);
-    return { type: 'image', sender: split.sender, content: formatImageContent(media), media };
+    return { type: 'image', sender, content: formatImageContent(media), media };
   }
   if (typeCode === 34) {
     const media = parseVoiceMedia(body, extra.packed_info_data);
-    return { type: 'voice', sender: split.sender, content: formatVoiceContent(media), media };
+    return { type: 'voice', sender, content: formatVoiceContent(media), media };
   }
   if (typeCode === 43) {
     const media = parseVideoMedia(body, extra.packed_info_data);
-    return { type: 'video', sender: split.sender, content: formatVideoContent(media), media };
+    return { type: 'video', sender, content: formatVideoContent(media), media };
   }
   if (typeCode === 47) {
     const media = parseEmojiMedia(body);
-    return { type: 'emoji', sender: split.sender, content: formatEmojiContent(media), media };
+    return { type: 'emoji', sender, content: formatEmojiContent(media), media };
   }
   if (typeCode === 49) {
     const parsed = parseAppMessage(body, extra.packed_info_data);
-    return { type: parsed.type, sender: split.sender, content: parsed.content, media: parsed.media };
+    return { type: parsed.type, sender, content: parsed.content, media: parsed.media };
   }
   if (typeCode === 10000) {
     const content = extractTag(body, 'content') || body.replace(/<[^>]+>/g, '').trim();
-    return { type: 'system', sender: split.sender, content: content || '[系统消息]' };
+    return { type: 'system', sender, content: content || '[系统消息]' };
   }
-  if (body) return { type: 'other', sender: split.sender, content: body.slice(0, 1000) };
-  return { type: 'other', sender: split.sender, content: `[非文本消息 type=${Number(localType || 0)}]` };
+  if (body) return { type: 'other', sender, content: body.slice(0, 1000) };
+  return { type: 'other', sender, content: `[非文本消息 type=${Number(localType || 0)}]` };
 }
 
 function decodeMessagePayload(value) {
@@ -2277,7 +2281,6 @@ function parseImageMedia(xml, packedInfoData) {
   const media = {
     kind: 'image',
     md5: xmlAttr(xml, 'img', 'md5'),
-    aeskey: xmlAttr(xml, 'img', 'aeskey'),
     size: numberAttr(xml, 'img', 'length') || numberAttr(xml, 'img', 'hdlength') || numberAttr(xml, 'img', 'hevc_mid_size'),
     width: firstNumber([
       xmlAttr(xml, 'img', 'width'),
@@ -3082,6 +3085,7 @@ export const __wxdbInternals = {
   weixinV4KeyCandidates,
   normalizeWxTimestamp,
   messageTimeBounds,
+  toUnixSeconds,
   formatMessageTime,
   groupPinyinInitial,
   groupSearchFields,

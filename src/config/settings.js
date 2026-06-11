@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { DATA_DIR, DEFAULT_DIGESTS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TMP_DIR, outputDirFromSettings, resolveInsideTmp } from '../lib/paths.js';
+import { DATA_DIR, DEFAULT_DIGESTS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TMP_DIR, isInside, outputDirFromSettings, resolveInsideTmp } from '../lib/paths.js';
 import { cloneJson, deepMerge, ensureDir, writeJsonAtomic } from '../lib/json-store.js';
 import { protectText, unprotectToText } from './dpapi.js';
 
@@ -46,19 +46,50 @@ export function defaultSettings() {
 export async function ensureRuntimeDirs(settings = defaultSettings()) {
   await ensureDir(DATA_DIR);
   await ensureDir(OUTPUTS_DIR);
-  await ensureDir(TMP_DIR);
+  await ensureOrdinaryTmpDir();
   await ensureDir(DEFAULT_DIGESTS_DIR);
   await ensureDir(outputDirFromSettings(settings));
 }
 
 export async function clearTmpDir() {
-  await ensureDir(TMP_DIR);
+  await ensureOrdinaryTmpDir();
   const entries = await fsp.readdir(TMP_DIR, { withFileTypes: true }).catch(() => []);
   await Promise.all(entries.map(async entry => {
     const full = path.join(TMP_DIR, entry.name);
+    if (!isInside(TMP_DIR, full)) return;
+    const stat = await fsp.lstat(full).catch(() => null);
+    if (stat?.isSymbolicLink?.()) {
+      await fsp.unlink(full).catch(() => fsp.rmdir(full).catch(() => {}));
+      return;
+    }
     await fsp.rm(full, { recursive: true, force: true }).catch(() => {});
   }));
+  await ensureOrdinaryTmpDir();
+}
+
+async function ensureOrdinaryTmpDir() {
+  await ensureDir(OUTPUTS_DIR);
+  const stat = await fsp.lstat(TMP_DIR).catch(e => {
+    if (e?.code === 'ENOENT') return null;
+    throw e;
+  });
+  if (stat?.isSymbolicLink?.()) {
+    await fsp.unlink(TMP_DIR).catch(() => fsp.rmdir(TMP_DIR).catch(() => {}));
+  } else if (stat && !stat.isDirectory()) {
+    await fsp.rm(TMP_DIR, { force: true });
+  }
   await ensureDir(TMP_DIR);
+  const [realProject, realOutputs, realTmp] = await Promise.all([
+    fsp.realpath(PROJECT_ROOT).catch(() => ''),
+    fsp.realpath(OUTPUTS_DIR).catch(() => ''),
+    fsp.realpath(TMP_DIR).catch(() => ''),
+  ]);
+  if (!realProject || !realOutputs || !realTmp || !isInside(realProject, realOutputs) || !isInside(realOutputs, realTmp) || path.resolve(realOutputs) === path.resolve(realTmp)) {
+    const err = new Error('outputs/.tmp must be an ordinary directory inside project outputs/');
+    err.status = 500;
+    err.code = 'UNSAFE_TMP_DIR';
+    throw err;
+  }
 }
 
 export function normalizeBaseUrl(value) {

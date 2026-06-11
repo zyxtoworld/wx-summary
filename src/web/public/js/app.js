@@ -380,10 +380,11 @@ function splitGraphemes(text) {
   return Array.from(GRAPHEME_SEGMENTER.segment(value), item => item.segment);
 }
 
-function parseLocalDateTime(value) {
+function parseLocalDateTime(value, { endOfMinuteWhenSecondsMissing = false } = {}) {
   const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
   if (!match) return null;
-  const [, y, mo, d, h, mi, s = '0'] = match;
+  const [, y, mo, d, h, mi, rawSeconds] = match;
+  const s = rawSeconds ?? (endOfMinuteWhenSecondsMissing ? '59' : '0');
   const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
   return Number.isNaN(date.getTime()) ? null : date;
 }
@@ -621,8 +622,9 @@ function outputDirLooksInsideProject(dir, projectRoot) {
   const normalized = normalizePathForUi(raw);
   if (!isAbsolutePathForUi(raw)) {
     const rel = normalizeRelativePathForUi(raw).toLowerCase();
-    return (rel === 'outputs' || rel.startsWith('outputs/'))
+    return rel.startsWith('outputs/')
       && !rel.split('/').includes('..')
+      && rel !== 'outputs'
       && rel !== 'outputs/.tmp'
       && !rel.startsWith('outputs/.tmp/');
   }
@@ -630,7 +632,7 @@ function outputDirLooksInsideProject(dir, projectRoot) {
   const full = normalizePathForUi(raw).toLowerCase();
   const outputs = root ? `${root}/outputs` : '';
   const tmp = root ? `${root}/outputs/.tmp` : '';
-  return !!root && (full === outputs || full.startsWith(`${outputs}/`)) && full !== tmp && !full.startsWith(`${tmp}/`);
+  return !!root && full.startsWith(`${outputs}/`) && full !== outputs && full !== tmp && !full.startsWith(`${tmp}/`);
 }
 
 function updateCustomRangeDate(dateText) {
@@ -2195,7 +2197,7 @@ function digestTargetLastMessageHint(target = {}, since = '', until = '') {
   if (!Number.isFinite(ts) || ts < 946684800000) return '';
   const last = new Date(ts);
   const sinceDate = parseLocalDateTime(since);
-  const untilDate = parseLocalDateTime(until);
+  const untilDate = parseLocalDateTime(until, { endOfMinuteWhenSecondsMissing: true });
   const inRange = sinceDate && untilDate && last >= sinceDate && last <= untilDate;
   return `群列表最后消息：${fmtDateTime(last, { includeSeconds: true })}${inRange ? '，落在本次范围内，可能是微信会话列表与消息分片尚未同步或会话表不一致' : '，不在本次范围内'}`;
 }
@@ -4442,8 +4444,8 @@ async function renderSettings() {
     lines.push('');
     const copy = diag?.local_action_evidence?.last_clipboard_copy;
     const reveal = diag?.local_action_evidence?.last_reveal_request;
-    lines.push(`- 最近复制：${copy?.relative_path || '无'}${copy?.clipboard ? ` (${imageSizeLabel(copy.clipboard)})` : ''}`);
-    lines.push(`- 最近打开文件夹：${reveal?.relative_path || '无'}${reveal?.explorer_selection ? ` (Explorer matched=${reveal.explorer_selection.matched})` : ''}`);
+    lines.push(`- 最近复制：${copy ? '有记录' : '无'}${copy?.clipboard ? ` (${imageSizeLabel(copy.clipboard)})` : ''}`);
+    lines.push(`- 最近打开文件夹：${reveal ? '有记录' : '无'}${reveal?.explorer_selection ? ` (Explorer matched=${reveal.explorer_selection.matched})` : ''}`);
     return lines.join('\n');
   }
   function exportAcceptanceMarkdown() {

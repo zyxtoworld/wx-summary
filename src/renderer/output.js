@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { outputDirFromSettings, PROJECT_ROOT, OUTPUTS_DIR, toProjectRelative, isInside } from '../lib/paths.js';
+import { outputDirFromSettings, PROJECT_ROOT, OUTPUTS_DIR, TMP_DIR, toProjectRelative, isInside } from '../lib/paths.js';
 import { ensureDir, readJson, writeJsonAtomic } from '../lib/json-store.js';
 
 let historyWriteQueue = Promise.resolve();
@@ -10,8 +10,47 @@ export function historyIndexPath(settings) {
   return path.join(outputDirFromSettings(settings), 'index.json');
 }
 
+async function safeOutputBase(settings, { ensure = true } = {}) {
+  const base = outputDirFromSettings(settings);
+  if (ensure) await ensureDir(base);
+  await assertRealOutputBase(base);
+  return base;
+}
+
+async function assertRealOutputBase(base) {
+  const [realProject, realOutputs, realTmp, realBase] = await Promise.all([
+    fsp.realpath(PROJECT_ROOT).catch(() => ''),
+    fsp.realpath(OUTPUTS_DIR).catch(() => ''),
+    fsp.realpath(TMP_DIR).catch(() => ''),
+    fsp.realpath(base).catch(() => ''),
+  ]);
+  if (!realProject || !realOutputs || !realBase || !isInside(realProject, realOutputs) || !isInside(realOutputs, realBase) || path.resolve(realOutputs) === path.resolve(realBase)) {
+    throw outputPathError('output dir outside outputs/');
+  }
+  if (realTmp && isInside(realTmp, realBase)) throw outputPathError('output dir inside outputs/.tmp');
+  return { realOutputs, realTmp, realBase };
+}
+
+async function assertSafeOutputParent(base, targetPath) {
+  const parent = path.dirname(path.resolve(targetPath || ''));
+  await ensureDir(parent);
+  const { realTmp, realBase } = await assertRealOutputBase(base);
+  const realParent = await fsp.realpath(parent).catch(() => '');
+  if (!realParent || !isInside(realBase, realParent)) throw outputPathError('target parent outside output dir');
+  if (realTmp && isInside(realTmp, realParent)) throw outputPathError('target parent inside outputs/.tmp');
+  return realParent;
+}
+
+function outputPathError(message) {
+  const err = new Error(message);
+  err.status = 403;
+  err.code = 'UNSAFE_OUTPUT_PATH';
+  return err;
+}
+
 async function readHistoryIndex(settings) {
-  const file = historyIndexPath(settings);
+  const base = await safeOutputBase(settings);
+  const file = path.join(base, 'index.json');
   try {
     const raw = await fsp.readFile(file, 'utf-8');
     const parsed = JSON.parse(raw);
@@ -26,9 +65,9 @@ async function readHistoryIndex(settings) {
 }
 
 async function recoverHistoryIndex(settings, file, cause) {
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const backup = file.replace(/\.json$/i, `.invalid.${timestampForFilename(new Date())}.json`);
-  await ensureDir(path.dirname(file));
+  await assertSafeOutputParent(base, file);
   await fsp.rename(file, backup).catch(e => {
     if (e?.code !== 'ENOENT') throw e;
   });
@@ -45,7 +84,7 @@ async function recoverHistoryIndex(settings, file, cause) {
 
 async function rebuildHistoryIndexFromDigests(base) {
   const digestFiles = [];
-  await collectDigestJsonFiles(base, digestFiles);
+  await collectDigestJsonFiles(base, digestFiles, base);
   const items = [];
   for (const digestPath of digestFiles) {
     const digest = await readJson(digestPath, null, { strict: false });
@@ -74,15 +113,24 @@ async function rebuildHistoryIndexFromDigests(base) {
     .slice(0, 200);
 }
 
-async function collectDigestJsonFiles(dir, out) {
+async function collectDigestJsonFiles(dir, out, root = dir) {
+  if (isInside(TMP_DIR, dir)) return;
+  const [realRoot, realDir] = await Promise.all([
+    fsp.realpath(root).catch(() => ''),
+    fsp.realpath(dir).catch(() => ''),
+  ]);
+  if (!realRoot || !realDir || !isInside(realRoot, realDir)) return;
   const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(e => {
     if (e?.code === 'ENOENT') return [];
     throw e;
   });
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
+    if (isInside(TMP_DIR, full)) continue;
+    const stat = await fsp.lstat(full).catch(() => null);
+    if (entry.isSymbolicLink?.() || stat?.isSymbolicLink?.()) continue;
     if (entry.isDirectory()) {
-      await collectDigestJsonFiles(full, out);
+      await collectDigestJsonFiles(full, out, root);
     } else if (entry.isFile() && /\.digest\.json$/i.test(entry.name)) {
       out.push(full);
     }
@@ -91,7 +139,7 @@ async function collectDigestJsonFiles(dir, out) {
 
 export async function saveRenderedPng({ settings, digest, png_data_url, signal = null }) {
   throwIfOutputAborted(signal);
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const buffer = pngBufferFromDataUrl(png_data_url);
   throwIfOutputAborted(signal);
 
@@ -101,14 +149,12 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
   let filePath = '';
   let digestPath = '';
   try {
-    await ensureDir(dir);
+    await assertSafeOutputParent(base, path.join(dir, 'placeholder.png'));
     throwIfOutputAborted(signal);
-    const filename = await uniqueFilename(dir, buildFilename(digest, settings.output?.filename_pattern));
-    filePath = path.join(dir, filename);
+    filePath = await writeBinaryUnique(dir, buildFilename(digest, settings.output?.filename_pattern), buffer);
     digestPath = digestJsonPathForPng(filePath);
     throwIfOutputAborted(signal);
-    await writeBinaryAtomic(filePath, buffer);
-    throwIfOutputAborted(signal);
+    await assertSafeOutputParent(base, digestPath);
     await writeDigestJson(digestPath, digest);
     throwIfOutputAborted(signal);
   } catch (e) {
@@ -142,7 +188,7 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
 }
 
 export async function discardRenderedHistoryItem(settings, item) {
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const errors = [];
   const digestId = String(item?.digest_id || '');
   let canRemoveFiles = true;
@@ -160,7 +206,7 @@ export async function discardRenderedHistoryItem(settings, item) {
   ].filter(Boolean))].filter(target => isInside(base, target));
   if (canRemoveFiles) {
     for (const target of targets) {
-      await fsp.rm(target, { force: true }).catch(e => errors.push(e));
+      await removeOutputFileIfSafe(base, target).catch(e => errors.push(e));
     }
   }
   if (errors.length) {
@@ -171,7 +217,7 @@ export async function discardRenderedHistoryItem(settings, item) {
 }
 
 export async function listHistory(settings) {
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const items = (await readHistoryIndex(settings)).slice(0, 50);
   return Promise.all(items.map(item => historyItemWithFileStatus(base, item)));
 }
@@ -187,17 +233,14 @@ async function historyItemWithFileStatus(base, item = {}) {
 }
 
 async function regularFileExistsInside(base, targetPath, extension = '') {
-  if (!targetPath || !isInside(base, targetPath)) return false;
-  if (extension && !targetPath.toLowerCase().endsWith(extension)) return false;
-  const stat = await fsp.stat(targetPath).catch(() => null);
-  return !!stat?.isFile?.();
+  return !!(await assertReadableOutputFile(base, targetPath, { extensions: extension ? [extension] : [] }).catch(() => null));
 }
 
 export async function cleanupOldDigests(settings) {
   const days = Number(settings.output?.retention_days || 0);
   if (!Number.isFinite(days) || days <= 0) return { removed: 0 };
 
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
   const list = await readHistoryIndex(settings);
   const kept = [];
@@ -209,15 +252,20 @@ export async function cleanupOldDigests(settings) {
     const digestPath = resolveDigestPath(base, item);
     const expired = Number.isFinite(created) && created > 0 && created < cutoff;
     if (expired && isInside(base, filePath)) {
-      await fsp.rm(filePath, { force: true }).catch(() => {});
-      if (digestPath) await fsp.rm(digestPath, { force: true }).catch(() => {});
-      removed++;
+      const removedPng = await removeOutputFileIfSafe(base, filePath, '.png').catch(() => false);
+      if (digestPath) await removeOutputFileIfSafe(base, digestPath, '.digest.json').catch(() => false);
+      if (removedPng) removed++;
       continue;
     }
     kept.push(item);
   }
 
-  if (removed) await withHistoryWriteLock(() => writeJsonAtomic(historyIndexPath(settings), kept));
+  if (removed) await withHistoryWriteLock(async () => {
+    const safeBase = await safeOutputBase(settings);
+    const file = path.join(safeBase, 'index.json');
+    await assertSafeOutputParent(safeBase, file);
+    await writeJsonAtomic(file, kept);
+  });
   return { removed };
 }
 
@@ -229,15 +277,16 @@ export async function findHistoryItem(settings, digestId) {
 export async function readHistoryDigest(settings, digestId) {
   const item = await findHistoryItem(settings, digestId);
   if (!item) return null;
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const digestPath = resolveDigestPath(base, item);
   if (!digestPath) return null;
+  if (!(await assertReadableOutputFile(base, digestPath, { extensions: ['.digest.json'] }).catch(() => null))) return null;
   const digest = await readJson(digestPath, null);
-  return digest && typeof digest === 'object' && !Array.isArray(digest) ? digest : null;
+  return digest && typeof digest === 'object' && !Array.isArray(digest) ? persistedDigest(digest) : null;
 }
 
 export async function overwriteRenderedPng({ settings, item, digest, png_data_url }) {
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const target = await writableHistoryPngTarget(settings, item?.file_path || '');
   const buffer = pngBufferFromDataUrl(png_data_url);
   const digestPath = resolveDigestPath(base, item) || digestJsonPathForPng(target);
@@ -251,6 +300,8 @@ export async function overwriteRenderedPng({ settings, item, digest, png_data_ur
   };
   const rollback = await snapshotFilesForRollback([target, digestPath]);
   try {
+    await assertSafeOutputParent(base, target);
+    await assertSafeOutputParent(base, digestPath);
     await writeBinaryAtomic(target, buffer);
     await writeDigestJson(digestPath, digest);
     await upsertHistory(settings, next);
@@ -277,11 +328,10 @@ export async function savePreviewMarkdown({ settings, title = '文本预览', ma
     err.status = 413;
     throw err;
   }
-  const dir = path.join(outputDirFromSettings(settings), 'previews');
-  await ensureDir(dir);
-  const filename = await uniqueFilename(dir, `${sanitizeName(title || '文本预览')}__${timestampForFilename(new Date())}.md`);
-  const filePath = path.join(dir, filename);
-  await fsp.writeFile(filePath, text.endsWith('\n') ? text : `${text}\n`, 'utf-8');
+  const base = await safeOutputBase(settings);
+  const dir = path.join(base, 'previews');
+  await assertSafeOutputParent(base, path.join(dir, 'placeholder.md'));
+  const filePath = await writeTextUnique(dir, `${sanitizeName(title || '文本预览')}__${timestampForFilename(new Date())}.md`, text.endsWith('\n') ? text : `${text}\n`);
   return {
     file_path: filePath,
     relative_path: toProjectRelative(filePath),
@@ -289,7 +339,11 @@ export async function savePreviewMarkdown({ settings, title = '文本预览', ma
 }
 
 export async function assertRevealable(settings, targetPath, { extensions = [] } = {}) {
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
+  return assertReadableOutputFile(base, targetPath, { extensions });
+}
+
+async function assertReadableOutputFile(base, targetPath, { extensions = [] } = {}) {
   const resolved = path.resolve(targetPath || '');
   if (!isInside(base, resolved)) {
     const err = new Error('path outside output dir');
@@ -297,9 +351,16 @@ export async function assertRevealable(settings, targetPath, { extensions = [] }
     throw err;
   }
   const allowed = Array.isArray(extensions) ? extensions.map(ext => String(ext || '').toLowerCase()).filter(Boolean) : [];
-  if (allowed.length && !allowed.includes(path.extname(resolved).toLowerCase())) {
+  const resolvedLower = resolved.toLowerCase();
+  if (allowed.length && !allowed.some(ext => resolvedLower.endsWith(ext))) {
     const err = new Error(`file must be ${allowed.join(' or ')}`);
     err.status = 400;
+    throw err;
+  }
+  const linkStat = await fsp.lstat(resolved).catch(() => null);
+  if (linkStat?.isSymbolicLink?.()) {
+    const err = new Error('file must be a regular output file');
+    err.status = 403;
     throw err;
   }
   const st = await fsp.stat(resolved).catch(() => null);
@@ -308,11 +369,11 @@ export async function assertRevealable(settings, targetPath, { extensions = [] }
     err.status = 404;
     throw err;
   }
-  const [realBase, realTarget] = await Promise.all([
-    fsp.realpath(base).catch(() => ''),
+  const [{ realTmp, realBase }, realTarget] = await Promise.all([
+    assertRealOutputBase(base),
     fsp.realpath(resolved).catch(() => ''),
   ]);
-  if (!realBase || !realTarget || !isInside(realBase, realTarget)) {
+  if (!realBase || !realTarget || !isInside(realBase, realTarget) || (realTmp && isInside(realTmp, realTarget))) {
     const err = new Error('path outside output dir');
     err.status = 403;
     throw err;
@@ -321,7 +382,7 @@ export async function assertRevealable(settings, targetPath, { extensions = [] }
 }
 
 async function writableHistoryPngTarget(settings, targetPath) {
-  const base = outputDirFromSettings(settings);
+  const base = await safeOutputBase(settings);
   const resolved = path.resolve(targetPath || '');
   if (!isInside(base, resolved)) {
     const err = new Error('path outside output dir');
@@ -338,16 +399,7 @@ async function writableHistoryPngTarget(settings, targetPath) {
     throw e;
   });
   if (existing) return assertRevealable(settings, resolved, { extensions: ['.png'] });
-  await ensureDir(path.dirname(resolved));
-  const [realBase, realParent] = await Promise.all([
-    fsp.realpath(base).catch(() => ''),
-    fsp.realpath(path.dirname(resolved)).catch(() => ''),
-  ]);
-  if (!realBase || !realParent || !isInside(realBase, realParent)) {
-    const err = new Error('path outside output dir');
-    err.status = 403;
-    throw err;
-  }
+  await assertSafeOutputParent(base, resolved);
   return resolved;
 }
 
@@ -602,6 +654,49 @@ async function writeBinaryAtomic(filePath, buffer) {
   }
 }
 
+async function writeBinaryUnique(dir, filename, buffer) {
+  return writeUniqueFile(dir, filename, handle => handle.writeFile(buffer));
+}
+
+async function writeTextUnique(dir, filename, text) {
+  return writeUniqueFile(dir, filename, handle => handle.writeFile(text, 'utf-8'));
+}
+
+async function writeUniqueFile(dir, filename, writer) {
+  const ext = path.extname(filename);
+  const stem = ext ? filename.slice(0, -ext.length) : filename;
+  for (let i = 0; i < 100; i++) {
+    const candidate = i === 0 ? filename : `${stem}_${i + 1}${ext}`;
+    const target = path.join(dir, candidate);
+    let handle = null;
+    try {
+      handle = await fsp.open(target, 'wx');
+      await writer(handle);
+      await handle.close();
+      return target;
+    } catch (e) {
+      if (handle) await handle.close().catch(() => {});
+      if (e?.code === 'EEXIST') continue;
+      await fsp.rm(target, { force: true }).catch(() => {});
+      throw e;
+    }
+  }
+  const fallback = path.join(dir, `${stem}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}${ext}`);
+  const handle = await fsp.open(fallback, 'wx');
+  try {
+    await writer(handle);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  return fallback;
+}
+
+async function removeOutputFileIfSafe(base, targetPath, extension = '') {
+  const file = await assertReadableOutputFile(base, targetPath, { extensions: extension ? [extension] : [] });
+  await fsp.rm(file, { force: true });
+  return true;
+}
+
 function resolveDigestPath(base, item = {}) {
   const explicit = item.digest_path ? path.resolve(item.digest_path) : '';
   if (explicit && isInside(base, explicit) && /\.digest\.json$/i.test(explicit)) return explicit;
@@ -613,7 +708,9 @@ function resolveDigestPath(base, item = {}) {
 async function upsertHistory(settings, item, { signal = null } = {}) {
   await withHistoryWriteLock(async () => {
     throwIfOutputAborted(signal);
-    const file = historyIndexPath(settings);
+    const base = await safeOutputBase(settings);
+    const file = path.join(base, 'index.json');
+    await assertSafeOutputParent(base, file);
     const list = await readHistoryIndex(settings);
     const next = [item, ...list.filter(x => x.digest_id !== item.digest_id)].slice(0, 200);
     throwIfOutputAborted(signal);
@@ -626,7 +723,9 @@ async function removeHistoryItem(settings, digestId) {
   const id = String(digestId || '');
   if (!id) return;
   await withHistoryWriteLock(async () => {
-    const file = historyIndexPath(settings);
+    const base = await safeOutputBase(settings);
+    const file = path.join(base, 'index.json');
+    await assertSafeOutputParent(base, file);
     const list = await readHistoryIndex(settings);
     const next = list.filter(item => item.digest_id !== id);
     if (next.length !== list.length) await writeJsonAtomic(file, next);
@@ -647,7 +746,10 @@ function buildFilename(digest, pattern = '') {
     until: compactTime(digest.until),
     id8,
   };
-  const template = String(pattern || '{group}__{since}_{until}__{id8}.png').trim();
+  const rawTemplate = String(pattern || '{group}__{since}_{until}__{id8}.png').trim();
+  const template = /\{id8\}/.test(rawTemplate)
+    ? rawTemplate
+    : rawTemplate.replace(/(?:\.png)?$/i, '__{id8}.png');
   const rendered = template.replace(/\{(group|since|until|id8)\}/g, (_, key) => tokens[key] || '');
   const safe = sanitizeFilename(rendered || `${tokens.group}__${tokens.since}_${tokens.until}__${tokens.id8}.png`);
   return /\.png$/i.test(safe) ? safe : `${safe}.png`;

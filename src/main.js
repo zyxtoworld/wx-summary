@@ -362,8 +362,9 @@ async function readWeixinBaselineFile(file, { relativePath, expectedSources, fal
     const fresh = Number.isFinite(deltaMs) && deltaMs >= -30_000 && deltaMs <= 10 * 60_000;
     const requiresFresh = freshness === 'service_start';
     const source = typeof raw?.source === 'string' && expectedSources.includes(raw.source) ? raw.source : 'unknown';
+    const sha256 = /^[a-f0-9]{64}$/i.test(String(raw?.sha256 || '')) ? String(raw.sha256).toLowerCase() : '';
     const clean = {
-      ok: !!raw?.ok,
+      ok: !!raw?.ok && source !== 'unknown' && !!sha256,
       source,
       relative_path: relativePath,
       captured_at: typeof raw?.captured_at === 'string' ? raw.captured_at : '',
@@ -376,7 +377,7 @@ async function readWeixinBaselineFile(file, { relativePath, expectedSources, fal
     if (typeof raw?.path === 'string') clean.path = raw.path;
     if (Number.isFinite(Number(raw?.bytes))) clean.bytes = Number(raw.bytes);
     if (typeof raw?.modified_at === 'string') clean.modified_at = raw.modified_at;
-    if (/^[a-f0-9]{64}$/i.test(String(raw?.sha256 || ''))) clean.sha256 = String(raw.sha256).toLowerCase();
+    if (sha256) clean.sha256 = sha256;
     if (raw?.reason) clean.reason = sanitizeText(String(raw.reason));
     if (raw?.error) clean.error = sanitizeText(String(raw.error));
     if (requiresFresh && !fresh) {
@@ -425,7 +426,13 @@ async function readLauncherWeixinBaseline() {
 }
 
 function compareSha256(left, right) {
-  return left?.sha256 && right?.sha256 ? left.sha256 === right.sha256 : null;
+  return validSha256Evidence(left) && validSha256Evidence(right) ? left.sha256 === right.sha256 : null;
+}
+
+function validSha256Evidence(value = {}) {
+  if (!value || value.ok !== true) return false;
+  if (Object.hasOwn(value, 'source') && value.source === 'unknown') return false;
+  return /^[a-f0-9]{64}$/i.test(String(value.sha256 || ''));
 }
 
 function weixinExecutableLabel() {
@@ -829,7 +836,44 @@ function sanitizeLogLine(line = '') {
     .replace(/"group"\s*:\s*"([^"\\]|\\.)*"/g, '"group":"[redacted-group]"')
     .replace(/"group_name"\s*:\s*"([^"\\]|\\.)*"/g, '"group_name":"[redacted-group]"')
     .replace(/"(account_id|group_id|cursor_key)"\s*:\s*"([^"\\]|\\.)*"/g, '"$1":"[redacted-id]"')
-    .replace(/"(file_path|relative_path|digest_path|digest_relative_path)"\s*:\s*"([^"\\]|\\.)*"/g, '"$1":"[redacted-path]"');
+    .replace(/"(project_root|path|main_path|file_name|command_line|account_root|db_storage|file_path|relative_path|digest_path|digest_relative_path)"\s*:\s*"([^"\\]|\\.)*"/g, '"$1":"[redacted-path]"');
+}
+
+const DIAGNOSTIC_PATH_KEYS = new Set([
+  'project_root',
+  'path',
+  'main_path',
+  'file_name',
+  'command_line',
+  'account_root',
+  'db_storage',
+  'file_path',
+  'relative_path',
+  'digest_path',
+  'digest_relative_path',
+]);
+
+function sanitizeDiagnosticsPayload(value, key = '') {
+  if (Array.isArray(value)) return value.map(item => sanitizeDiagnosticsPayload(item, key));
+  if (!value || typeof value !== 'object') {
+    if (typeof value !== 'string') return value;
+    return DIAGNOSTIC_PATH_KEYS.has(key) && value
+      ? '[redacted-path]'
+      : redactEmbeddedDiagnosticPaths(value);
+  }
+  const out = {};
+  for (const [entryKey, entryValue] of Object.entries(value)) {
+    if (entryKey === 'pid' && (Object.hasOwn(value, 'sha256') || Object.hasOwn(value, 'path') || /weixin|binary|baseline|current|startup|prelaunch|launcher/i.test(key))) continue;
+    out[entryKey] = sanitizeDiagnosticsPayload(entryValue, entryKey);
+  }
+  return out;
+}
+
+function redactEmbeddedDiagnosticPaths(value = '') {
+  const text = String(value || '');
+  return text
+    .replaceAll(PROJECT_ROOT, '[redacted-path]')
+    .replace(/[A-Za-z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*/g, '[redacted-path]');
 }
 
 async function postSaveSettingsWarnings(patch) {
@@ -1347,7 +1391,7 @@ async function handleApi(req, res, parsedUrl) {
       prelaunch_scope_note: 'prelaunch 由启动.cmd 在托盘启动前采集；launcher_pre_node 由托盘在启动 Node 前采集。',
       verification_note: `external_user_baseline 是启动本工具前由用户独立记录的 ${weixinExecutableLabel()} SHA256，可写入 data/external-weixin-binary-baseline.json；launcher_pre_node 由托盘在启动 Node 前采集；prelaunch 仅在本地另行提供 data/prelaunch-weixin-binary.json 时参与比较。external_to_* 为 true 时可作为 A3 的外部基线证据；launcher_to_* 可加强证明本工具启动链路内没有改动 ${weixinExecutableLabel()}。`,
     };
-    return sendJson(res, 200, {
+    const diagnosticsPayload = {
       ok: true,
       diagnostic_scope: lightweight ? 'acceptance' : 'full',
       project_root: PROJECT_ROOT,
@@ -1365,7 +1409,8 @@ async function handleApi(req, res, parsedUrl) {
       media_tools: mediaTools,
       weixin_binary: weixinBinary,
       weixin_modules: weixinModules,
-    });
+    };
+    return sendJson(res, 200, sanitizeDiagnosticsPayload(diagnosticsPayload));
   }
 
   return sendJson(res, 404, { error: 'no such api' });
@@ -1455,7 +1500,7 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       ready_for_user_confirmation: !!clipboardEvidence,
       software_evidence_status: clipboardEvidence ? 'ready_for_user_paste_confirmation' : 'needs_local_copy_action',
       software_evidence_summary: clipboardEvidence
-        ? `最近一次剪贴板写入：${clipboardEvidence.relative_path || '未知文件'}${clipboardSize ? `，尺寸 ${clipboardSize}` : ''}。`
+        ? `最近一次剪贴板写入已记录${clipboardSize ? `，尺寸 ${clipboardSize}` : ''}。`
         : '本轮服务还没有成功复制 PNG 到剪贴板的动作证据。',
       evidence_available: [platform === 'win32' ? 'Windows 剪贴板 fallback 支持' : '浏览器剪贴板复制需人工确认', 'local_action_evidence.last_clipboard_copy'],
       latest_evidence: clipboardEvidence,
@@ -1469,7 +1514,7 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
       ready_for_user_confirmation: !!revealEvidence,
       software_evidence_status: revealEvidence ? (explorerMatched ? 'explorer_selection_matched' : 'reveal_requested_needs_visual_confirmation') : 'needs_local_reveal_action',
       software_evidence_summary: revealEvidence
-        ? `最近一次请求打开：${revealEvidence.relative_path || '未知文件'}；${fileManagerLabel} 选中匹配=${explorerMatched ? 'true' : String(explorerSelection?.matched ?? 'unknown')}。`
+        ? `最近一次“在文件夹中显示”请求已记录；${fileManagerLabel} 选中匹配=${explorerMatched ? 'true' : String(explorerSelection?.matched ?? 'unknown')}。`
         : '本轮服务还没有“在文件夹中显示”的动作证据。',
       evidence_available: ['reveal API 路径边界', 'local_action_evidence.last_reveal_request'],
       latest_evidence: revealEvidence,

@@ -184,20 +184,21 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
 
 function validateMessageTimeRange(since, until) {
   const start = parseMessageDateTime(since, '起始时间');
-  const end = parseMessageDateTime(until || 'now', '结束时间', { allowNow: true });
+  const end = parseMessageDateTime(until || 'now', '结束时间', { allowNow: true, endOfMinuteWhenSecondsMissing: true });
   if (start && end && start > end) {
     throw Object.assign(new Error('起始时间不能晚于结束时间。'), { status: 400 });
   }
 }
 
-function parseMessageDateTime(value, label, { allowNow = false } = {}) {
+function parseMessageDateTime(value, label, { allowNow = false, endOfMinuteWhenSecondsMissing = false } = {}) {
   const text = String(value || '').trim();
   if (allowNow && (!text || text === 'now')) return new Date();
   const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
   if (!match) {
     throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm 或 YYYY-MM-DD HH:mm:ss。`), { status: 400 });
   }
-  const [, y, mo, d, h, mi, s = '0'] = match;
+  const [, y, mo, d, h, mi, rawSeconds] = match;
+  const s = rawSeconds ?? (endOfMinuteWhenSecondsMissing ? '59' : '0');
   const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
   const valid = date.getFullYear() === Number(y)
     && date.getMonth() === Number(mo) - 1
@@ -488,5 +489,7 @@ export const __collectorInternals = {
   dbRawKeyCandidates,
   messageSearchText,
   normalizeSearchText,
+  parseMessageDateTime,
   throwIfAborted,
+  validateMessageTimeRange,
 };

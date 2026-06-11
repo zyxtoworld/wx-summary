@@ -45,6 +45,12 @@ export function outputDirFromSettings(settings) {
     err.status = 400;
     throw err;
   }
+  if (path.resolve(resolved) === path.resolve(OUTPUTS_DIR)) {
+    const err = new Error('output.dir must be a dedicated subdirectory under outputs/');
+    err.code = 'PATH_OUTPUTS_ROOT';
+    err.status = 400;
+    throw err;
+  }
   if (isInside(TMP_DIR, resolved)) {
     const err = new Error('output.dir must not be inside outputs/.tmp');
     err.code = 'PATH_INSIDE_TMP';
