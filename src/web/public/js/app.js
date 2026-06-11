@@ -459,6 +459,7 @@ function setupCustomRangePicker() {
   }).join('');
 
   function open(side) {
+    if (_state_digest.generating) return;
     ensureCustomRangeDefaults();
     _state_digest.customRangeSide = side;
     const selected = parseLocalDateTime(side === 'since' ? _state_digest.customSince : _state_digest.customUntil) || new Date();
@@ -520,6 +521,7 @@ function paintCustomRangeFields() {
 }
 
 function shiftRangeMonth(delta) {
+  if (_state_digest.generating) return;
   const base = rangeCalendarMonth();
   base.setMonth(base.getMonth() + delta);
   _state_digest.customRangeMonth = monthKey(base);
@@ -611,6 +613,7 @@ function outputDirLooksInsideProject(dir, projectRoot) {
 }
 
 function updateCustomRangeDate(dateText) {
+  if (_state_digest.generating) return;
   const current = parseLocalDateTime(_state_digest.customRangeSide === 'since' ? _state_digest.customSince : _state_digest.customUntil) || new Date();
   const [y, m, d] = String(dateText).split('-').map(Number);
   const minute = Math.floor(current.getMinutes() / 5) * 5;
@@ -620,6 +623,7 @@ function updateCustomRangeDate(dateText) {
 }
 
 function updateCustomRangeTime() {
+  if (_state_digest.generating) return;
   const current = parseLocalDateTime(_state_digest.customRangeSide === 'since' ? _state_digest.customSince : _state_digest.customUntil) || new Date();
   current.setHours(Number(document.getElementById('range-hour').value || 0));
   current.setMinutes(Number(document.getElementById('range-minute').value || 0));
@@ -1496,6 +1500,9 @@ function updateDigestSelectionLock() {
   });
   document.querySelectorAll([
     '#quick-range button',
+    '#range-picker button',
+    '#range-popover button',
+    '#range-popover select',
     '#custom-range input',
     '.chip-input input',
     '.chip-input .x',

@@ -1070,10 +1070,12 @@ async function handleApi(req, res, parsedUrl) {
       const thumb = await renderDigestThumbnailPng({ filePath: file, digestId: item.digest_id });
       data = await fsp.readFile(thumb);
     } catch (e) {
-      logWarn('digest_thumbnail_fallback_original', {
-        digest_id: item.digest_id,
-        error: sanitizeText(e?.message || String(e)),
-      });
+      if (e?.status !== 501) {
+        logWarn('digest_thumbnail_fallback_original', {
+          digest_id: item.digest_id,
+          error: sanitizeText(e?.message || String(e)),
+        });
+      }
       data = await fsp.readFile(file);
     }
     return send(res, 200, data, { 'Content-Type': 'image/png' });
