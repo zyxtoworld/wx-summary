@@ -143,6 +143,10 @@ function handleAccountSwitch() {
 
 function abortActiveDigest(reason = '取消') {
   if (!_state_digest.abortController) return false;
+  const batchId = _state_digest.activeBatchId;
+  if (batchId) {
+    void api('/api/digest-cancel', { method: 'POST', body: { batch_id: batchId, reason } }).catch(() => {});
+  }
   _state_digest.abortReason = reason;
   _state_digest.abortController.abort();
   updateDigestCancelButton();
@@ -614,6 +618,7 @@ let _state_digest = {
   lastTextPartialReason: '',
   generating: false,
   abortController: null,
+  activeBatchId: '',
   abortReason: '',
   progress: null,
 };
@@ -1410,7 +1415,9 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.generating = true;
   _state_digest.abortReason = '';
   const controller = new AbortController();
+  const batchId = createDigestBatchId();
   _state_digest.abortController = controller;
+  _state_digest.activeBatchId = batchId;
   const digestRouteSeq = _routeSeq;
   const accountId = selectedAccountId();
   const generateButton = document.getElementById('btn-generate');
@@ -1463,7 +1470,6 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.lastTextPartialReason = '';
   scrollDigestWorkIntoView($progress);
   const selectedIds = [..._state_digest.selectedGroups];
-  const batchId = createDigestBatchId();
   let groups;
   try {
     const cache = getDigestGroupCache(accountId);
@@ -1474,6 +1480,7 @@ async function generateDigest({ previewText = false } = {}) {
     if (_state_digest.abortController === controller) {
       _state_digest.generating = false;
       _state_digest.abortController = null;
+      _state_digest.activeBatchId = '';
       _state_digest.abortReason = '';
       updateDigestCancelButton();
     }
@@ -1671,7 +1678,7 @@ async function generateDigest({ previewText = false } = {}) {
             if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
             upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
             try {
-              const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal });
+              const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal, batchId });
               if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
               digest.file_path = saved.item.file_path;
@@ -1743,6 +1750,7 @@ async function generateDigest({ previewText = false } = {}) {
     clearAllRunningStages();
     if (_state_digest.abortController === controller) {
       _state_digest.abortController = null;
+      _state_digest.activeBatchId = '';
       _state_digest.abortReason = '';
       _state_digest.generating = false;
       updateDigestCancelButton();
@@ -2369,12 +2377,12 @@ function drawDigestCanvas(d, targetCanvas = null) {
   return canvas;
 }
 
-async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null } = {}) {
+async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null, batchId = '' } = {}) {
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   const canvas = renderedCanvas || document.getElementById('digest-canvas') || drawDigestCanvas(digest);
   const png_data_url = canvas.toDataURL('image/png');
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
-  return api('/api/save-render', { method: 'POST', signal, body: { digest: { ...digest, __render: digestRenderPayload() }, png_data_url } });
+  return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload() }, png_data_url } });
 }
 
 function renderTextPreview(d) {

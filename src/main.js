@@ -31,6 +31,8 @@ const SAVE_RENDER_BODY_LIMIT = 120 * 1024 * 1024;
 const MAX_ACTIVE_DIGEST_REQUESTS = 6;
 const DIGEST_BATCH_SETTINGS_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_DIGEST_BATCH_SETTINGS = 20;
+const CANCELLED_DIGEST_BATCH_TTL_MS = 2 * 60 * 60 * 1000;
+const MAX_CANCELLED_DIGEST_BATCHES = 100;
 const SERVICE_STARTED_AT = new Date();
 let ACTIVE_SERVER = null;
 let ACTIVE_PORT = null;
@@ -41,6 +43,7 @@ let WEIXIN_BINARY_LAUNCHER_BASELINE = null;
 let WEIXIN_BINARY_BASELINE = null;
 let ACTIVE_DIGEST_REQUESTS = new Map();
 const DIGEST_BATCH_SETTINGS = new Map();
+const CANCELLED_DIGEST_BATCHES = new Map();
 let NEXT_DIGEST_REQUEST_ID = 1;
 let ACTIVE_DEEP_KEY_STATUS = null;
 let LAST_CLIPBOARD_COPY_EVIDENCE = null;
@@ -72,6 +75,7 @@ function sendJson(res, status, obj) {
 }
 
 function apiError(res, err) {
+  if (res.destroyed || res.writableEnded) return;
   const status = err?.status && Number.isInteger(err.status) ? err.status : 500;
   sendJson(res, status, { ok: false, status, error: sanitizeText(err?.message || String(err)) });
 }
@@ -112,6 +116,49 @@ function removeRuntimeInfo() {
 function normalizeDigestBatchId(value) {
   const id = String(value || '').trim();
   return /^[a-zA-Z0-9_.:-]{8,80}$/.test(id) ? id : '';
+}
+
+function cleanupCancelledDigestBatches(now = Date.now()) {
+  for (const [id, item] of CANCELLED_DIGEST_BATCHES.entries()) {
+    if (!item?.cancelled_at || now - item.cancelled_at > CANCELLED_DIGEST_BATCH_TTL_MS) {
+      CANCELLED_DIGEST_BATCHES.delete(id);
+    }
+  }
+  trimCancelledDigestBatches();
+}
+
+function trimCancelledDigestBatches() {
+  while (CANCELLED_DIGEST_BATCHES.size > MAX_CANCELLED_DIGEST_BATCHES) {
+    const oldest = [...CANCELLED_DIGEST_BATCHES.entries()]
+      .sort((a, b) => Number(a[1]?.cancelled_at || 0) - Number(b[1]?.cancelled_at || 0))[0]?.[0];
+    if (!oldest) break;
+    CANCELLED_DIGEST_BATCHES.delete(oldest);
+  }
+}
+
+function markDigestBatchCancelled(batchId, reason = 'cancelled') {
+  const id = normalizeDigestBatchId(batchId);
+  if (!id) return false;
+  cleanupCancelledDigestBatches();
+  CANCELLED_DIGEST_BATCHES.set(id, {
+    cancelled_at: Date.now(),
+    reason: sanitizeText(reason || 'cancelled').slice(0, 120),
+  });
+  trimCancelledDigestBatches();
+  return true;
+}
+
+function cancelledDigestBatch(batchId) {
+  const id = normalizeDigestBatchId(batchId);
+  if (!id) return null;
+  cleanupCancelledDigestBatches();
+  return CANCELLED_DIGEST_BATCHES.get(id) || null;
+}
+
+function throwIfDigestBatchCancelled(batchId) {
+  const item = cancelledDigestBatch(batchId);
+  if (!item) return;
+  throw Object.assign(new Error('生成已取消，已阻止保存长图。'), { status: 499 });
 }
 
 async function loadDigestBatchSettings(batchId) {
@@ -566,6 +613,7 @@ async function readBody(req, maxBytes = 20 * 1024 * 1024) {
         reject(Object.assign(new Error('Invalid JSON body'), { status: 400 }));
       }
     });
+    req.on('aborted', () => reject(Object.assign(new Error('请求已取消'), { status: 499 })));
     req.on('error', reject);
   });
 }
@@ -846,6 +894,12 @@ async function handleApi(req, res, parsedUrl) {
     return sendJson(res, 200, { ok: true, ...(await readDbInventory(account)) });
   }
 
+  if (pathname === '/api/digest-cancel' && req.method === 'POST') {
+    const body = await readBody(req, 16 * 1024);
+    const cancelled = markDigestBatchCancelled(body.batch_id, body.reason || 'client_cancelled');
+    return sendJson(res, 200, { ok: true, cancelled });
+  }
+
   if (pathname === '/api/digest' && req.method === 'POST') {
     const body = await readBody(req);
     if (ACTIVE_DIGEST_REQUESTS.size >= MAX_ACTIVE_DIGEST_REQUESTS) {
@@ -866,11 +920,29 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/save-render' && req.method === 'POST') {
-    const body = await readBody(req, SAVE_RENDER_BODY_LIMIT);
-    const settings = await loadSettings();
-    const item = await saveRenderedPng({ settings, digest: body.digest, png_data_url: body.png_data_url });
-    logInfo('digest_render_saved', { digest_id: item.digest_id, group: item.group, relative_path: item.relative_path });
-    return sendJson(res, 200, { ok: true, item });
+    const controller = new AbortController();
+    let completed = false;
+    let saveBatchId = '';
+    const abortForClientClose = () => {
+      if (completed) return;
+      controller.abort();
+      if (saveBatchId) markDigestBatchCancelled(saveBatchId, 'save_connection_closed');
+    };
+    req.once('aborted', abortForClientClose);
+    res.once('close', abortForClientClose);
+    try {
+      const body = await readBody(req, SAVE_RENDER_BODY_LIMIT);
+      saveBatchId = normalizeDigestBatchId(body.batch_id || body.digest?.batch_id);
+      throwIfDigestBatchCancelled(saveBatchId);
+      const settings = await loadSettings();
+      const item = await saveRenderedPng({ settings, digest: body.digest, png_data_url: body.png_data_url, signal: controller.signal });
+      logInfo('digest_render_saved', { digest_id: item.digest_id, group: item.group, relative_path: item.relative_path });
+      completed = true;
+      return sendJson(res, 200, { ok: true, item });
+    } finally {
+      req.off('aborted', abortForClientClose);
+      res.off('close', abortForClientClose);
+    }
   }
 
   if (pathname === '/api/export-preview' && req.method === 'POST') {
@@ -1217,7 +1289,9 @@ async function runDigestSSE(req, res, body) {
   const controller = new AbortController();
   let completed = false;
   const abortForClientClose = () => {
-    if (!completed) controller.abort();
+    if (completed) return;
+    controller.abort();
+    markDigestBatchCancelled(body.batch_id, 'digest_connection_closed');
   };
   req.once('aborted', abortForClientClose);
   res.once('close', abortForClientClose);
