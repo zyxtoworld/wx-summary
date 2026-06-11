@@ -278,6 +278,16 @@ function fmtTimeAgo(ts) {
   return `${Math.floor(h / 24)} 天前`;
 }
 
+const QUICK_RANGE_LABELS = {
+  today: '今天',
+  yesterday: '昨天',
+  last4h: '最近 4h',
+  last12h: '最近 12h',
+  last1d: '最近 1d',
+  thisweek: '本周',
+  custom: '自定义',
+};
+
 function quickRangeToDates(key) {
   const now = new Date();
   const since = new Date(now);
@@ -297,6 +307,25 @@ function quickRangeToDates(key) {
     since.setHours(0, 0, 0, 0);
   }
   return { since: fmtDateTime(since, { includeSeconds }), until: fmtDateTime(now, { includeSeconds }) };
+}
+
+function digestRangeLabel(key = _state_digest.rangeKey) {
+  return QUICK_RANGE_LABELS[key] || QUICK_RANGE_LABELS.last1d;
+}
+
+function currentDigestRange() {
+  if (_state_digest.rangeKey === 'custom') {
+    ensureCustomRangeDefaults();
+    return { since: _state_digest.customSince, until: _state_digest.customUntil || 'now' };
+  }
+  return quickRangeToDates(_state_digest.rangeKey);
+}
+
+function updateDigestRangeSummary() {
+  const el = document.getElementById('range-summary');
+  if (!el) return;
+  const range = currentDigestRange();
+  el.textContent = `${digestRangeLabel()}：${range.since} ~ ${range.until}`;
 }
 
 function fmtDateTime(d, { includeSeconds = false } = {}) {
@@ -623,6 +652,7 @@ function commitCustomRangeSide(date) {
   }
   paintCustomRangeFields();
   paintRangeCalendar();
+  updateDigestRangeSummary();
 }
 
 // ---------- Digest 主页 ----------
@@ -922,6 +952,7 @@ async function renderDigest() {
     } else {
       $cr.classList.add('hidden');
     }
+    updateDigestRangeSummary();
   });
 
   // chip 输入
@@ -1073,6 +1104,7 @@ function syncDigestControlsFromState() {
   } else {
     customRange?.classList.add('hidden');
   }
+  updateDigestRangeSummary();
   document.querySelectorAll('input[name="ex"]').forEach(cb => {
     cb.checked = _state_digest.filters.excludeTypes.has(cb.value);
   });
@@ -1570,20 +1602,13 @@ async function generateDigest({ previewText = false } = {}) {
   }
   const targets = selectedIds.map(id => {
     const group = groups.find(g => g.id === id) || {};
-    return { id, name: group.name || id || '未命名会话' };
+    return { id, name: group.name || id || '未命名会话', last_msg_at: Number(group.last_msg_at || 0) || 0 };
   });
   rememberRecentGroups(targets, groups, accountId, controller.signal).catch(() => {});
 
-  let since, until;
-  if (_state_digest.rangeKey === 'custom') {
-    ensureCustomRangeDefaults();
-    since = _state_digest.customSince;
-    until = _state_digest.customUntil || 'now';
-  } else {
-    const r = quickRangeToDates(_state_digest.rangeKey);
-    since = r.since;
-    until = r.until;
-  }
+  const range = currentDigestRange();
+  const since = range.since;
+  const until = range.until;
 
   $progress.classList.remove('hidden');
   $stages.innerHTML = '';
@@ -1775,10 +1800,11 @@ async function generateDigest({ previewText = false } = {}) {
         }
       } catch (e) {
         const aborted = e?.name === 'AbortError';
-        failures.push({ group: target.name, error: aborted ? '已取消' : e.message });
+        const message = aborted ? '已取消' : digestClientErrorMessage(e.message, target, since, until);
+        failures.push({ group: target.name, error: message });
         markGroupRunningStages(i, aborted ? 'done' : 'error', aborted ? '已取消' : '已失败');
-        upsertStage(groupStage(i, { name: 'error', label: aborted ? '已取消' : `失败：${e.message}`, status: aborted ? 'done' : 'error' }));
-        if (!aborted) showProgressLogPrompt(e.message);
+        upsertStage(groupStage(i, { name: 'error', label: aborted ? '已取消' : `失败：${message}`, status: aborted ? 'done' : 'error' }));
+        if (!aborted) showProgressLogPrompt(message);
       }
     }, controller.signal);
     await renderQueue;
@@ -1900,6 +1926,30 @@ function compactErrorSummary(value) {
     text = `${host} 返回${code ? ' ' + code : ''}${phrase ? ' ' + phrase : ''}，这是 AI 端点或代理网关错误。`;
   }
   return text.length > 360 ? `${text.slice(0, 360)}...` : text;
+}
+
+function digestClientErrorMessage(value, target = {}, since = '', until = '') {
+  const text = compactErrorSummary(value);
+  if (!isDigestNoMessagesError(text)) return text;
+  return [
+    text,
+    text.includes('本次范围') ? `当前范围按钮：${digestRangeLabel()}` : `本次请求范围：${since || '未知'} ~ ${until || 'now'}（${digestRangeLabel()}）`,
+    digestTargetLastMessageHint(target, since, until),
+  ].filter(Boolean).join('；');
+}
+
+function isDigestNoMessagesError(value) {
+  return /所选时间范围内(?:没有可总结的消息|读取到 \d+ 条消息，但被.*筛选条件全部过滤掉了)/.test(String(value || ''));
+}
+
+function digestTargetLastMessageHint(target = {}, since = '', until = '') {
+  const ts = Number(target.last_msg_at || 0);
+  if (!Number.isFinite(ts) || ts < 946684800000) return '';
+  const last = new Date(ts);
+  const sinceDate = parseLocalDateTime(since);
+  const untilDate = parseLocalDateTime(until);
+  const inRange = sinceDate && untilDate && last >= sinceDate && last <= untilDate;
+  return `群列表最后消息：${fmtDateTime(last, { includeSeconds: true })}${inRange ? '，落在本次范围内，可能是微信会话列表与消息分片尚未同步或会话表不一致' : '，不在本次范围内'}`;
 }
 
 async function toggleProgressLog() {
@@ -2078,14 +2128,20 @@ function digestQuotesForRender(d = {}) {
 function digestLinksForRender(d = {}) {
   const links = Array.isArray(d.links) ? d.links : [];
   return links
-    .filter(link => link && isRenderableDigestUrl(link.url))
+    .filter(link => link && isSuccessfulDigestLink(link) && isRenderableDigestUrl(link.url))
     .sort((a, b) => digestLinkScore(b) - digestLinkScore(a))
     .slice(0, 12);
+}
+
+function isSuccessfulDigestLink(link = {}) {
+  const status = String(link.preview_status || link.status || '').trim().toLowerCase();
+  return !status || status === 'ok';
 }
 
 function digestLinkScore(link = {}) {
   const summary = String(link.summary || '');
   let score = 0;
+  if (!isSuccessfulDigestLink(link)) score -= 20;
   if (/群里|群聊|聊天|上下文|前文|后文|发来|发出|发送|询问|讨论|针对|回应/.test(summary)) score += 8;
   if (/本程序打开该链接时返回|打开超时|加载中|环境异常|没有可靠中文摘要|分段模型失败|聊天上下文不足/.test(summary)) score -= 5;
   if (/报价|文档|官网|仓库|注册|入口|教程|新闻|快讯|公告|优惠|充值|支付|模型|API|代码|下载/.test(`${link.title || ''} ${summary}`)) score += 3;
@@ -2130,10 +2186,12 @@ function digestDataRows(d = {}) {
   const renderedLinks = digestLinksForRender(d);
   const renderedTodos = digestTodosForRender(d);
   const mediaRow = digestMediaStatusRow(d.media_status);
+  const linkRow = digestLinkStatusRow(d.link_status);
   return [
     `时间：${d.since || '未知'} ~ ${d.until || 'now'}`,
     `消息：${d.message_count || 0} 条${d.truncated ? `；已从 ${d.scanned_message_count || d.message_count || 0} 条中截取 ${d.input_message_count || d.message_count || 0} 条` : ''}`,
     mediaRow,
+    linkRow,
     `内容：${d.topics?.length || 0} 条聊天主线，${renderedLinks.length} 个链接资料，${renderedTodos.length} 个后续关注，${digestQuotesForRender(d).length} 条群里金句`,
     `来源：${d.source_label || '本机数据'}；模型：${d.model || '未记录'}`,
   ].filter(Boolean);
@@ -2148,6 +2206,26 @@ function digestMediaStatusRow(mediaStatus = null) {
   return metadataOnly
     ? `媒体：${mediaMessages} 条，其中 ${metadataOnly} 条仅按元信息总结${attached ? `，${attached} 条已附给 AI` : ''}`
     : `媒体：${mediaMessages} 条，均已附给 AI 或按可用内容处理`;
+}
+
+function digestLinkStatusRow(linkStatus = null) {
+  if (!linkStatus || typeof linkStatus !== 'object') return '';
+  const links = Number(linkStatus.links || 0);
+  if (!links) return '';
+  const parts = [
+    `链接：处理 ${Number(linkStatus.processed || 0)}/${links}`,
+    `成功 ${Number(linkStatus.succeeded || 0)}`,
+  ];
+  const failed = Number(linkStatus.failed || 0);
+  const skipped = Number(linkStatus.skipped || 0);
+  if (failed) parts.push(`失败 ${failed}`);
+  if (skipped) parts.push(`跳过 ${skipped}`);
+  const aiRequested = Number(linkStatus.ai_research_requested || 0);
+  if (aiRequested) parts.push(`AI 查链 ${Number(linkStatus.ai_researched || 0)}/${aiRequested}`);
+  if (linkStatus.ai_research_skipped) parts.push('AI 查链已跳过');
+  const failedBatches = Number(linkStatus.ai_research_failed_batches || 0);
+  if (failedBatches) parts.push(`AI 查链失败 ${failedBatches} 批`);
+  return parts.join('，');
 }
 
 function digestTodosForRender(d = {}) {

@@ -1094,8 +1094,10 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
     table: tableName,
     messages: out,
     scanned_message_count: scannedCount,
+    searched_shard_count: dbFiles.length,
     readable_shard_count: readableShards,
     matching_shard_count: matchingShards,
+    query_time_bounds: timeBounds,
     truncated: false,
   };
 }

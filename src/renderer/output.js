@@ -432,6 +432,7 @@ function persistedDigest(digest = {}) {
     truncated: !!digest.truncated,
     source_label: String(digest.source_label || ''),
     media_status: cleanMediaStatus(digest.media_status),
+    link_status: cleanLinkStatus(digest.link_status),
     model: String(digest.model || ''),
     headline: String(digest.headline || ''),
     highlights: cleanHighlights(digest.highlights),
@@ -455,6 +456,24 @@ function cleanMediaStatus(value) {
     attached: Math.max(0, Number(status.attached || 0) || 0),
     metadata_only: Math.max(0, Number(status.metadata_only || 0) || 0),
     omitted: Math.max(0, Number(status.omitted || 0) || 0),
+  };
+}
+
+function cleanLinkStatus(value) {
+  const status = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!status) return null;
+  const links = Math.max(0, Number(status.links || 0) || 0);
+  if (!links) return null;
+  return {
+    links,
+    processed: Math.max(0, Number(status.processed || 0) || 0),
+    succeeded: Math.max(0, Number(status.succeeded || 0) || 0),
+    failed: Math.max(0, Number(status.failed || 0) || 0),
+    skipped: Math.max(0, Number(status.skipped || 0) || 0),
+    ai_research_requested: Math.max(0, Number(status.ai_research_requested || 0) || 0),
+    ai_researched: Math.max(0, Number(status.ai_researched || 0) || 0),
+    ai_research_failed_batches: Math.max(0, Number(status.ai_research_failed_batches || 0) || 0),
+    ai_research_skipped: !!status.ai_research_skipped,
   };
 }
 
@@ -524,6 +543,8 @@ function cleanLinks(value) {
     summary: cleanLinkSummary(item?.summary || ''),
     from: String(item?.from || ''),
     time: String(item?.time || ''),
+    preview_status: String(item?.preview_status || ''),
+    preview_error: String(item?.preview_error || ''),
   })).filter(item => isAnalyzableWebLinkUrl(item.url)) : []);
 }
 

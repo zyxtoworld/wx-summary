@@ -332,6 +332,8 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   });
   const normalized = sourceMessages.map(m => redactStructuredValue(m, settings.privacy));
   const enriched = await enrichMessagesWithLinkPreviews(normalized, settings.link_preview, settings, signal, onProgress);
+  const linkPreviewStatus = enriched.__link_preview_status || null;
+  const linkPreviewStatusByUrl = enriched.__link_preview_by_url || new Map();
   const linkPolicy = { allow_private_networks: linkPreviewAllowsPrivateNetworks(settings.link_preview) };
   throwIfAborted(signal);
   const contextualMessages = attachGlobalNearbyContexts(enriched);
@@ -400,7 +402,9 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     until,
     messageCount: sourceMessages.length,
     model,
-    linkPreviewCount: enriched.reduce((n, msg) => n + (msg.link_previews?.length || 0), 0),
+    linkPreviewCount: linkPreviewStatus?.succeeded || enriched.reduce((n, msg) => n + (msg.link_previews?.length || 0), 0),
+    link_status: linkPreviewStatus,
+    linkPreviewStatusByUrl,
     ...linkPolicy,
   });
 }
@@ -1565,6 +1569,7 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
     detail: `${uniqueUrls.length} 个网页链接`,
   });
   const previewByUrl = new Map();
+  const linkStatus = createLinkPreviewStatus(uniqueUrls.length);
   let cursor = 0;
   let completed = 0;
   const workers = Array.from({ length: Math.min(4, uniqueUrls.length) }, async () => {
@@ -1583,25 +1588,28 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
         };
       }
       previewByUrl.set(url, preview);
+      recordLinkPreviewStatus(linkStatus, preview);
       completed++;
       if (completed === uniqueUrls.length || completed % 5 === 0) {
         notifyProgress(onProgress, {
           phase: 'link_preview',
           label: 'AI 总结 · 打开网页',
-          detail: `已打开 ${completed}/${uniqueUrls.length} 个网页链接`,
+          detail: linkPreviewProgressDetail(linkStatus),
         });
       }
     }
   });
   await Promise.all(workers);
 
-  const researchUrls = uniqueUrls.filter(url => isAnalyzableLinkPreview(previewByUrl.get(url), cfg));
+  const researchUrls = uniqueUrls.filter(url => isSuccessfulLinkPreview(previewByUrl.get(url), cfg));
   let aiResearch = new Map();
   try {
     aiResearch = await fetchAiLinkResearchForUrls(researchUrls, settings, cfg, signal, onProgress);
   } catch (err) {
     if (err?.status === 499 || signal?.aborted) throw err;
+    linkStatus.ai_research_failed_batches++;
   }
+  mergeAiLinkResearchStatus(linkStatus, aiResearch.__link_research_status);
   for (const [url, research] of aiResearch.entries()) {
     const current = previewByUrl.get(url) || { url, status: 'ok' };
     previewByUrl.set(url, {
@@ -1619,12 +1627,84 @@ export async function enrichMessagesWithLinkPreviews(messages, options = {}, set
     urlsByMessage.set(target.index, arr);
   }
 
-  return messages.map((msg, index) => {
+  const enriched = messages.map((msg, index) => {
     const urls = urlsByMessage.get(index);
     if (!urls?.length) return msg;
-    const previews = urls.map(url => previewByUrl.get(url)).filter(preview => isAnalyzableLinkPreview(preview, cfg));
+    const previews = urls.map(url => previewByUrl.get(url)).filter(preview => isTimelineLinkPreview(preview, cfg));
     return previews.length ? { ...msg, link_previews: previews } : msg;
   });
+  attachLinkPreviewMeta(enriched, linkStatus, previewByUrl);
+  return enriched;
+}
+
+function createLinkPreviewStatus(total = 0) {
+  return {
+    links: Math.max(0, Number(total || 0)),
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    skipped: 0,
+    ai_research_requested: 0,
+    ai_researched: 0,
+    ai_research_failed_batches: 0,
+    ai_research_skipped: false,
+  };
+}
+
+function recordLinkPreviewStatus(status, preview = {}) {
+  if (!status) return;
+  status.processed++;
+  const previewStatus = String(preview?.status || 'ok');
+  if (previewStatus === 'ok') status.succeeded++;
+  else if (previewStatus === 'failed') status.failed++;
+  else status.skipped++;
+}
+
+function linkPreviewProgressDetail(status = {}) {
+  const parts = [
+    `已处理 ${status.processed || 0}/${status.links || 0} 个网页链接`,
+    `成功 ${status.succeeded || 0}`,
+    status.failed ? `失败 ${status.failed}` : '',
+    status.skipped ? `跳过 ${status.skipped}` : '',
+  ].filter(Boolean);
+  return parts.join('，');
+}
+
+function mergeAiLinkResearchStatus(linkStatus, aiStatus = null) {
+  if (!linkStatus || !aiStatus) return;
+  linkStatus.ai_research_requested = Number(aiStatus.requested || 0);
+  linkStatus.ai_researched = Number(aiStatus.succeeded || 0);
+  linkStatus.ai_research_failed_batches += Number(aiStatus.failed_batches || 0);
+  linkStatus.ai_research_skipped = !!aiStatus.unsupported;
+}
+
+function attachLinkPreviewMeta(messages, linkStatus, previewByUrl) {
+  Object.defineProperty(messages, '__link_preview_status', {
+    value: linkStatus,
+    enumerable: false,
+  });
+  Object.defineProperty(messages, '__link_preview_by_url', {
+    value: linkPreviewStatusMap(previewByUrl),
+    enumerable: false,
+  });
+}
+
+function linkPreviewStatusMap(previewByUrl = new Map()) {
+  const map = new Map();
+  for (const [url, preview] of previewByUrl.entries()) {
+    const normalized = normalizeHttpUrl(url) || String(url || '');
+    if (!normalized) continue;
+    const item = {
+      status: String(preview?.status || 'ok'),
+      error: cleanField(preview?.error || '').slice(0, 160),
+      final_url: cleanField(preview?.final_url || ''),
+      content_type: cleanField(preview?.content_type || ''),
+    };
+    map.set(normalized, item);
+    const finalUrl = normalizeHttpUrl(preview?.final_url);
+    if (finalUrl) map.set(finalUrl, item);
+  }
+  return map;
 }
 
 function extractMessageLinkTargets(messages, cfg = {}) {
@@ -1726,7 +1806,18 @@ function isMediaContentType(contentType = '') {
 }
 
 function isAnalyzableLinkPreview(preview, cfg = {}) {
-  if (!preview || preview.status === 'skipped_media') return false;
+  return isSuccessfulLinkPreview(preview, cfg);
+}
+
+function isSuccessfulLinkPreview(preview, cfg = {}) {
+  if (!preview || String(preview.status || 'ok') !== 'ok') return false;
+  return isAnalyzableWebLinkUrl(preview.url, cfg) && (!preview.final_url || isAnalyzableWebLinkUrl(preview.final_url, cfg));
+}
+
+function isTimelineLinkPreview(preview, cfg = {}) {
+  if (!preview) return false;
+  const status = String(preview.status || 'ok');
+  if (status === 'skipped' || status === 'skipped_media') return false;
   return isAnalyzableWebLinkUrl(preview.url, cfg) && (!preview.final_url || isAnalyzableWebLinkUrl(preview.final_url, cfg));
 }
 
@@ -1924,12 +2015,32 @@ function markdownToPlainText(text) {
 }
 
 async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null, onProgress = null) {
-  if (!shouldUseAiLinkResearch(urls, settings, cfg)) return new Map();
+  if (!shouldUseAiLinkResearch(urls, settings, cfg)) {
+    const out = new Map();
+    Object.defineProperty(out, '__link_research_status', {
+      value: {
+        requested: 0,
+        batches: 0,
+        succeeded: 0,
+        failed_batches: 0,
+        unsupported: Array.isArray(urls) && urls.length > 0,
+      },
+      enumerable: false,
+    });
+    return out;
+  }
   throwIfAborted(signal);
   const uniqueUrls = [...new Set(urls.map(normalizeHttpUrl).filter(Boolean))];
   const chunks = chunkArray(uniqueUrls, AI_LINK_RESEARCH_URLS_PER_CALL);
   const concurrency = Math.min(DEFAULT_LINK_RESEARCH_CONCURRENCY, chunks.length || 1);
   const out = new Map();
+  const status = {
+    requested: uniqueUrls.length,
+    batches: chunks.length,
+    succeeded: 0,
+    failed_batches: 0,
+    unsupported: false,
+  };
   let completed = 0;
   notifyProgress(onProgress, {
     phase: 'ai_link_research',
@@ -1946,16 +2057,19 @@ async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null, on
     try {
       const batch = await fetchAiLinkResearchBatch(chunk, settings, signal, onProgress);
       for (const [url, research] of batch.entries()) out.set(url, research);
+      status.succeeded += batch.size;
     } catch (err) {
       if (err?.status === 499 || signal?.aborted) throw err;
       if (isLikelyUnsupportedWebSearchError(err)) {
         rememberAiWebSearchSupport(settings, false);
+        status.unsupported = true;
         notifyProgress(onProgress, {
           phase: 'ai_link_research_skip',
           label: 'AI 总结 · AI 查链接',
           detail: '当前 AI 端点不支持 Responses 联网工具，本次后续链接只使用本地打开结果',
         });
       }
+      status.failed_batches++;
       // Local link previews remain attached to the timeline if web-search research fails.
     }
     completed++;
@@ -1964,6 +2078,10 @@ async function fetchAiLinkResearchForUrls(urls, settings, cfg, signal = null, on
       label: 'AI 总结 · AI 查链接',
       detail: `已完成 ${completed}/${chunks.length} 批链接核查`,
     });
+  });
+  Object.defineProperty(out, '__link_research_status', {
+    value: status,
+    enumerable: false,
   });
   return out;
 }
@@ -2305,6 +2423,7 @@ async function callJsonModel({ settings, model, groupName, since, until, message
     '不要按消息顺序逐条照抄；相同事项必须合并成一个议题。title 要是“群友读完就知道这条讲什么”的事项标题，不要只写关键词。',
     '如果议题来自链接、图片、视频、语音或文件，summary 必须把内容和发送时间、发送人、前后聊天上下文关联起来：说明它在群聊里被用来证明什么、询问什么、推进什么或引出什么结论。上下文不足时必须写“聊天上下文不足，只能确认...”，不要写成脱离群聊的网页介绍或图片说明。',
     'todos/links 没有内容时返回空数组。',
+    '只要输入里有任何消息行，就不得写“没有消息、无消息、没有可总结内容、聊天内容为空”这类说法；如果内容零散，也必须基于可见消息概括出大家聊了什么，最多说明“没有形成明确结论”。',
     'quotes 表示“代表性说法”，从聊天原文中挑 0-5 条对群成员有公共价值、能代表情绪或观点的短句；每项包含 speaker、text、context。不要编造原话，不要摘取隐私或只对单个人有意义的话。',
     'todos 表示“后续关注”，不是待办清单。只有聊天里明确有人要做、明确要报名/付款/提交/联系/交付，或全群明确约定下一步时才写，通常 0-3 条，最多 5 条。普通信息点、猜测、可再验证、链接清单、工具状态、泛泛的“持续关注/排查/优化/确认”不要写进 todos，而应写在 topics 里。',
     '不要输出面向单个账号的提醒栏目；有人被点名时，只有对全群有公共价值才写进 topics 或 todos，并使用群昵称。',
@@ -2625,6 +2744,9 @@ function digestPublishabilityReport(raw = {}, context = {}) {
   const leakCount = visibleTexts.filter(text => DIGEST_FALLBACK_LEAK_RE.test(text)).length;
   const fallbackTopicCount = topics.filter(topic => DIGEST_FALLBACK_TOPIC_RE.test(`${topic?.title || ''} ${topic?.category || ''} ${topic?.summary || ''}`)).length;
   const badHeadline = DIGEST_BAD_HEADLINE_RE.test(cleanField(raw?.headline));
+  const falseEmptyClaimCount = messageCount > 0
+    ? visibleTexts.filter(text => DIGEST_FALSE_EMPTY_RE.test(text)).length
+    : 0;
   const effectiveTopics = topics.filter(topic => cleanField(topic?.title).length >= 2 && cleanField(topic?.summary).length >= 12);
   const effectiveLinks = links.filter(link => isAnalyzableWebLinkUrl(link?.url, context));
   const effectiveQuotes = quotes.filter(quote => cleanField(typeof quote === 'string' ? quote : quote?.text).length >= 4);
@@ -2641,15 +2763,16 @@ function digestPublishabilityReport(raw = {}, context = {}) {
     && effectiveTodos.length === 0
     && highlights.length < 2;
   const repeatedFallback = fallbackTopicCount >= 3 || (fallbackTopicCount >= 2 && fallbackTopicCount >= Math.ceil(Math.max(1, topics.length) * 0.25));
-  const blocked = sparse || veryThin || (badHeadline && leakCount > 0) || repeatedFallback || leakCount >= 4;
+  const blocked = sparse || veryThin || falseEmptyClaimCount > 0 || (badHeadline && leakCount > 0) || repeatedFallback || leakCount >= 4;
   const reason = [
     sparse ? '模型返回内容过空' : '',
     veryThin ? '话题提炼不足' : '',
+    falseEmptyClaimCount ? `AI 把已读取到的 ${messageCount} 条消息写成无消息` : '',
     badHeadline ? '标题像分段兜底' : '',
     leakCount ? `正文命中 ${leakCount} 处兜底/原始时间线痕迹` : '',
     fallbackTopicCount ? `${fallbackTopicCount}/${Math.max(1, topics.length)} 个话题像失败分段` : '',
   ].filter(Boolean).join('，') || '命中成品质量闸门';
-  return { blocked, reason, leakCount, fallbackTopicCount, badHeadline };
+  return { blocked, reason, leakCount, fallbackTopicCount, badHeadline, falseEmptyClaimCount };
 }
 
 function digestQualityVisibleTexts(raw = {}) {
@@ -2960,7 +3083,7 @@ function normalizeDigest(raw, meta) {
   const todos = arrayOf(raw?.todos).map(normalizeTodo).filter(Boolean);
   const topics = dedupeTopics(arrayOf(raw?.topics).map(normalizeTopic).filter(t => t.summary || t.title !== '未命名议题'));
   const links = arrayOf(raw?.links)
-    .map(normalizeLink)
+    .map(link => normalizeLink(link, meta))
     .filter(l => isAnalyzableWebLinkUrl(l.url, meta));
   const quotes = arrayOf(raw?.quotes).map(normalizeQuote).filter(Boolean).slice(0, 8);
   return {
@@ -2976,6 +3099,7 @@ function normalizeDigest(raw, meta) {
     todos,
     topics,
     links: publicDigestLinks(links, 12, meta),
+    link_status: cleanDigestLinkStatus(meta.link_status),
     quotes,
     created_at: new Date().toISOString(),
   };
@@ -3042,6 +3166,7 @@ const DIGEST_WORK_REPORT_RE = /(?:根据聊天记录|根据群聊内容|以下�
 const DIGEST_FALLBACK_LEAK_RE = /(?:_raw_timeline|raw_timeline|_fallback_chunk|分段兜底|原始时间线|少量消息仅保留元信息|本地文件待解封|md5=|未被模型稳定提炼|模型请求返回空内容|按分段摘要整理|无可直接附加的媒体块|时间范围：\d{4}-\d{2}-\d{2}.*?共\s*\d+\s*条消息|涉及内容：\d+\s*张图片\/视频关键帧)/i;
 const DIGEST_FALLBACK_TOPIC_RE = /(?:少量消息仅保留元信息|原始时间线|待合并|失败分段|未被模型稳定提炼|无可直接附加的媒体块|本地文件待解封|md5=)/i;
 const DIGEST_BAD_HEADLINE_RE = /(?:按分段摘要整理|重点见下方|原始时间线|分段摘要|分段兜底)/i;
+const DIGEST_FALSE_EMPTY_RE = /(?:没有|没(?:有|什么)?|无|暂无|未见|未看到).{0,10}(?:消息|聊天内容|可总结内容|可提炼内容|有效内容|重点内容)|聊天内容为空|没有(?:可总结|可提炼|值得总结)的?(?:内容|信息|消息)/i;
 const TODO_ACTION_RE = /确认|处理|跟进|补充|整理|报名|提交|付款|测试|验证|联系|修复|发布|更新|迁移|查看|统计|安排|提醒|复盘|决定|对齐|收集|申请|注册|认领|补发|回复|开通|关闭|领取|报销|交付|检查|排查|推进|落实|回访|同步/;
 const CJK_RE = /[\u3400-\u9fff]/;
 const TODO_PLACEHOLDER_RE = /^(待认领|未指定|无|暂无|不明确|待定|未定|待确认)$/;
@@ -3133,9 +3258,15 @@ function normalizeQuote(value = {}) {
   };
 }
 
-function normalizeLink(link = {}) {
+function normalizeLink(link = {}, meta = {}) {
   const url = cleanField(link.url);
-  const summary = ensureLinkSummaryHasContext(cleanLinkSummary(link.summary || link.description || link.context));
+  const preview = linkPreviewStatusForUrl(meta.linkPreviewStatusByUrl, url);
+  const previewStatus = cleanField(link.preview_status || link.status || preview?.status || '').slice(0, 40);
+  const previewError = cleanField(link.preview_error || link.error || preview?.error || '').slice(0, 160);
+  const fallbackSummary = previewStatus && previewStatus !== 'ok'
+    ? linkPreviewFailureSummary(previewStatus, previewError)
+    : '';
+  const summary = ensureLinkSummaryHasContext(cleanLinkSummary(link.summary || link.description || link.context || fallbackSummary));
   const title = cleanPublicLinkTitle(link.title) || '网页链接';
   return {
     title,
@@ -3143,6 +3274,36 @@ function normalizeLink(link = {}) {
     summary,
     from: cleanField(link.from),
     time: cleanField(link.time),
+    preview_status: previewStatus && previewStatus !== 'ok' ? previewStatus : '',
+    preview_error: previewStatus && previewStatus !== 'ok' ? previewError : '',
+  };
+}
+
+function linkPreviewStatusForUrl(map, url) {
+  if (!map || !url) return null;
+  const normalized = normalizeHttpUrl(url);
+  if (normalized && typeof map.get === 'function') return map.get(normalized) || null;
+  return typeof map.get === 'function' ? map.get(url) || null : null;
+}
+
+function linkPreviewFailureSummary(status, error) {
+  if (status === 'failed') return `本程序打开该链接失败${error ? `：${error}` : ''}，未把它当成成功网页预览。`;
+  return `本程序未把该链接作为普通网页预览${error ? `：${error}` : ''}。`;
+}
+
+function cleanDigestLinkStatus(value = null) {
+  const status = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!status || !Number(status.links || 0)) return null;
+  return {
+    links: Math.max(0, Number(status.links || 0) || 0),
+    processed: Math.max(0, Number(status.processed || 0) || 0),
+    succeeded: Math.max(0, Number(status.succeeded || 0) || 0),
+    failed: Math.max(0, Number(status.failed || 0) || 0),
+    skipped: Math.max(0, Number(status.skipped || 0) || 0),
+    ai_research_requested: Math.max(0, Number(status.ai_research_requested || 0) || 0),
+    ai_researched: Math.max(0, Number(status.ai_researched || 0) || 0),
+    ai_research_failed_batches: Math.max(0, Number(status.ai_research_failed_batches || 0) || 0),
+    ai_research_skipped: !!status.ai_research_skipped,
   };
 }
 
@@ -3361,6 +3522,13 @@ export const __llmInternals = {
   extractResponsesText,
   extractMessageLinkTargets,
   enrichMessagesWithLinkPreviews,
+  createLinkPreviewStatus,
+  recordLinkPreviewStatus,
+  linkPreviewProgressDetail,
+  linkPreviewStatusMap,
+  isSuccessfulLinkPreview,
+  isTimelineLinkPreview,
+  cleanDigestLinkStatus,
   isTransientError,
   isLikelyChunkableFailure,
   isLikelyRecoverableChunkFailure,

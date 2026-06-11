@@ -1384,6 +1384,43 @@ function mediaStatusDetail(mediaStatus = null) {
   return `媒体 ${mediaMessages} 条，其中 ${metadataOnly} 条仅按元信息总结${attached ? `，${attached} 条已附给 AI` : ''}`;
 }
 
+function linkStatusDetail(linkStatus = null) {
+  if (!linkStatus || typeof linkStatus !== 'object') return '';
+  const links = Number(linkStatus.links || 0);
+  if (!links) return '';
+  const failed = Number(linkStatus.failed || 0);
+  const skipped = Number(linkStatus.skipped || 0);
+  const parts = [
+    `链接处理 ${Number(linkStatus.processed || 0)}/${links}`,
+    `成功 ${Number(linkStatus.succeeded || 0)}`,
+    failed ? `失败 ${failed}` : '',
+    skipped ? `跳过 ${skipped}` : '',
+  ].filter(Boolean);
+  const aiRequested = Number(linkStatus.ai_research_requested || 0);
+  if (aiRequested) {
+    parts.push(`AI 查链 ${Number(linkStatus.ai_researched || 0)}/${aiRequested}`);
+  } else if (linkStatus.ai_research_skipped) {
+    parts.push('AI 查链已跳过');
+  }
+  const failedBatches = Number(linkStatus.ai_research_failed_batches || 0);
+  if (failedBatches) parts.push(`AI 查链失败 ${failedBatches} 批`);
+  return parts.join('，');
+}
+
+function emptyCollectionDetail(collection = {}) {
+  const parts = [
+    `本次范围 ${collection.since || '未知'} ~ ${collection.until || 'now'}`,
+  ];
+  const searched = Number(collection.searched_shard_count || 0);
+  const readable = Number(collection.readable_shard_count || 0);
+  const matching = Number(collection.matching_shard_count || 0);
+  if (searched || readable || matching) {
+    parts.push(`消息分片：扫描 ${searched || 0} 个、可读 ${readable || 0} 个、含该会话表 ${matching || 0} 个`);
+  }
+  if (collection.table) parts.push(`会话表 ${sanitizeText(collection.table)}`);
+  return parts.join('；');
+}
+
 async function runDigestSSE(req, res, body) {
   const controller = new AbortController();
   let completed = false;
@@ -1490,10 +1527,11 @@ async function runDigestSSE(req, res, body) {
     });
 
     if (!collection.message_count || !Array.isArray(collection.messages) || collection.messages.length === 0) {
+      const emptyDetail = emptyCollectionDetail(collection);
       if (collection.no_matching_filters) {
-        throw Object.assign(new Error(`所选时间范围内读取到 ${collection.pre_filter_message_count || collection.scanned_message_count || 0} 条消息，但被发送人、关键词或类型筛选条件全部过滤掉了。请放宽筛选条件后重试。`), { status: 400 });
+        throw Object.assign(new Error(`所选时间范围内读取到 ${collection.pre_filter_message_count || collection.scanned_message_count || 0} 条消息，但被发送人、关键词或类型筛选条件全部过滤掉了。请放宽筛选条件后重试。${emptyDetail ? `（${emptyDetail}）` : ''}`), { status: 400 });
       }
-      throw Object.assign(new Error('所选时间范围内没有可总结的消息，请换一个时间范围或群聊。'), { status: 400 });
+      throw Object.assign(new Error(`所选时间范围内没有可总结的消息，请换一个时间范围或群聊。${emptyDetail ? `（${emptyDetail}）` : ''}`), { status: 400 });
     }
 
     if (collection.below_minimum) {
@@ -1533,7 +1571,7 @@ async function runDigestSSE(req, res, body) {
     digest.truncated = !!collection.truncated;
     digest.source_label = collection.source_label;
     digest.media_status = collection.media_status || null;
-    sendStage({ name: 'summarizing', label: 'AI 总结', status: 'done', detail: digest.model });
+    sendStage({ name: 'summarizing', label: 'AI 总结', status: 'done', detail: [digest.model, linkStatusDetail(digest.link_status)].filter(Boolean).join(' · ') });
     logInfo('digest_summarized', { group_id: groupId, digest_id: digest.digest_id, model: digest.model, topics: digest.topics?.length || 0, links: digest.links?.length || 0 });
 
     sendStage({ name: 'rendering', label: body.preview_text ? '生成文本预览' : '渲染长图', status: 'running' });
