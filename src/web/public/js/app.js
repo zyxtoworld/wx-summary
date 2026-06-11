@@ -3848,7 +3848,7 @@ function showHistoryModal(item) {
     status.textContent = '正在读取原渲染设置...';
     try {
       const saved = await api(`/api/history-digest/${encodeURIComponent(item.digest_id)}`);
-      const initial = digestRenderSelectionFromSaved(saved.digest?.__render);
+      const initial = digestRenderSelectionFromSaved(saved.render || saved.digest?.__render);
       status.textContent = '';
       showDigestRerenderPanel({
         anchor: e.currentTarget,

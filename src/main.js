@@ -1099,6 +1099,15 @@ function publicSchedulerStatus(status = getSchedulerStatus()) {
   };
 }
 
+function publicDigestRenderOptions(render = {}) {
+  const saved = render && typeof render === 'object' && !Array.isArray(render) ? render : {};
+  return {
+    theme: ['light', 'dark'].includes(saved.theme) ? saved.theme : '',
+    font_size: saved.font_size === 'large' ? 'large' : saved.font_size === 'normal' ? 'normal' : '',
+    accent_color: /^#[0-9a-fA-F]{6}$/.test(String(saved.accent_color || '')) ? String(saved.accent_color).toUpperCase() : '',
+  };
+}
+
 function publicOutputItem(item = {}) {
   const out = {};
   for (const key of [
@@ -1488,7 +1497,15 @@ async function handleApi(req, res, parsedUrl) {
     const settings = await loadSettings();
     const digest = await readHistoryDigest(settings, digestId);
     if (!digest) return sendJson(res, 404, { error: 'saved digest json not found' });
-    return sendJson(res, 200, { ok: true, digest });
+    const render = publicDigestRenderOptions(digest.__render);
+    return sendJson(res, 200, {
+      ok: true,
+      digest: {
+        digest_id: digest.digest_id,
+        __render: render,
+      },
+      render,
+    });
   }
 
   if (pathname === '/api/rerender-history' && req.method === 'POST') {
