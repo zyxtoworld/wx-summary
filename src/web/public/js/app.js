@@ -200,6 +200,7 @@ function resetDigestAccountState() {
   _state_digest.lastTextPartialReason = '';
   _state_digest.lastCanvasRenderKey = '';
   _state_digest.lastSavedRenderKey = '';
+  _state_digest.lastRenderSelection = null;
   _state_digest.progress = null;
   stopDigestProgressPaintTimer();
 }
@@ -692,7 +693,7 @@ function outputDirLooksInsideProject(dir, projectRoot) {
   }
   const root = normalizePathForUi(projectRoot).toLowerCase();
   const full = normalizePathForUi(raw).toLowerCase();
-  if (!root) return true;
+  if (!root) return false;
   const outputs = root ? `${root}/outputs` : '';
   const tmp = root ? `${root}/outputs/.tmp` : '';
   return !!root && full.startsWith(`${outputs}/`) && full !== outputs && full !== tmp && !full.startsWith(`${tmp}/`);
@@ -767,6 +768,7 @@ let _state_digest = {
   lastTextPartialReason: '',
   lastCanvasRenderKey: '',
   lastSavedRenderKey: '',
+  lastRenderSelection: null,
   generating: false,
   abortController: null,
   activeBatchId: '',
@@ -1133,6 +1135,7 @@ async function renderDigest() {
         applyDigestRenderSelection(selection);
         drawDigestCanvas(_state_digest.lastDigest);
         _state_digest.lastCanvasRenderKey = digestRenderStateKey(selection);
+        _state_digest.lastRenderSelection = { ...selection };
         return updatePreviewSavedRenderState({ notify: true });
       },
       onSave: async selection => {
@@ -1152,12 +1155,14 @@ async function renderDigest() {
           _state_digest.lastSavedItem = r.item || _state_digest.lastSavedItem;
           _state_digest.lastCanvasRenderKey = digestRenderStateKey(selection);
           _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
+          _state_digest.lastRenderSelection = { ...selection };
           updatePreviewSavedRenderState();
           return r;
         } catch (err) {
           applyDigestRenderSelection(previousSelection);
           drawDigestCanvas(_state_digest.lastDigest);
           _state_digest.lastCanvasRenderKey = digestRenderStateKey(previousSelection);
+          _state_digest.lastRenderSelection = { ...previousSelection };
           updatePreviewSavedRenderState();
           throw err;
         }
@@ -1419,10 +1424,13 @@ function digestRenderSelectionFromSaved(render = {}, fallback = currentDigestRen
 }
 
 function closeRerenderPanels() {
-  document.querySelectorAll('.rerender-popover').forEach(el => el.remove());
+  document.querySelectorAll('.rerender-popover').forEach(el => {
+    if (typeof el._onClose === 'function') el._onClose();
+    else el.remove();
+  });
 }
 
-function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigestRenderSelection(), onPreview, onSave }) {
+function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigestRenderSelection(), onPreview, onSave, onClose }) {
   closeRerenderPanels();
   const selection = {
     theme: normalizeDigestTheme(initial.theme),
@@ -1469,6 +1477,12 @@ function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigest
   else document.body.appendChild(panel);
 
   const panelStatus = panel.querySelector('[data-status]');
+  const closePanel = () => {
+    if (!panel.isConnected) return;
+    panel.remove();
+    if (typeof onClose === 'function') onClose();
+  };
+  panel._onClose = closePanel;
   const syncSwatches = () => {
     panel.querySelectorAll('[data-accent]').forEach(btn => {
       btn.classList.toggle('selected', btn.dataset.accent === selection.accent);
@@ -1483,7 +1497,7 @@ function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigest
       statusTarget.textContent = '已更新预览';
     }
   };
-  panel.querySelector('[data-close]').addEventListener('click', () => panel.remove());
+  panel.querySelector('[data-close]').addEventListener('click', closePanel);
   panel.querySelectorAll(`input[name="${id}-theme"]`).forEach(input => {
     input.addEventListener('change', () => {
       selection.theme = normalizeDigestTheme(input.value);
@@ -1907,6 +1921,7 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.lastTextPartialReason = '';
   _state_digest.lastCanvasRenderKey = '';
   _state_digest.lastSavedRenderKey = '';
+  _state_digest.lastRenderSelection = null;
   scrollDigestWorkIntoView($progress);
   const selectedIds = [..._state_digest.selectedGroups];
   let groups;
@@ -2320,6 +2335,7 @@ async function generateDigest({ previewText = false } = {}) {
             _state_digest.lastSavedItem = null;
             _state_digest.lastCanvasRenderKey = digestRenderStateKey(batchSnapshot.render);
             _state_digest.lastSavedRenderKey = '';
+            _state_digest.lastRenderSelection = { ...batchSnapshot.render };
             const revealButton = document.getElementById('btn-reveal');
             if (revealButton) {
               revealButton.disabled = true;
@@ -2402,13 +2418,10 @@ async function generateDigest({ previewText = false } = {}) {
                 renderSelection: batchSnapshot.render,
                 onProgress: stage => upsertStage(groupStage(i, stage)),
               });
-              if (controller.signal.aborted) {
-                hideUncommittedDigestPreview();
-                return;
-              }
               _state_digest.lastDigest = digest;
               _state_digest.lastSavedItem = saved.item;
               _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
+              _state_digest.lastRenderSelection = { ...batchSnapshot.render };
               digests[i] = digest;
               updatePreviewSavedRenderState();
               updateDigestPreviewActionLock();
@@ -2574,6 +2587,12 @@ function compactErrorSummary(value) {
 function digestClientErrorMessage(value, target = {}, since = '', until = '') {
   const text = compactErrorSummary(value);
   if (!isDigestNoMessagesError(text)) return text;
+  if (isDigestFilterEmptyError(text)) {
+    return [text, digestActiveFilterHint()].filter(Boolean).join('；');
+  }
+  if (isDigestBelowMinimumError(text)) {
+    return [text, `当前最少消息数：${Math.max(1, Number(_state_digest.minMessages || 1) || 1)}`].join('；');
+  }
   return [
     text,
     text.includes('本次范围') ? `当前范围按钮：${digestRangeLabel()}` : `本次请求范围：${since || '未知'} ~ ${until || 'now'}（${digestRangeLabel()}）`,
@@ -2583,6 +2602,23 @@ function digestClientErrorMessage(value, target = {}, since = '', until = '') {
 
 function isDigestNoMessagesError(value) {
   return /所选时间范围内(?:没有可总结的消息|读取到 \d+ 条消息，但被.*筛选条件全部过滤掉了|只有 \d+ 条可总结消息.*低于最少 \d+ 条)/.test(String(value || ''));
+}
+
+function isDigestFilterEmptyError(value) {
+  return /读取到 \d+ 条消息，但被.*筛选条件全部过滤掉了/.test(String(value || ''));
+}
+
+function isDigestBelowMinimumError(value) {
+  return /只有 \d+ 条可总结消息.*低于最少 \d+ 条/.test(String(value || ''));
+}
+
+function digestActiveFilterHint() {
+  const parts = [
+    _state_digest.filters.senders?.length ? `发送人 ${_state_digest.filters.senders.length} 个` : '',
+    _state_digest.filters.keywords?.length ? `关键词 ${_state_digest.filters.keywords.length} 个` : '',
+    _state_digest.filters.excludeTypes?.size ? `排除类型 ${_state_digest.filters.excludeTypes.size} 个` : '',
+  ].filter(Boolean);
+  return parts.length ? `当前筛选：${parts.join('、')}，请放宽筛选后重试` : '当前没有可显示的筛选项，请调整时间范围后重试';
 }
 
 function digestTargetLastMessageHint(target = {}, since = '', until = '') {
@@ -3339,8 +3375,9 @@ function restoreDigestOutputs() {
     const canvas = document.getElementById('digest-canvas');
     if (previewCard && canvas) {
       previewCard.classList.remove('hidden');
-      drawDigestCanvas(_state_digest.lastDigest, canvas);
-      _state_digest.lastCanvasRenderKey = digestRenderStateKey();
+      const renderSelection = _state_digest.lastRenderSelection || currentDigestRenderSelection();
+      drawDigestCanvas(_state_digest.lastDigest, canvas, renderSelection);
+      _state_digest.lastCanvasRenderKey = digestRenderStateKey(renderSelection);
       updateDigestPreviewActionLock();
     }
   }
@@ -3966,6 +4003,10 @@ function showHistoryModal(item) {
         anchor: e.currentTarget,
         statusTarget: status,
         initial,
+        onClose: () => {
+          delete rerenderButton.dataset.panelOpen;
+          rerenderButton.disabled = !canRerender;
+        },
         onSave: async selection => {
           let r;
           try {
@@ -3997,6 +4038,7 @@ function showHistoryModal(item) {
           return r;
         },
       });
+      rerenderButton.dataset.panelOpen = '1';
     } catch (err) {
       if (err?.status === 404) {
         markHistoryDigestMissing(`读取原渲染设置失败：${err.message || '原摘要 JSON 已不存在'}`);
@@ -4005,7 +4047,7 @@ function showHistoryModal(item) {
       status.className = 'status err';
       status.textContent = `读取原渲染设置失败：${err.message || '未知错误'}`;
     } finally {
-      rerenderButton.disabled = !canRerender;
+      rerenderButton.disabled = rerenderButton.dataset.panelOpen === '1' || !canRerender;
     }
   });
 }
@@ -4841,6 +4883,16 @@ async function renderSettings() {
   document.getElementById('s-fontsize').value = s.render.default_font_size;
   document.getElementById('s-outdir').value = s.output.dir;
   document.getElementById('s-retention').value = s.output.retention_days ?? 0;
+  const markRenderSettingsDirty = () => {
+    const $st = document.getElementById('s-render-status');
+    if (!$st || $st.dataset.saving === '1') return;
+    $st.className = 'status warn';
+    $st.textContent = '有未保存更改';
+  };
+  ['s-theme', 's-fontsize', 's-outdir', 's-retention'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', markRenderSettingsDirty);
+    document.getElementById(id)?.addEventListener('change', markRenderSettingsDirty);
+  });
   const openOutdirButton = document.getElementById('s-open-outdir');
   const saveRenderButton = document.getElementById('s-save-render');
   const renderOutputButtons = [openOutdirButton, saveRenderButton];
@@ -4849,7 +4901,7 @@ async function renderSettings() {
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir)) {
       $st.className = 'status err';
-      $st.textContent = '✗ 输出目录必须在 outputs/ 下，且不能位于 outputs/.tmp';
+      $st.textContent = '✗ 输出目录请填写 ./outputs/...，且不能位于 outputs/.tmp';
       return;
     }
     $st.className = 'status';
@@ -4868,10 +4920,11 @@ async function renderSettings() {
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir)) {
       $st.className = 'status err';
-      $st.textContent = '✗ 输出目录必须在 outputs/ 下，且不能位于 outputs/.tmp';
+      $st.textContent = '✗ 输出目录请填写 ./outputs/...，且不能位于 outputs/.tmp';
       return;
     }
     $st.className = 'status';
+    $st.dataset.saving = '1';
     $st.textContent = '保存中...';
     try {
       const r = await api('/api/settings', {
@@ -4898,6 +4951,8 @@ async function renderSettings() {
     } catch (e) {
       $st.className = 'status err';
       $st.textContent = '✗ ' + e.message;
+    } finally {
+      delete $st.dataset.saving;
     }
   }));
   openOutdirButton.disabled = false;

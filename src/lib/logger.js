@@ -4,6 +4,7 @@ import { PROJECT_ROOT, TMP_DIR, resolveInsideTmp } from './paths.js';
 import { ensureDir } from './json-store.js';
 
 const DEFAULT_LOG_FILE = path.join(TMP_DIR, 'wx-summary.log');
+const LOG_TAIL_MAX_BYTES = 256 * 1024;
 const LEVELS = new Map([['debug', 10], ['info', 20], ['warn', 30], ['error', 40]]);
 const SENSITIVE_FIELD_KEYS = new Set([
   'account',
@@ -68,8 +69,22 @@ export function logError(event, fields = {}) {
 }
 
 export async function readLogTail(maxLines = 200) {
-  const text = await fsp.readFile(targetFile, 'utf-8').catch(() => '');
-  return text.split(/\r?\n/).filter(Boolean).slice(-maxLines);
+  const lineLimit = Math.max(1, Math.min(1000, Number(maxLines || 200) || 200));
+  const stat = await fsp.stat(targetFile).catch(() => null);
+  if (!stat?.size) return [];
+  const bytesToRead = Math.min(stat.size, Math.max(8192, Math.min(LOG_TAIL_MAX_BYTES, lineLimit * 2048)));
+  const handle = await fsp.open(targetFile, 'r').catch(() => null);
+  if (!handle) return [];
+  let text = '';
+  try {
+    const buffer = Buffer.alloc(bytesToRead);
+    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, stat.size - bytesToRead);
+    text = buffer.subarray(0, bytesRead).toString('utf-8');
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  if (stat.size > bytesToRead) text = text.replace(/^[^\r\n]*(?:\r?\n|$)/, '');
+  return text.split(/\r?\n/).filter(Boolean).slice(-lineLimit);
 }
 
 function writeLog(level, event, fields) {

@@ -33,6 +33,7 @@ const PRELAUNCH_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'prelaunch-weixin-bin
 const LAUNCHER_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'launcher-weixin-binary.json');
 const SAVE_RENDER_BODY_LIMIT = 120 * 1024 * 1024;
 const MAX_ACTIVE_DIGEST_REQUESTS = 6;
+const MAX_ACTIVE_DIGEST_SAVES = 2;
 const DIGEST_BATCH_SETTINGS_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_DIGEST_BATCH_SETTINGS = 20;
 const CANCELLED_DIGEST_BATCH_TTL_MS = 2 * 60 * 60 * 1000;
@@ -1448,6 +1449,9 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/save-render' && req.method === 'POST') {
+    if (ACTIVE_DIGEST_SAVES.size >= MAX_ACTIVE_DIGEST_SAVES) {
+      throw Object.assign(new Error('当前长图保存任务较多，请稍后再试。'), { status: 429 });
+    }
     const controller = new AbortController();
     let completed = false;
     let saveBatchId = '';
@@ -1678,6 +1682,8 @@ async function handleApi(req, res, parsedUrl) {
       uptime_hours: Number(((Date.now() - SERVICE_STARTED_AT.getTime()) / 3_600_000).toFixed(3)),
       active_digest_requests: ACTIVE_DIGEST_REQUESTS.size,
       max_active_digest_requests: MAX_ACTIVE_DIGEST_REQUESTS,
+      active_digest_saves: ACTIVE_DIGEST_SAVES.size,
+      max_active_digest_saves: MAX_ACTIVE_DIGEST_SAVES,
     };
     const localActionEvidence = {
       last_clipboard_copy: LAST_CLIPBOARD_COPY_EVIDENCE,

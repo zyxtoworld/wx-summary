@@ -12,8 +12,7 @@ export function historyIndexPath(settings) {
 
 async function safeOutputBase(settings, { ensure = true } = {}) {
   const base = outputDirFromSettings(settings);
-  if (ensure) await ensureDir(base);
-  await assertRealOutputDir(base);
+  await assertRealOutputDir(base, { ensure });
   return base;
 }
 

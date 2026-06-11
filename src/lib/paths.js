@@ -63,18 +63,48 @@ export function outputDirFromSettings(settings) {
 
 export async function assertRealOutputDir(base, { ensure = false } = {}) {
   const resolved = path.resolve(base || DEFAULT_DIGESTS_DIR);
-  if (ensure) await fsp.mkdir(resolved, { recursive: true });
-  const [realProject, realOutputs, realTmp, realBase] = await Promise.all([
-    fsp.realpath(PROJECT_ROOT).catch(() => ''),
-    fsp.realpath(OUTPUTS_DIR).catch(() => ''),
-    fsp.realpath(TMP_DIR).catch(() => ''),
-    fsp.realpath(resolved).catch(() => ''),
-  ]);
+  const realProject = await fsp.realpath(PROJECT_ROOT).catch(() => '');
+  if (!realProject) throw realOutputPathError('project root unavailable');
+  await fsp.mkdir(OUTPUTS_DIR, { recursive: true });
+  const realOutputs = await fsp.realpath(OUTPUTS_DIR).catch(() => '');
+  if (!realOutputs || !isInside(realProject, realOutputs)) throw realOutputPathError('outputs dir outside project');
+  const realTmp = await fsp.realpath(TMP_DIR).catch(() => '');
+  if (ensure) {
+    await assertCreatableInsideRealOutputs(resolved, { realOutputs, realTmp });
+    await fsp.mkdir(resolved, { recursive: true });
+  }
+  const realBase = await fsp.realpath(resolved).catch(() => '');
   if (!realProject || !realOutputs || !realBase || !isInside(realProject, realOutputs) || !isInside(realOutputs, realBase) || path.resolve(realOutputs) === path.resolve(realBase)) {
     throw realOutputPathError('output dir outside outputs/');
   }
   if (realTmp && isInside(realTmp, realBase)) throw realOutputPathError('output dir inside outputs/.tmp');
   return { realOutputs, realTmp, realBase };
+}
+
+async function assertCreatableInsideRealOutputs(target, { realOutputs, realTmp = '' } = {}) {
+  const existing = await closestExistingPath(target);
+  const realExisting = existing ? await fsp.realpath(existing).catch(() => '') : '';
+  if (!realExisting || !isInside(realOutputs, realExisting)) {
+    throw realOutputPathError('output dir parent outside outputs/');
+  }
+  if (realTmp && isInside(realTmp, realExisting)) {
+    throw realOutputPathError('output dir parent inside outputs/.tmp');
+  }
+}
+
+async function closestExistingPath(target) {
+  let current = path.resolve(target || DEFAULT_DIGESTS_DIR);
+  while (true) {
+    try {
+      await fsp.access(current);
+      return current;
+    } catch (e) {
+      if (e?.code !== 'ENOENT') throw e;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return '';
+    current = parent;
+  }
 }
 
 function realOutputPathError(message) {

@@ -50,7 +50,7 @@ export async function ensureRuntimeDirs(settings = defaultSettings()) {
   await ensureDir(OUTPUTS_DIR);
   await ensureOrdinaryTmpDir();
   await ensureDir(DEFAULT_DIGESTS_DIR);
-  await ensureDir(outputDirFromSettings(settings));
+  await assertRealOutputDir(outputDirFromSettings(settings), { ensure: true });
 }
 
 export async function clearTmpDir() {
@@ -299,7 +299,20 @@ export function stripRuntime(settings) {
   const s = cloneJson(settings);
   delete s.llm.api_key;
   delete s.wechat.manual_key;
+  if (s.output && Object.hasOwn(s.output, 'dir')) {
+    s.output.dir = publicOutputDir(s.output.dir);
+  }
   return s;
+}
+
+function publicOutputDir(value) {
+  try {
+    const dir = outputDirFromSettings({ output: { dir: value } });
+    const rel = path.relative(PROJECT_ROOT, dir).replaceAll(path.sep, '/');
+    return rel ? `./${rel}` : './outputs/digests';
+  } catch {
+    return './outputs/digests';
+  }
 }
 
 export function normalizeSettings(settings) {
