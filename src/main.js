@@ -37,6 +37,7 @@ const MAX_CANCELLED_DIGEST_BATCHES = 100;
 const SERVICE_STARTED_AT = new Date();
 let ACTIVE_SERVER = null;
 let ACTIVE_PORT = null;
+const ACTIVE_SOCKETS = new Set();
 let INSTANCE_LOCK_FD = null;
 let SHUTTING_DOWN = false;
 let WEIXIN_BINARY_EXTERNAL_BASELINE = null;
@@ -115,6 +116,14 @@ function removeRuntimeInfo() {
   try { fs.rmSync(RUNTIME_INFO_FILE, { force: true }); } catch {}
 }
 
+function sameProjectRoot(rootText) {
+  const resolved = path.resolve(String(rootText || '').trim());
+  if (!resolved) return false;
+  return process.platform === 'win32'
+    ? resolved.toLowerCase() === PROJECT_ROOT.toLowerCase()
+    : resolved === PROJECT_ROOT;
+}
+
 function releaseInstanceLockSync() {
   const fd = INSTANCE_LOCK_FD;
   INSTANCE_LOCK_FD = null;
@@ -130,6 +139,8 @@ async function readRuntimeInfo() {
     const raw = JSON.parse(await fsp.readFile(RUNTIME_INFO_FILE, 'utf-8'));
     const port = Number(raw?.port || 0);
     const urlValue = String(raw?.url || '').trim();
+    const runtimeRootText = String(raw?.project_root || '').trim();
+    if (!runtimeRootText || !sameProjectRoot(runtimeRootText)) return null;
     if (!Number.isInteger(port) || port <= 0 || port > 65535 || !urlValue) return null;
     const parsed = new URL(urlValue);
     if (parsed.hostname !== HOST) return null;
@@ -377,14 +388,28 @@ function freshPrelaunchBaseline() {
 async function gracefulShutdown(code = 0) {
   if (SHUTTING_DOWN) return;
   SHUTTING_DOWN = true;
-  await stopScheduler({ wait: true, timeout_ms: 30000 });
-  const server = ACTIVE_SERVER;
-  if (server) {
-    await new Promise(resolve => server.close(() => resolve())).catch(() => {});
+  try {
+    await stopScheduler({ wait: true, timeout_ms: 30000 });
+    const server = ACTIVE_SERVER;
+    if (server) {
+      await closeServerForShutdown(server, 5000);
+    }
+    await clearTmpDir().catch(() => removeRuntimeInfo());
+  } finally {
+    removeRuntimeInfo();
+    releaseInstanceLockSync();
+    process.exit(code);
   }
-  await clearTmpDir().catch(() => removeRuntimeInfo());
-  releaseInstanceLockSync();
-  process.exit(code);
+}
+
+async function closeServerForShutdown(server, timeout_ms = 5000) {
+  server.closeIdleConnections?.();
+  await Promise.race([
+    new Promise(resolve => server.close(() => resolve())),
+    new Promise(resolve => setTimeout(resolve, timeout_ms)),
+  ]).catch(() => {});
+  server.closeAllConnections?.();
+  for (const socket of ACTIVE_SOCKETS) socket.destroy();
 }
 
 function openerLaunchError(command, err) {
@@ -1426,6 +1451,17 @@ function emptyCollectionDetail(collection = {}) {
   return parts.join('；');
 }
 
+function belowMinimumCollectionMessage(collection = {}, minMessages = 0) {
+  const actual = Number(collection.message_count || 0) || 0;
+  const minimum = Math.max(1, Number(minMessages || 0) || 0);
+  const preFilterCount = Number(collection.pre_filter_message_count || 0) || 0;
+  const filterNote = collection.filter_active && preFilterCount > actual
+    ? `（筛选前 ${preFilterCount} 条，筛选后 ${actual} 条）`
+    : '';
+  const detail = emptyCollectionDetail(collection);
+  return `所选时间范围内只有 ${actual} 条可总结消息${filterNote}，低于最少 ${minimum} 条。请降低最少消息数、放宽筛选条件、换一个时间范围或选择消息更多的群聊。${detail ? `（${detail}）` : ''}`;
+}
+
 function bodyValueOrSaved(body = {}, key, savedValue = '') {
   return Object.prototype.hasOwnProperty.call(body, key) ? body[key] : savedValue;
 }
@@ -1544,8 +1580,15 @@ async function runDigestSSE(req, res, body) {
     }
 
     if (collection.below_minimum) {
-      sendStage({ name: 'fetching', label: `消息数少于阈值，仍继续总结`, status: 'done' });
-      logWarn('digest_below_minimum', { group_id: groupId, message_count: collection.message_count, min_messages: body.min_messages });
+      const minMessages = Number(body.min_messages || 0) || 0;
+      sendStage({
+        name: 'fetching',
+        label: '消息数少于阈值，已跳过',
+        status: 'error',
+        detail: `${collection.message_count || 0} / ${Math.max(1, minMessages)} 条`,
+      });
+      logWarn('digest_below_minimum', { group_id: groupId, message_count: collection.message_count, min_messages: minMessages, skipped: true });
+      throw Object.assign(new Error(belowMinimumCollectionMessage(collection, minMessages)), { status: 400 });
     }
 
     sendStage({
@@ -1624,12 +1667,22 @@ function handle(req, res) {
 function tryListen(port) {
   return new Promise((resolve, reject) => {
     const server = http.createServer(handle);
+    server.on('connection', socket => {
+      ACTIVE_SOCKETS.add(socket);
+      socket.once('close', () => ACTIVE_SOCKETS.delete(socket));
+    });
     server.once('error', err => {
       if (err.code === 'EADDRINUSE') resolve(null);
       else reject(err);
     });
     server.listen(port, HOST, () => resolve(server));
   });
+}
+
+function candidatePorts(startPort, maxAttempts = 10) {
+  const first = Number.isInteger(startPort) && startPort >= 1024 && startPort <= 65535 ? startPort : DEFAULT_PORT;
+  const last = Math.min(65535, first + Math.max(1, maxAttempts) - 1);
+  return Array.from({ length: last - first + 1 }, (_, index) => first + index);
 }
 
 function argValue(name) {
@@ -1676,15 +1729,18 @@ export async function main() {
 
   let port = Number(argValue('--port') || settings.web.port || DEFAULT_PORT);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) port = DEFAULT_PORT;
+  const ports = candidatePorts(port, 10);
   let server = null;
-  for (let i = 0; i < 10; i++) {
-    server = await tryListen(port);
+  for (const candidate of ports) {
+    server = await tryListen(candidate);
     if (server) break;
-    port += 1;
+    port = candidate + 1;
   }
   if (!server) {
-    logError('startup_failed', { error: 'ports_unavailable', first_port: DEFAULT_PORT, last_port: DEFAULT_PORT + 9 });
-    console.error('[wx-summary] 端口 7788~7797 都被占用，请关闭其他服务后重试');
+    const firstPort = ports[0] || DEFAULT_PORT;
+    const lastPort = ports[ports.length - 1] || firstPort;
+    logError('startup_failed', { error: 'ports_unavailable', first_port: firstPort, last_port: lastPort });
+    console.error(`[wx-summary] 端口 ${firstPort}~${lastPort} 都被占用，请关闭其他服务后重试`);
     process.exit(1);
   }
 

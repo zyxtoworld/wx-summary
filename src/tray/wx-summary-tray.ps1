@@ -9,7 +9,7 @@ $StdoutLog = Join-Path $TmpDir 'tray-node.out.log'
 $StderrLog = Join-Path $TmpDir 'tray-node.err.log'
 $NodeProcess = $null
 $TrayMutex = $null
-$ServerUrl = 'http://127.0.0.1:7788'
+$ServerUrl = ''
 $ExitingByTray = $false
 $OpenedOnReady = $false
 $ReadyTicks = 0
@@ -39,17 +39,22 @@ function Assert-Node20 {
 }
 
 function Read-ServerUrl {
-  if (-not (Test-Path $RuntimeFile)) { return $ServerUrl }
+  if (-not (Test-Path $RuntimeFile)) { return $null }
   try {
     $info = Get-Content -LiteralPath $RuntimeFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($NodeProcess -and $info.pid -and ([int]$info.pid) -ne $NodeProcess.Id) { return $ServerUrl }
+    if (-not (RuntimeInfo-MatchesProject $info)) { return $null }
+    if ($NodeProcess -and $info.pid -and ([int]$info.pid) -ne $NodeProcess.Id) { return $null }
     if ($info.url) { return [string]$info.url }
   } catch {}
-  return $ServerUrl
+  return $null
 }
 
 function Open-Web {
   $script:ServerUrl = Read-ServerUrl
+  if (-not $script:ServerUrl) {
+    Show-StartupError 'wx-summary 服务仍在启动或运行信息不可用，请稍后再试。'
+    return
+  }
   try {
     Start-Process -FilePath 'rundll32.exe' -ArgumentList @('url.dll,FileProtocolHandler', $script:ServerUrl) | Out-Null
   } catch {
@@ -57,10 +62,22 @@ function Open-Web {
   }
 }
 
+function RuntimeInfo-MatchesProject {
+  param($Info)
+  try {
+    if (-not $Info.project_root) { return $false }
+    $runtimeRoot = (Resolve-Path -LiteralPath ([string]$Info.project_root) -ErrorAction Stop).Path
+    return [string]::Equals($runtimeRoot, $ProjectRoot, [System.StringComparison]::OrdinalIgnoreCase)
+  } catch {
+    return $false
+  }
+}
+
 function Try-AttachExistingServer {
   if (-not (Test-Path $RuntimeFile)) { return $null }
   try {
     $info = Get-Content -LiteralPath $RuntimeFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not (RuntimeInfo-MatchesProject $info)) { return $null }
     if (-not $info.pid -or -not $info.url) { return $null }
 
     $existingPid = [int]$info.pid

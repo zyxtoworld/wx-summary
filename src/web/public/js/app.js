@@ -1987,7 +1987,7 @@ function digestClientErrorMessage(value, target = {}, since = '', until = '') {
 }
 
 function isDigestNoMessagesError(value) {
-  return /所选时间范围内(?:没有可总结的消息|读取到 \d+ 条消息，但被.*筛选条件全部过滤掉了)/.test(String(value || ''));
+  return /所选时间范围内(?:没有可总结的消息|读取到 \d+ 条消息，但被.*筛选条件全部过滤掉了|只有 \d+ 条可总结消息.*低于最少 \d+ 条)/.test(String(value || ''));
 }
 
 function digestTargetLastMessageHint(target = {}, since = '', until = '') {
