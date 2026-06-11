@@ -1466,7 +1466,7 @@ async function runDigestSSE(req, res, body) {
       name: 'fetching',
       label: '拉取消息',
       status: 'done',
-      detail: `${collection.message_count} 条${collection.truncated ? ` / 已截取 ${collection.scanned_message_count} 条` : ''} · ${collection.source_label}`,
+      detail: `${collection.message_count} 条${collection.no_matching_filters ? ` / 筛选前 ${collection.pre_filter_message_count || 0} 条` : (collection.truncated ? ` / 已截取 ${collection.scanned_message_count} 条` : '')} · ${collection.source_label}`,
     });
     logInfo('digest_messages_collected', {
       account_id: accountId,
@@ -1477,6 +1477,9 @@ async function runDigestSSE(req, res, body) {
     });
 
     if (!collection.message_count || !Array.isArray(collection.messages) || collection.messages.length === 0) {
+      if (collection.no_matching_filters) {
+        throw Object.assign(new Error(`所选时间范围内读取到 ${collection.pre_filter_message_count || collection.scanned_message_count || 0} 条消息，但被发送人、关键词或类型筛选条件全部过滤掉了。请放宽筛选条件后重试。`), { status: 400 });
+      }
       throw Object.assign(new Error('所选时间范围内没有可总结的消息，请换一个时间范围或群聊。'), { status: 400 });
     }
 

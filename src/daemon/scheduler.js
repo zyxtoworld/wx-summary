@@ -255,6 +255,7 @@ async function runGroupDigest({ settings, account, group, window }) {
     };
   }
   if (!collection.message_count || collection.message_count < Number(minMessages || 0)) {
+    const detail = collection.no_matching_filters ? 'no_matching_filters' : 'below_minimum';
     return {
       account_id: accountIdentity(account),
       account: account.name || accountIdentity(account),
@@ -262,8 +263,9 @@ async function runGroupDigest({ settings, account, group, window }) {
       group: group.name,
       generated: false,
       message_count: collection.message_count || 0,
+      pre_filter_message_count: collection.pre_filter_message_count || 0,
       window_message_count: collection.window_message_count || windowMessageCount,
-      detail: 'below_minimum',
+      detail,
       min_messages: minMessages,
       keyword_override: override?.keywords || [],
     };

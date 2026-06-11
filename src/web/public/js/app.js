@@ -284,10 +284,10 @@ function quickRangeToDates(key) {
   let includeSeconds = true;
   if (key === 'today') since.setHours(0, 0, 0, 0);
   else if (key === 'yesterday') {
-    includeSeconds = false;
     since.setDate(since.getDate() - 1);
     since.setHours(0, 0, 0, 0);
-    now.setHours(0, 0, 0, 0);
+    now.setTime(since.getTime());
+    now.setHours(23, 59, 59, 0);
   } else if (key === 'last4h') since.setHours(now.getHours() - 4);
   else if (key === 'last12h') since.setHours(now.getHours() - 12);
   else if (key === 'last1d') since.setDate(now.getDate() - 1);
@@ -342,10 +342,10 @@ function splitGraphemes(text) {
 }
 
 function parseLocalDateTime(value) {
-  const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/);
+  const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
   if (!match) return null;
-  const [, y, mo, d, h, mi] = match.map(Number);
-  const date = new Date(y, mo - 1, d, h, mi, 0, 0);
+  const [, y, mo, d, h, mi, s = '0'] = match;
+  const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
@@ -470,11 +470,15 @@ function ensureCustomRangeDefaults() {
 }
 
 function normalizeCustomRangeMinutes() {
-  for (const key of ['customSince', 'customUntil']) {
-    const parsed = parseLocalDateTime(_state_digest[key]);
-    if (!parsed) continue;
-    parsed.setMinutes(Math.floor(parsed.getMinutes() / 5) * 5, 0, 0);
-    _state_digest[key] = fmtDateTime(parsed);
+  const since = parseLocalDateTime(_state_digest.customSince);
+  if (since) {
+    since.setMinutes(Math.floor(since.getMinutes() / 5) * 5, 0, 0);
+    _state_digest.customSince = fmtDateTime(since);
+  }
+  const until = parseLocalDateTime(_state_digest.customUntil);
+  if (until) {
+    until.setMinutes(Math.floor(until.getMinutes() / 5) * 5, 59, 0);
+    _state_digest.customUntil = fmtDateTime(until, { includeSeconds: true });
   }
 }
 
@@ -582,7 +586,8 @@ function updateCustomRangeDate(dateText) {
   const current = parseLocalDateTime(_state_digest.customRangeSide === 'since' ? _state_digest.customSince : _state_digest.customUntil) || new Date();
   const [y, m, d] = String(dateText).split('-').map(Number);
   const minute = Math.floor(current.getMinutes() / 5) * 5;
-  const next = new Date(y, m - 1, d, current.getHours(), minute, 0, 0);
+  const seconds = _state_digest.customRangeSide === 'until' ? 59 : 0;
+  const next = new Date(y, m - 1, d, current.getHours(), minute, seconds, 0);
   commitCustomRangeSide(next);
 }
 
@@ -594,13 +599,27 @@ function updateCustomRangeTime() {
 }
 
 function commitCustomRangeSide(date) {
-  if (_state_digest.customRangeSide === 'since') _state_digest.customSince = fmtDateTime(date);
-  else _state_digest.customUntil = fmtDateTime(date);
+  if (_state_digest.customRangeSide === 'since') {
+    const start = new Date(date);
+    start.setSeconds(0, 0);
+    _state_digest.customSince = fmtDateTime(start);
+  } else {
+    const end = new Date(date);
+    end.setSeconds(59, 0);
+    _state_digest.customUntil = fmtDateTime(end, { includeSeconds: true });
+  }
   const sinceDate = parseLocalDateTime(_state_digest.customSince);
   const untilDate = parseLocalDateTime(_state_digest.customUntil);
   if (sinceDate && untilDate && sinceDate > untilDate) {
-    if (_state_digest.customRangeSide === 'since') _state_digest.customUntil = fmtDateTime(new Date(sinceDate.getTime() + 60 * 60 * 1000));
-    else _state_digest.customSince = fmtDateTime(new Date(untilDate.getTime() - 60 * 60 * 1000));
+    if (_state_digest.customRangeSide === 'since') {
+      const end = new Date(sinceDate.getTime() + 60 * 60 * 1000);
+      end.setSeconds(59, 0);
+      _state_digest.customUntil = fmtDateTime(end, { includeSeconds: true });
+    } else {
+      const start = new Date(untilDate.getTime() - 60 * 60 * 1000);
+      start.setSeconds(0, 0);
+      _state_digest.customSince = fmtDateTime(start);
+    }
   }
   paintCustomRangeFields();
   paintRangeCalendar();

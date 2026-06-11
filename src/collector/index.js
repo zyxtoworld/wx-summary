@@ -121,7 +121,9 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
     });
     throwIfAborted(signal);
     if (real) {
-      const filtered = applyFilters(real.messages, filters).map(redactMessageSecrets);
+      const rawMessages = Array.isArray(real.messages) ? real.messages : [];
+      const filtered = applyFilters(rawMessages, filters).map(redactMessageSecrets);
+      const filterActive = filtersAreActive(filters);
       throwIfAborted(signal);
       return {
         source: 'wxdb',
@@ -131,8 +133,11 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         until,
         messages: filtered,
         message_count: filtered.length,
+        pre_filter_message_count: rawMessages.length,
         scanned_message_count: real.scanned_message_count,
         truncated: !!real.truncated,
+        filter_active: filterActive,
+        no_matching_filters: filterActive && rawMessages.length > 0 && filtered.length === 0,
         below_minimum: Number(min_messages || 0) > 0 && filtered.length < Number(min_messages || 0),
       };
     }
@@ -157,7 +162,7 @@ function parseMessageDateTime(value, label, { allowNow = false } = {}) {
   if (allowNow && (!text || text === 'now')) return new Date();
   const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
   if (!match) {
-    throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm。`), { status: 400 });
+    throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm 或 YYYY-MM-DD HH:mm:ss。`), { status: 400 });
   }
   const [, y, mo, d, h, mi, s = '0'] = match;
   const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
@@ -171,6 +176,12 @@ function parseMessageDateTime(value, label, { allowNow = false } = {}) {
     throw Object.assign(new Error(`${label}格式无效，请使用真实存在的日期时间。`), { status: 400 });
   }
   return date;
+}
+
+function filtersAreActive(filters = {}) {
+  return normalizeFilterTerms(filters.senders || []).length > 0
+    || normalizeFilterTerms(filters.keywords || []).length > 0
+    || new Set(filters.exclude_types || filters.excludeTypes || []).size > 0;
 }
 
 function redactMessageSecrets(message) {

@@ -985,6 +985,9 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
   const dbFiles = (await listDbFiles(account, 'message'))
     .filter(f => /^message_\d+\.db$/i.test(f.name))
     .sort((a, b) => new Date(b.last_write_time) - new Date(a.last_write_time));
+  if (!dbFiles.length) {
+    throw Object.assign(new Error(`未找到微信消息分片 message_*.db，无法读取该会话消息。账号目录：${path.basename(account.account_root || account.db_storage || '') || '未知'}`), { status: 502 });
+  }
   throwIfAborted(signal);
   const sinceTs = toUnixSeconds(since, 0, '起始时间');
   const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000), '结束时间');
@@ -1072,6 +1075,9 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
     );
     err.status = readableShards === 0 ? 502 : 409;
     throw err;
+  }
+  if (matchingShards === 0) {
+    throw Object.assign(new Error(`未在 ${readableShards} 个可读消息分片中找到该会话消息表 ${tableName}。可能是会话 ID 不匹配、账号选择错误，或该会话尚未在本机同步消息。`), { status: 404 });
   }
 
   out.sort((a, b) => a.timestamp - b.timestamp || a.sort_seq - b.sort_seq || a.local_id - b.local_id || String(a.id || '').localeCompare(String(b.id || '')));
@@ -2111,7 +2117,7 @@ function toUnixSeconds(value, fallback, label = '时间') {
   if (!text || text === 'now') return fallback;
   const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
   if (!match) {
-    throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm。`), { status: 400 });
+    throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm 或 YYYY-MM-DD HH:mm:ss。`), { status: 400 });
   }
   const [, y, mo, d, h, mi, s = '0'] = match;
   const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
