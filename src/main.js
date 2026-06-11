@@ -1013,6 +1013,27 @@ function publicWeixinStatus(status = {}) {
   };
 }
 
+function publicOutputItem(item = {}) {
+  const out = {};
+  for (const key of [
+    'digest_id',
+    'group',
+    'since',
+    'until',
+    'relative_path',
+    'digest_relative_path',
+    'model',
+    'message_count',
+    'created_at',
+    'rerendered_at',
+    'file_exists',
+    'digest_exists',
+  ]) {
+    if (Object.hasOwn(item, key)) out[key] = item[key];
+  }
+  return out;
+}
+
 function settingsPatchNeedsSchedulerRestart(patch = {}) {
   if (patch?.scheduler) return true;
   if (!patch?.groups || typeof patch.groups !== 'object') return false;
@@ -1286,7 +1307,7 @@ async function handleApi(req, res, parsedUrl) {
       const item = await saveRenderedPng({ settings, digest: body.digest, png_data_url: body.png_data_url, signal: controller.signal });
       logInfo('digest_render_saved', { digest_id: item.digest_id, group: item.group, relative_path: item.relative_path });
       completed = true;
-      return sendJson(res, 200, { ok: true, item });
+      return sendJson(res, 200, { ok: true, item: publicOutputItem(item) });
     } finally {
       req.off('aborted', abortForClientClose);
       res.off('close', abortForClientClose);
@@ -1299,12 +1320,12 @@ async function handleApi(req, res, parsedUrl) {
     const markdown = redactContent(body.markdown || '', settings.privacy || {});
     const item = await savePreviewMarkdown({ settings, title: body.title || '文本预览', markdown });
     logInfo('preview_markdown_exported', { relative_path: item.relative_path });
-    return sendJson(res, 200, { ok: true, item });
+    return sendJson(res, 200, { ok: true, item: publicOutputItem(item) });
   }
 
   if (pathname === '/api/history' && req.method === 'GET') {
     const settings = await loadSettings();
-    return sendJson(res, 200, await listHistory(settings));
+    return sendJson(res, 200, (await listHistory(settings)).map(publicOutputItem));
   }
 
   if (pathname.startsWith('/api/digest-file/') && req.method === 'GET') {
@@ -1367,7 +1388,7 @@ async function handleApi(req, res, parsedUrl) {
     const digestForSave = { ...digest, __render: persistedRenderOptions(renderOptions) };
     const pngDataUrl = await renderDigestPngDataUrl(digestForSave, renderOptions);
     const next = await overwriteRenderedPng({ settings, item, digest: digestForSave, png_data_url: pngDataUrl });
-    return sendJson(res, 200, { ok: true, item: next });
+    return sendJson(res, 200, { ok: true, item: publicOutputItem(next) });
   }
 
   if (pathname === '/api/reveal' && req.method === 'POST') {

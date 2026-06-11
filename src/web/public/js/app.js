@@ -2144,7 +2144,6 @@ async function generateDigest({ previewText = false } = {}) {
               _state_digest.lastDigest = digest;
               _state_digest.lastSavedItem = saved.item;
               _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
-              digest.file_path = saved.item.file_path;
               digests[i] = digest;
               updatePreviewSavedRenderState();
               updateDigestPreviewActionLock();
@@ -3359,7 +3358,7 @@ function historySearchText(item = {}) {
 }
 
 function historyItemCacheBust(item = {}) {
-  return item.rerendered_at || item.created_at || item.file_path || item.digest_id || '';
+  return item.rerendered_at || item.created_at || item.relative_path || item.digest_id || '';
 }
 
 function historyDownloadFilename(item = {}) {
