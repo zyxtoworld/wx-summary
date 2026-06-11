@@ -11,8 +11,82 @@ export function historyIndexPath(settings) {
 }
 
 async function readHistoryIndex(settings) {
-  const list = await readJson(historyIndexPath(settings), []);
-  return Array.isArray(list) ? list : [];
+  const file = historyIndexPath(settings);
+  try {
+    const raw = await fsp.readFile(file, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw Object.assign(new Error('history index is not an array'), { code: 'HISTORY_INDEX_INVALID' });
+    }
+    return parsed;
+  } catch (e) {
+    if (e?.code === 'ENOENT') return [];
+    return recoverHistoryIndex(settings, file, e);
+  }
+}
+
+async function recoverHistoryIndex(settings, file, cause) {
+  const base = outputDirFromSettings(settings);
+  const backup = file.replace(/\.json$/i, `.invalid.${timestampForFilename(new Date())}.json`);
+  await ensureDir(path.dirname(file));
+  await fsp.rename(file, backup).catch(e => {
+    if (e?.code !== 'ENOENT') throw e;
+  });
+  const rebuilt = await rebuildHistoryIndexFromDigests(base);
+  if (!rebuilt.length && cause) {
+    const err = new Error(`历史索引损坏，已备份为 ${toProjectRelative(backup)}，但未找到可重建的摘要文件。`);
+    err.status = 500;
+    err.cause = cause;
+    throw err;
+  }
+  await writeJsonAtomic(file, rebuilt);
+  return rebuilt;
+}
+
+async function rebuildHistoryIndexFromDigests(base) {
+  const digestFiles = [];
+  await collectDigestJsonFiles(base, digestFiles);
+  const items = [];
+  for (const digestPath of digestFiles) {
+    const digest = await readJson(digestPath, null, { strict: false });
+    if (!digest || typeof digest !== 'object' || Array.isArray(digest)) continue;
+    const filePath = digestPath.replace(/\.digest\.json$/i, '.png');
+    const stat = await fsp.stat(filePath).catch(() => null);
+    if (!stat?.isFile?.()) continue;
+    const digestId = String(digest.digest_id || '').trim();
+    if (!digestId) continue;
+    items.push({
+      digest_id: digestId,
+      group: String(digest.group || '摘要'),
+      since: String(digest.since || ''),
+      until: String(digest.until || ''),
+      file_path: filePath,
+      relative_path: toProjectRelative(filePath),
+      digest_path: digestPath,
+      digest_relative_path: toProjectRelative(digestPath),
+      model: String(digest.model || ''),
+      message_count: Number(digest.message_count || 0),
+      created_at: String(digest.created_at || stat.mtime.toISOString()),
+    });
+  }
+  return items
+    .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
+    .slice(0, 200);
+}
+
+async function collectDigestJsonFiles(dir, out) {
+  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(e => {
+    if (e?.code === 'ENOENT') return [];
+    throw e;
+  });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await collectDigestJsonFiles(full, out);
+    } else if (entry.isFile() && /\.digest\.json$/i.test(entry.name)) {
+      out.push(full);
+    }
+  }
 }
 
 export async function saveRenderedPng({ settings, digest, png_data_url, signal = null }) {
@@ -77,7 +151,7 @@ export async function cleanupOldDigests(settings) {
 
   const base = outputDirFromSettings(settings);
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-  const list = await readJson(historyIndexPath(settings), []);
+  const list = await readHistoryIndex(settings);
   const kept = [];
   let removed = 0;
 
