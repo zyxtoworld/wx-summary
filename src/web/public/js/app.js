@@ -670,6 +670,7 @@ function outputDirLooksInsideProject(dir, projectRoot) {
   }
   const root = normalizePathForUi(projectRoot).toLowerCase();
   const full = normalizePathForUi(raw).toLowerCase();
+  if (!root) return true;
   const outputs = root ? `${root}/outputs` : '';
   const tmp = root ? `${root}/outputs/.tmp` : '';
   return !!root && full.startsWith(`${outputs}/`) && full !== outputs && full !== tmp && !full.startsWith(`${tmp}/`);
@@ -3918,8 +3919,8 @@ async function renderSettings() {
   const s = await api('/api/settings');
   if (settingsRouteSeq !== _routeSeq) return;
   let settingsAccountId = selectedAccountId();
-  const statePromise = api('/api/state').catch(() => ({ platform: '', project_root: '' }));
-  let settingsState = _appState || { platform: '', project_root: '' };
+  const statePromise = api('/api/state').catch(() => ({ platform: '', project_label: '' }));
+  let settingsState = _appState || { platform: '', project_label: '' };
 
   // AI
   let availableModels = Array.isArray(s.llm.available_models) ? s.llm.available_models : [];
@@ -4459,8 +4460,11 @@ async function renderSettings() {
   }
   function schedulerResultDetailLabel(result = {}) {
     const label = schedulerDetailLabel(result.detail);
-    if (result.detail === 'ambiguous_group_refs' && Array.isArray(result.ambiguous_refs) && result.ambiguous_refs.length) {
-      return `${label}（${result.ambiguous_refs.length} 条未执行）`;
+    const ambiguousCount = Array.isArray(result.ambiguous_refs)
+      ? result.ambiguous_refs.length
+      : Number(result.ambiguous_ref_count || 0);
+    if (result.detail === 'ambiguous_group_refs' && ambiguousCount > 0) {
+      return `${label}（${ambiguousCount} 条未执行）`;
     }
     return label;
   }
@@ -4657,7 +4661,7 @@ async function renderSettings() {
     const platformEl = document.getElementById('s-platform');
     const rootEl = document.getElementById('s-projroot');
     if (platformEl) platformEl.textContent = settingsState.platform || '';
-    if (rootEl) rootEl.textContent = settingsState.project_root || '';
+    if (rootEl) rootEl.textContent = settingsState.project_label || '本地项目';
   }
   statePromise.then(state => {
     if (settingsRouteSeq !== _routeSeq) return;
@@ -4674,7 +4678,7 @@ async function renderSettings() {
   openOutdirButton.addEventListener('click', () => withBusyButtons(renderOutputButtons, async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
-    if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
+    if (!outputDirLooksInsideProject(outDir)) {
       $st.className = 'status err';
       $st.textContent = '✗ 输出目录必须在 outputs/ 下，且不能位于 outputs/.tmp';
       return;
@@ -4693,7 +4697,7 @@ async function renderSettings() {
   saveRenderButton.addEventListener('click', () => withBusyButtons(renderOutputButtons, async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
-    if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
+    if (!outputDirLooksInsideProject(outDir)) {
       $st.className = 'status err';
       $st.textContent = '✗ 输出目录必须在 outputs/ 下，且不能位于 outputs/.tmp';
       return;

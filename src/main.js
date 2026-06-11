@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import { clearDbKeyRuntimeCache, collectMessages, detectWeixin, listAccounts, listGroups } from './collector/index.js';
 import { clearTmpDir, ensureRuntimeDirs, loadSettings, normalizeBaseUrl, publicSettings, saveSettingsPatch } from './config/settings.js';
 import { getSchedulerStatus, restartScheduler, runSchedulerOnce, startScheduler, stopScheduler } from './daemon/scheduler.js';
-import { DATA_DIR, DEFAULT_DIGESTS_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, isInside, outputDirFromSettings, resolveInsideTmp } from './lib/paths.js';
+import { DATA_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, isInside, outputDirFromSettings, resolveInsideTmp } from './lib/paths.js';
 import { configureLogger, logError, logInfo, logWarn, readLogTail } from './lib/logger.js';
 import { listModels, redactContent, sanitizeText, summarizeDigest, testLlmConnectivity } from './summarizer/llm.js';
 import { assertRevealable, cleanupOldDigests, findHistoryItem, listHistory, overwriteRenderedPng, readHistoryDigest, savePreviewMarkdown, saveRenderedPng } from './renderer/output.js';
@@ -25,6 +25,7 @@ const SESSION_TOKEN = crypto.randomBytes(16).toString('hex');
 const SHUTDOWN_TOKEN = crypto.randomBytes(16).toString('hex');
 const HEALTH_TOKEN = crypto.randomBytes(16).toString('hex');
 const INSTANCE_LOCK_TOKEN = crypto.randomBytes(16).toString('hex');
+const PROJECT_ID = crypto.createHash('sha256').update(PROJECT_ROOT).digest('hex').slice(0, 16);
 const RUNTIME_INFO_FILE = path.join(TMP_DIR, 'server.json');
 const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'wx-summary.lock');
 const EXTERNAL_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'external-weixin-binary-baseline.json');
@@ -137,6 +138,11 @@ function sameProjectRoot(rootText) {
     : resolved === PROJECT_ROOT;
 }
 
+function sameProjectHealth(health = {}) {
+  if (health?.project_id) return String(health.project_id) === PROJECT_ID;
+  return sameProjectRoot(health?.project_root);
+}
+
 function releaseInstanceLockSync() {
   const fd = INSTANCE_LOCK_FD;
   const lockInfo = readInstanceLockInfoSync();
@@ -209,7 +215,7 @@ async function existingRuntimeAlive(info) {
         try {
           const health = JSON.parse(body);
           const samePid = Number(health?.pid || 0) === Number(info.pid || 0);
-          resolve(!!health?.ok && samePid && sameProjectRoot(health.project_root));
+          resolve(!!health?.ok && samePid && sameProjectHealth(health));
         } catch {
           resolve(false);
         }
@@ -1043,6 +1049,56 @@ function publicWeixinStatus(status = {}) {
   };
 }
 
+function publicSchedulerDetail(detail = '') {
+  const value = String(detail || '').trim();
+  return /^[a-z0-9_:-]{1,80}$/i.test(value) ? value : '';
+}
+
+function publicSchedulerResult(result = null) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const ambiguousCount = Array.isArray(result.ambiguous_refs)
+    ? result.ambiguous_refs.length
+    : Math.max(0, Number(result.ambiguous_ref_count || 0) || 0);
+  return {
+    ok: result.ok !== false,
+    reason: publicSchedulerDetail(result.reason),
+    at: String(result.at || ''),
+    since: String(result.since || ''),
+    until: String(result.until || ''),
+    accounts: Math.max(0, Number(result.accounts || 0) || 0),
+    checked: Math.max(0, Number(result.checked || 0) || 0),
+    generated: Math.max(0, Number(result.generated || 0) || 0),
+    skipped: Math.max(0, Number(result.skipped || 0) || 0),
+    failed: Math.max(0, Number(result.failed || 0) || 0),
+    detail: publicSchedulerDetail(result.detail),
+    ambiguous_ref_count: ambiguousCount,
+    error: result.error ? '检查失败' : '',
+    items: Array.isArray(result.items)
+      ? result.items.map(item => ({
+          generated: !!item?.generated,
+          detail: item?.error ? 'error' : publicSchedulerDetail(item?.detail),
+          error: !!item?.error,
+          message_count: Math.max(0, Number(item?.message_count || 0) || 0),
+          attempts: Math.max(0, Number(item?.attempts || 0) || 0),
+        }))
+      : [],
+  };
+}
+
+function publicSchedulerStatus(status = getSchedulerStatus()) {
+  return {
+    enabled: !!status.enabled,
+    running: !!status.running,
+    timer_active: !!status.timer_active,
+    interval_ms: Math.max(0, Number(status.interval_ms || 0) || 0),
+    next_run_at: String(status.next_run_at || ''),
+    last_started_at: String(status.last_started_at || ''),
+    last_finished_at: String(status.last_finished_at || ''),
+    last_error: status.last_error ? '检查失败' : '',
+    last_result: publicSchedulerResult(status.last_result),
+  };
+}
+
 function publicOutputItem(item = {}) {
   const out = {};
   for (const key of [
@@ -1107,7 +1163,7 @@ async function handleApi(req, res, parsedUrl) {
       ok: true,
       pid: process.pid,
       port: ACTIVE_PORT,
-      project_root: PROJECT_ROOT,
+      project_id: PROJECT_ID,
       started_at: SERVICE_STARTED_AT.toISOString(),
     });
   }
@@ -1135,13 +1191,11 @@ async function handleApi(req, res, parsedUrl) {
       ok: true,
       need_setup: needSetup,
       platform: process.platform,
-      project_root: PROJECT_ROOT,
-      output_dir: outputDirFromSettings(settings),
-      default_output_dir: DEFAULT_DIGESTS_DIR,
-      session_token: SESSION_TOKEN,
+      project_label: '本地项目',
+      output_policy: 'outputs-subdir',
       data_mode: wechat.accounts?.length ? 'wxdb' : 'unavailable',
       wechat: publicWeixinStatus(wechat),
-      scheduler: getSchedulerStatus(),
+      scheduler: publicSchedulerStatus(),
       secrets_invalid: settings._secrets_invalid,
       secrets_invalid_info: settings._secrets_invalid_info || null,
       settings_invalid: settings._settings_invalid || null,
@@ -1179,12 +1233,12 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/scheduler/status' && req.method === 'GET') {
-    return sendJson(res, 200, { ok: true, scheduler: getSchedulerStatus() });
+    return sendJson(res, 200, { ok: true, scheduler: publicSchedulerStatus() });
   }
 
   if (pathname === '/api/scheduler/run-once' && req.method === 'POST') {
     const result = await runSchedulerOnce({ reason: 'manual_api', force: true });
-    return sendJson(res, 200, { ok: true, result, scheduler: getSchedulerStatus() });
+    return sendJson(res, 200, { ok: true, result: publicSchedulerResult(result), scheduler: publicSchedulerStatus() });
   }
 
   if (pathname === '/api/list-models' && req.method === 'POST') {
@@ -1300,7 +1354,7 @@ async function handleApi(req, res, parsedUrl) {
 
   if (pathname === '/api/wechat/db-inventory' && req.method === 'GET') {
     const account = parsedUrl.searchParams.get('account') || '';
-    return sendJson(res, 200, { ok: true, ...(await readDbInventory(account)) });
+    return sendJson(res, 200, sanitizeDiagnosticsPayload({ ok: true, ...(await readDbInventory(account)) }));
   }
 
   if (pathname === '/api/digest-cancel' && req.method === 'POST') {
@@ -2071,7 +2125,7 @@ export async function main() {
   WEIXIN_BINARY_EXTERNAL_BASELINE = await readExternalWeixinBaseline();
   WEIXIN_BINARY_PRELAUNCH_BASELINE = await readPrelaunchWeixinBaseline();
   WEIXIN_BINARY_LAUNCHER_BASELINE = await readLauncherWeixinBaseline();
-  logInfo('startup_begin', { pid: process.pid, project_root: PROJECT_ROOT, no_open: !shouldOpenBrowser(settings), open_browser: settings.web?.open_browser !== false });
+  logInfo('startup_begin', { pid: process.pid, project_id: PROJECT_ID, no_open: !shouldOpenBrowser(settings), open_browser: settings.web?.open_browser !== false });
   if (WEIXIN_BINARY_EXTERNAL_BASELINE) {
     logInfo('external_weixin_binary_baseline', {
       ok: !!WEIXIN_BINARY_EXTERNAL_BASELINE.ok,
@@ -2125,13 +2179,13 @@ export async function main() {
 
   const wx = await detectWeixin();
   await startScheduler().catch(() => {});
-  logInfo('server_listening', { url: `http://${HOST}:${port}`, wechat_running: !!wx.running, wechat_message: wx.message, scheduler: getSchedulerStatus() });
+  logInfo('server_listening', { url: `http://${HOST}:${port}`, wechat_running: !!wx.running, wechat_message: wx.message, scheduler: publicSchedulerStatus() });
   console.log([
     '',
     'wx-summary v0.1.0',
     `✓ 服务：http://${HOST}:${port}`,
     `${wx.running ? '✓' : '!'} 微信：${wx.message}`,
-    `✓ 项目根：${PROJECT_ROOT}`,
+    '✓ 项目：本地项目',
     '按 Ctrl+C 停止',
     '',
   ].join('\n'));

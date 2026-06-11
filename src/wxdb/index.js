@@ -1609,8 +1609,6 @@ function redactAccount(account) {
     id: account.id,
     wxid: account.wxid,
     display_name: account.display_name,
-    account_root: account.account_root,
-    db_storage: account.db_storage,
     last_write_time: account.last_write_time,
     summary: account.summary,
   };
