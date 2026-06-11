@@ -64,7 +64,7 @@ function Read-ServerUrl {
 function Open-Web {
   $script:ServerUrl = Read-ServerUrl
   if (-not $script:ServerUrl) {
-    Show-StartupError 'wx-summary 服务仍在启动或运行信息不可用，请稍后再试。'
+    Show-StartupError (Utf8Label 'd3gtc3VtbWFyeSDmnI3liqHku43lnKjlkK/liqjmiJbov5DooYzkv6Hmga/kuI3lj6/nlKjvvIzor7fnqI3lkI7lho3or5XjgII=')
     return
   }
   try {

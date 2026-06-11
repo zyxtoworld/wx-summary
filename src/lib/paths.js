@@ -1,5 +1,6 @@
 import path from 'node:path';
 import url from 'node:url';
+import fsp from 'node:fs/promises';
 
 export const SRC_DIR = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..');
 export const PROJECT_ROOT = path.resolve(SRC_DIR, '..');
@@ -58,6 +59,29 @@ export function outputDirFromSettings(settings) {
     throw err;
   }
   return resolved;
+}
+
+export async function assertRealOutputDir(base, { ensure = false } = {}) {
+  const resolved = path.resolve(base || DEFAULT_DIGESTS_DIR);
+  if (ensure) await fsp.mkdir(resolved, { recursive: true });
+  const [realProject, realOutputs, realTmp, realBase] = await Promise.all([
+    fsp.realpath(PROJECT_ROOT).catch(() => ''),
+    fsp.realpath(OUTPUTS_DIR).catch(() => ''),
+    fsp.realpath(TMP_DIR).catch(() => ''),
+    fsp.realpath(resolved).catch(() => ''),
+  ]);
+  if (!realProject || !realOutputs || !realBase || !isInside(realProject, realOutputs) || !isInside(realOutputs, realBase) || path.resolve(realOutputs) === path.resolve(realBase)) {
+    throw realOutputPathError('output dir outside outputs/');
+  }
+  if (realTmp && isInside(realTmp, realBase)) throw realOutputPathError('output dir inside outputs/.tmp');
+  return { realOutputs, realTmp, realBase };
+}
+
+function realOutputPathError(message) {
+  const err = new Error(message);
+  err.status = 403;
+  err.code = 'UNSAFE_OUTPUT_PATH';
+  return err;
 }
 
 export function toProjectRelative(absPath) {

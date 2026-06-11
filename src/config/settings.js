@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { DATA_DIR, DEFAULT_DIGESTS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TMP_DIR, isInside, outputDirFromSettings, resolveInsideTmp } from '../lib/paths.js';
+import { DATA_DIR, DEFAULT_DIGESTS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TMP_DIR, assertRealOutputDir, isInside, outputDirFromSettings, resolveInsideTmp } from '../lib/paths.js';
 import { cloneJson, deepMerge, ensureDir, writeJsonAtomic } from '../lib/json-store.js';
 import { protectText, unprotectToText } from './dpapi.js';
 
@@ -668,6 +668,7 @@ async function saveSettingsPatchUnlocked(patch, { settingsFile = SETTINGS_FILE, 
   }
 
   await ensureRuntimeDirs(merged);
+  await assertRealOutputDir(outputDirFromSettings(merged));
   let stagedSecrets = '';
   let settingsWritten = false;
   try {

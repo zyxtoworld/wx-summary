@@ -4,7 +4,7 @@
 const TOKEN = window.__WX_TOKEN__;
 const $app = document.getElementById('app');
 const MAX_SCHEDULER_INTERVAL_MS = 24 * 24 * 60 * 60 * 1000;
-const DIGEST_PROGRESS_STEP_VISIBLE_MS = 180;
+const DIGEST_PROGRESS_STEP_VISIBLE_MS = 320;
 let _appState = null;
 let _appAccounts = [];
 let _keyboardShortcutsAttached = false;
@@ -1964,6 +1964,28 @@ async function generateDigest({ previewText = false } = {}) {
   const stagesOrder = previewText
     ? ['fetching', 'summarizing', 'received', 'text_inspect', 'text_merge', 'text_refresh']
     : ['fetching', 'summarizing', 'received', 'digest_inspect', 'render_queue', 'render_setup', 'render_measure', 'render_draw', 'encoding', 'saving'];
+  const stagePlanLabels = previewText ? {
+    fetching: '拉取消息',
+    summarizing: 'AI 总结',
+    received: '接收摘要结果',
+    text_inspect: '整理摘要结构',
+    text_merge: '合并 Markdown',
+    text_refresh: '刷新文本预览',
+  } : {
+    fetching: '拉取消息',
+    summarizing: 'AI 总结',
+    received: '接收摘要结果',
+    digest_inspect: '检查摘要结构',
+    render_queue: '等待本地渲染队列',
+    render_setup: '准备渲染环境',
+    render_measure: '测量长图布局',
+    render_draw: '绘制 Canvas',
+    encoding: '编码 PNG',
+    saving: '保存 PNG 文件',
+  };
+  const pipelineDetail = previewText
+    ? '文本流程：拉取消息 -> AI 总结 -> 整理结构 -> 合并 Markdown -> 刷新预览'
+    : '长图流程：拉取消息 -> AI 总结 -> 测量布局 -> 绘制 Canvas -> 编码 PNG -> 保存历史';
   function stripElapsedDetail(detail = '') {
     return stripDigestElapsedDetail(detail);
   }
@@ -2091,18 +2113,27 @@ async function generateDigest({ previewText = false } = {}) {
       label: `[${index + 1}/${targets.length}] ${targets[index].name} · ${stage.label}`,
     };
   }
+  function seedGroupPlannedStages(index) {
+    stagesOrder.forEach(stageName => {
+      upsertStage(groupStage(index, {
+        name: stageName,
+        label: stagePlanLabels[stageName] || stageName,
+        status: 'pending',
+      }));
+    });
+  }
   function serverStageSubstepName(stage = {}) {
     const phase = String(stage.phase || '').replace(/[^\w-]/g, '_').slice(0, 48);
     return phase ? `${stage.name}:${phase}` : stage.name;
   }
   function serverStageForClient(stage = {}) {
-    if (stage.name !== 'rendering') return stage;
+    if (stage.name !== 'rendering' && stage.name !== 'handoff') return stage;
     return {
       name: 'received',
       label: '接收摘要结果',
       status: stage.status,
       detail: stage.status === 'done'
-        ? (previewText ? '准备整理文本预览' : '准备绘制长图')
+        ? (previewText ? '摘要已到达浏览器，开始整理文本预览' : '摘要已到达浏览器，开始本地生图')
         : (stage.detail || '等待摘要数据到达浏览器'),
     };
   }
@@ -2154,11 +2185,12 @@ async function generateDigest({ previewText = false } = {}) {
       stageName: 'batch',
       label: `并行准备 ${targets.length} 个群`,
       status: 'running',
-      detail: `准备并发 ${prepareConcurrency} 路；AI 队列按服务端限流`,
+      detail: `准备并发 ${prepareConcurrency} 路；AI 队列按服务端限流；${pipelineDetail}`,
     });
 
     await runClientPool(targets, prepareConcurrency, async (target, i) => {
       if (controller.signal.aborted) return;
+      seedGroupPlannedStages(i);
       upsertStage(groupStage(i, {
         name: 'fetching',
         label: '等待服务端采集进度',
@@ -4738,7 +4770,7 @@ async function renderSettings() {
       : existingWhitelist;
     const perGroup = [...preservedSchedulerOverrides, ...schedulerOverrides].map(overridePayload);
     return {
-      groups: { whitelist: mergeGroupRefs([...wl, ...perGroup.map(overrideGroupRef)]) },
+      groups: { whitelist: wl },
       scheduler: {
         enabled: document.getElementById('s-scheduler').checked,
         default_interval: getDurationControlValue('s-scheduler-interval', '30m', { maxMs: MAX_SCHEDULER_INTERVAL_MS }),

@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import { clearDbKeyRuntimeCache, collectMessages, detectWeixin, listAccounts, listGroups } from './collector/index.js';
 import { clearTmpDir, ensureRuntimeDirs, loadSettings, normalizeBaseUrl, publicSettings, saveSettingsPatch } from './config/settings.js';
 import { getSchedulerStatus, restartScheduler, runSchedulerOnce, startScheduler, stopScheduler } from './daemon/scheduler.js';
-import { DATA_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, isInside, outputDirFromSettings, resolveInsideTmp } from './lib/paths.js';
+import { DATA_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, assertRealOutputDir, isInside, outputDirFromSettings, resolveInsideTmp } from './lib/paths.js';
 import { configureLogger, logError, logInfo, logWarn, readLogTail } from './lib/logger.js';
 import { listModels, redactContent, sanitizeText, summarizeDigest, testLlmConnectivity } from './summarizer/llm.js';
 import { assertRevealable, cleanupOldDigests, findHistoryItem, listHistory, overwriteRenderedPng, readHistoryDigest, savePreviewMarkdown, saveRenderedPng } from './renderer/output.js';
@@ -1071,6 +1071,16 @@ function publicAccount(account = {}) {
   };
 }
 
+function publicGroup(group = {}) {
+  return {
+    id: String(group.id || group.group_id || '').trim(),
+    name: String(group.name || group.group_name || group.id || '').trim(),
+    last_msg_at: Math.max(0, Number(group.last_msg_at || 0) || 0),
+    pinyin: String(group.pinyin || '').trim(),
+    pinyin_initial: String(group.pinyin_initial || '').trim(),
+  };
+}
+
 function publicWeixinStatus(status = {}) {
   const accounts = Array.isArray(status.accounts) ? status.accounts.map(account => publicAccount({
     id: account.id,
@@ -1255,7 +1265,8 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/groups' && req.method === 'GET') {
-    return sendJson(res, 200, await listGroups({ account_id: await accountIdForGroupsRequest(parsedUrl) }));
+    const groups = await listGroups({ account_id: await accountIdForGroupsRequest(parsedUrl) });
+    return sendJson(res, 200, groups.map(publicGroup).filter(group => group.id || group.name));
   }
 
   if (pathname === '/api/settings' && req.method === 'GET') {
@@ -1468,7 +1479,6 @@ async function handleApi(req, res, parsedUrl) {
           signal: controller.signal,
           shouldAbort: () => !!cancelledDigestBatch(saveBatchId),
         });
-        throwIfDigestBatchCancelled(saveBatchId, '生成已取消，已阻止保存长图。');
         logInfo('digest_render_saved', { digest_id: item.digest_id, group: item.group, relative_path: item.relative_path });
         completed = true;
         return sendJson(res, 200, { ok: true, item: publicOutputItem(item) });
@@ -1625,7 +1635,7 @@ async function handleApi(req, res, parsedUrl) {
       ...settings,
       output: { ...settings.output, dir: requestedDir || settings.output?.dir },
     });
-    await fsp.mkdir(dir, { recursive: true });
+    await assertRealOutputDir(dir, { ensure: true });
     const opener = await openDirectoryInSystem(dir);
     return sendJson(res, 200, { ok: true, opener });
   }
@@ -2102,13 +2112,18 @@ async function runDigestSSE(req, res, body, requestId = null) {
     logInfo('digest_summarized', { group_id: groupId, digest_id: digest.digest_id, model: digest.model, topics: digest.topics?.length || 0, links: digest.links?.length || 0 });
 
     sendStage({
-      name: 'rendering',
-      label: body.preview_text ? '生成文本预览' : '渲染长图',
+      name: 'handoff',
+      label: '发送摘要到浏览器',
       status: 'running',
-      detail: body.preview_text ? '摘要已完成，发送到浏览器整理 Markdown' : '摘要已完成，发送到浏览器绘制 Canvas',
+      detail: body.preview_text ? '摘要已完成，等待浏览器整理 Markdown' : '摘要已完成，等待浏览器绘制并保存长图',
     });
     sendEvent('digest', { ...digest, preview_text: !!body.preview_text });
-    sendStage({ name: 'rendering', label: body.preview_text ? '生成文本预览' : '渲染长图', status: 'done' });
+    sendStage({
+      name: 'handoff',
+      label: '发送摘要到浏览器',
+      status: 'done',
+      detail: body.preview_text ? '浏览器已收到摘要，开始整理文本' : '浏览器已收到摘要，开始本地生图',
+    });
     sendEvent('done', { digest_id: digest.digest_id, preview_text: !!body.preview_text });
     logInfo('digest_done', { group_id: groupId, digest_id: digest.digest_id, preview_text: !!body.preview_text });
   } catch (e) {

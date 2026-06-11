@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { outputDirFromSettings, PROJECT_ROOT, OUTPUTS_DIR, TMP_DIR, toProjectRelative, isInside } from '../lib/paths.js';
+import { assertRealOutputDir, outputDirFromSettings, TMP_DIR, toProjectRelative, isInside } from '../lib/paths.js';
 import { ensureDir, readJson, writeJsonAtomic } from '../lib/json-store.js';
 
 let historyWriteQueue = Promise.resolve();
@@ -13,28 +13,14 @@ export function historyIndexPath(settings) {
 async function safeOutputBase(settings, { ensure = true } = {}) {
   const base = outputDirFromSettings(settings);
   if (ensure) await ensureDir(base);
-  await assertRealOutputBase(base);
+  await assertRealOutputDir(base);
   return base;
-}
-
-async function assertRealOutputBase(base) {
-  const [realProject, realOutputs, realTmp, realBase] = await Promise.all([
-    fsp.realpath(PROJECT_ROOT).catch(() => ''),
-    fsp.realpath(OUTPUTS_DIR).catch(() => ''),
-    fsp.realpath(TMP_DIR).catch(() => ''),
-    fsp.realpath(base).catch(() => ''),
-  ]);
-  if (!realProject || !realOutputs || !realBase || !isInside(realProject, realOutputs) || !isInside(realOutputs, realBase) || path.resolve(realOutputs) === path.resolve(realBase)) {
-    throw outputPathError('output dir outside outputs/');
-  }
-  if (realTmp && isInside(realTmp, realBase)) throw outputPathError('output dir inside outputs/.tmp');
-  return { realOutputs, realTmp, realBase };
 }
 
 async function assertSafeOutputParent(base, targetPath) {
   const parent = path.dirname(path.resolve(targetPath || ''));
   await ensureDir(parent);
-  const { realTmp, realBase } = await assertRealOutputBase(base);
+  const { realTmp, realBase } = await assertRealOutputDir(base);
   const realParent = await fsp.realpath(parent).catch(() => '');
   if (!realParent || !isInside(realBase, realParent)) throw outputPathError('target parent outside output dir');
   if (realTmp && isInside(realTmp, realParent)) throw outputPathError('target parent inside outputs/.tmp');
@@ -59,7 +45,14 @@ async function readHistoryIndex(settings) {
     }
     return parsed;
   } catch (e) {
-    if (e?.code === 'ENOENT') return [];
+    if (e?.code === 'ENOENT') {
+      const rebuilt = await rebuildHistoryIndexFromDigests(base);
+      if (rebuilt.length) {
+        await assertSafeOutputParent(base, file);
+        await writeJsonAtomic(file, rebuilt);
+      }
+      return rebuilt;
+    }
     return recoverHistoryIndex(settings, file, e);
   }
 }
@@ -90,8 +83,7 @@ async function rebuildHistoryIndexFromDigests(base) {
     const digest = await readJson(digestPath, null, { strict: false });
     if (!digest || typeof digest !== 'object' || Array.isArray(digest)) continue;
     const filePath = digestPath.replace(/\.digest\.json$/i, '.png');
-    const stat = await fsp.stat(filePath).catch(() => null);
-    if (!stat?.isFile?.()) continue;
+    const stat = await fsp.stat(digestPath).catch(() => null);
     const digestId = String(digest.digest_id || '').trim();
     if (!digestId) continue;
     items.push({
@@ -105,7 +97,7 @@ async function rebuildHistoryIndexFromDigests(base) {
       digest_relative_path: toProjectRelative(digestPath),
       model: String(digest.model || ''),
       message_count: Number(digest.message_count || 0),
-      created_at: String(digest.created_at || stat.mtime.toISOString()),
+      created_at: String(digest.created_at || stat?.mtime?.toISOString?.() || new Date().toISOString()),
     });
   }
   return items
@@ -372,7 +364,7 @@ async function assertReadableOutputFile(base, targetPath, { extensions = [] } = 
     throw err;
   }
   const [{ realTmp, realBase }, realTarget] = await Promise.all([
-    assertRealOutputBase(base),
+    assertRealOutputDir(base),
     fsp.realpath(resolved).catch(() => ''),
   ]);
   if (!realBase || !realTarget || !isInside(realBase, realTarget) || (realTmp && isInside(realTmp, realTarget))) {

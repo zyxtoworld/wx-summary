@@ -196,7 +196,11 @@ async function executeSchedulerTick({ reason, force = false }) {
   }
   for (const { account, groups } of accountEntries) {
     const accountId = accountIdentity(account);
-    const targets = selectScheduledGroups(groups, settings.groups?.whitelist || [], account, { allGroups });
+    const schedulerRefs = [
+      ...(Array.isArray(settings.groups?.whitelist) ? settings.groups.whitelist : []),
+      ...(Array.isArray(settings.scheduler?.per_group) ? settings.scheduler.per_group : []),
+    ];
+    const targets = selectScheduledGroups(groups, schedulerRefs, account, { allGroups });
     for (const group of targets) {
       result.checked++;
       const item = await runGroupDigestWithRetry({ settings, account, group, window, attempts: 2, allGroups });
@@ -605,7 +609,7 @@ function newMessagesForCursorState(messages = [], cursorState = {}) {
 function messagesWithinCursorWindow(messages = [], cursorState = {}) {
   const since = parseCursorWindowTime(cursorState.window_since);
   const until = parseCursorWindowTime(cursorState.window_until);
-  if (!since && !until) return [];
+  if (!since && !until) return Array.isArray(messages) ? messages : [];
   return (Array.isArray(messages) ? messages : []).filter(message => {
     const time = normalizeCursorNumber(message.timestamp);
     if (!time) return false;
@@ -655,9 +659,9 @@ function cursorObjectFromValue(value) {
     return null;
   }
   const out = {};
-  for (const part of text.split(':')) {
-    const [key, ...rest] = part.split('.');
-    const raw = rest.join('.');
+  const partPattern = /(?:^|:)(ts|seq|lid|sid|id)\.([\s\S]*?)(?=:(?:ts|seq|lid|sid|id)\.|$)/g;
+  for (const match of text.matchAll(partPattern)) {
+    const [, key, raw] = match;
     if (!key || !raw) continue;
     if (key === 'ts') out.timestamp = normalizeCursorNumber(raw);
     else if (key === 'seq') out.sort_seq = normalizeCursorNumber(raw);
@@ -681,8 +685,11 @@ function normalizeCursorNumber(value) {
 }
 
 function cursorComponent(value) {
-  const text = String(value || '').trim().slice(0, 120);
-  return text ? encodeURIComponent(text) : '';
+  const text = String(value || '')
+    .trim()
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(0, 120);
+  return text ? encodeURIComponent(text).replace(/%3A/gi, ':') : '';
 }
 
 function decodeCursorComponent(value) {
