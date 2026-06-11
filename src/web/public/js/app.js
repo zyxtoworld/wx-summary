@@ -4082,14 +4082,17 @@ async function renderSettings() {
   let groups = [];
   let groupsLoaded = false;
   let groupsLoadError = null;
-  let schedulerOverrides = Array.isArray(s.scheduler.per_group) ? s.scheduler.per_group.map(item => ({
-    account_id: item.account_id || '',
-    group_id: item.group_id || '',
-    group_name: item.group_name || item.name || '',
-    group: item.group || item.group_name || item.group_id || '',
-    keywords: Array.isArray(item.keywords) ? item.keywords : String(item.keywords || '').split(/[,，]/).map(x => x.trim()).filter(Boolean),
-    min_messages: Number(item.min_messages || item.min_messages_per_digest || 0) || 0,
-  })).filter(item => item.group && (item.keywords.length || item.min_messages)) : [];
+  function normalizeSchedulerOverridesForUi(perGroup = []) {
+    return Array.isArray(perGroup) ? perGroup.map(item => ({
+      account_id: item.account_id || '',
+      group_id: item.group_id || '',
+      group_name: item.group_name || item.name || '',
+      group: item.group || item.group_name || item.group_id || '',
+      keywords: Array.isArray(item.keywords) ? item.keywords : String(item.keywords || '').split(/[,，]/).map(x => x.trim()).filter(Boolean),
+      min_messages: Number(item.min_messages || item.min_messages_per_digest || 0) || 0,
+    })).filter(item => item.group && (item.keywords.length || item.min_messages)) : [];
+  }
+  let schedulerOverrides = normalizeSchedulerOverridesForUi(s.scheduler.per_group);
   $wl.innerHTML = '<p class="empty">正在后台读取本机微信群列表...</p>';
   function paintWl() {
     if (!groups.length) {
@@ -4165,7 +4168,7 @@ async function renderSettings() {
       .split(/[,，]/)
       .map(x => x.trim())
       .filter(Boolean);
-    const minMessages = parseInt(document.getElementById('s-override-min').value || '0', 10) || 0;
+    const minMessages = clampOverrideMinInput();
     if (!groupId || (!keywords.length && !minMessages)) return;
     const ref = groupRefForPayload({ id: groupId, name: group.name || groupId }, settingsAccountId);
     schedulerOverrides = schedulerOverrides.filter(item => groupRefKey(item) !== groupRefKey(ref));
@@ -4178,6 +4181,29 @@ async function renderSettings() {
   setDurationControl('s-scheduler-interval', s.scheduler.default_interval || '30m', '30m');
   setDurationControl('s-scheduler-window', s.scheduler.digest_window || '4h', '4h');
   document.getElementById('s-scheduler-min').value = s.scheduler.min_messages_per_digest ?? 30;
+  function clampSchedulerMinInput() {
+    const input = document.getElementById('s-scheduler-min');
+    const value = Math.max(1, Math.min(10000, parseInt(input?.value || '30', 10) || 30));
+    if (input) input.value = value;
+    return value;
+  }
+  function clampOverrideMinInput() {
+    const input = document.getElementById('s-override-min');
+    const value = Math.max(0, Math.min(10000, parseInt(input?.value || '0', 10) || 0));
+    if (input) input.value = value || '';
+    return value;
+  }
+  function applySavedSchedulerSettings(savedSettings = {}) {
+    if (savedSettings.groups) s.groups = savedSettings.groups;
+    if (savedSettings.scheduler) s.scheduler = savedSettings.scheduler;
+    schedulerOverrides = normalizeSchedulerOverridesForUi(s.scheduler?.per_group);
+    document.getElementById('s-scheduler').checked = !!s.scheduler?.enabled;
+    setDurationControl('s-scheduler-interval', s.scheduler?.default_interval || '30m', '30m');
+    setDurationControl('s-scheduler-window', s.scheduler?.digest_window || '4h', '4h');
+    document.getElementById('s-scheduler-min').value = s.scheduler?.min_messages_per_digest ?? 30;
+    paintWl();
+    paintOverrideEditor();
+  }
   const schedulerStatus = document.getElementById('s-scheduler-status');
   let schedulerStatusSeq = 0;
   let schedulerBusy = false;
@@ -4334,16 +4360,18 @@ async function renderSettings() {
         enabled: document.getElementById('s-scheduler').checked,
         default_interval: getDurationControlValue('s-scheduler-interval', '30m', { maxMs: MAX_SCHEDULER_INTERVAL_MS }),
         digest_window: getDurationControlValue('s-scheduler-window', '4h'),
-        min_messages_per_digest: parseInt(document.getElementById('s-scheduler-min').value || '30', 10),
+        min_messages_per_digest: clampSchedulerMinInput(),
         per_group: perGroup,
       },
     };
   }
   async function saveSchedulerSettings() {
-    return api('/api/settings', {
+    const result = await api('/api/settings', {
       method: 'PUT',
       body: schedulerSettingsPayload(),
     });
+    applySavedSchedulerSettings(result.settings || {});
+    return result;
   }
   saveGroupsButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
     setSchedulerActionBusy(true);
@@ -4352,9 +4380,9 @@ async function renderSettings() {
     try {
       await saveSchedulerSettings();
       schedulerStatus.className = 'status ok';
-      schedulerStatus.textContent = groupsLoaded ? '✓ 已保存白名单与调度设置' : '✓ 已保存调度设置，原白名单已保留';
-      const r = await api('/api/scheduler/status').catch(() => null);
-      if (r?.scheduler) paintSchedulerStatus(r.scheduler);
+      schedulerStatus.textContent = groupsLoaded
+        ? '✓ 已保存白名单与调度设置；等待下次自动检查'
+        : '✓ 已保存调度设置，原白名单已保留；等待下次自动检查';
     } catch (e) {
       schedulerStatus.className = 'status err';
       schedulerStatus.textContent = '✗ 保存失败：' + e.message;
@@ -4624,6 +4652,7 @@ async function renderSettings() {
       '# wx-summary 人工验收记录',
       '',
       `导出时间：${fmtDateTime(new Date())}`,
+      `诊断采集：${diag?.generated_at ? fmtDateTime(new Date(diag.generated_at), { includeSeconds: true }) : ''}`,
       `服务地址：${diag?.service?.url || ''}`,
       `服务运行：${diag?.service?.uptime_hours ?? ''} 小时`,
       '',
@@ -4647,23 +4676,32 @@ async function renderSettings() {
     lines.push(`- 最近打开文件夹：${reveal ? '有记录' : '无'}${reveal?.explorer_selection ? ` (Explorer matched=${reveal.explorer_selection.matched})` : ''}`);
     return lines.join('\n');
   }
-  function exportAcceptanceMarkdown() {
+  async function exportAcceptanceMarkdown() {
     const $st = document.getElementById('s-acceptance-status');
-    const markdown = acceptanceMarkdown();
-    if (!markdown.includes('### ')) {
-      $st.className = 'status warn';
-      $st.textContent = '请先刷新验收证据';
-      return;
+    $st.className = 'status';
+    $st.textContent = '正在刷新并导出验收证据...';
+    try {
+      const diag = await api('/api/diagnostics?scope=acceptance');
+      _state_settings.acceptanceDiagnostics = diag;
+      const markdown = acceptanceMarkdown(diag);
+      if (!markdown.includes('### ')) {
+        $st.className = 'status warn';
+        $st.textContent = '诊断包未返回人工验收清单';
+        return;
+      }
+      const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `wx-summary-acceptance-${Date.now()}.md`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      $st.className = 'status ok';
+      $st.textContent = '✓ 已导出验收记录 MD';
+    } catch (e) {
+      $st.className = 'status err';
+      $st.textContent = '✗ 导出失败：' + (e.message || '未知错误');
     }
-    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `wx-summary-acceptance-${Date.now()}.md`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    $st.className = 'status ok';
-    $st.textContent = '✓ 已导出验收记录 MD';
   }
   const refreshAcceptanceButton = document.getElementById('s-refresh-acceptance');
   const exportAcceptanceButton = document.getElementById('s-export-acceptance-md');

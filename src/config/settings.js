@@ -10,6 +10,8 @@ export const CURSORS_FILE = path.join(DATA_DIR, 'cursors.json');
 export const MAX_SCHEDULER_INTERVAL_MS = 24 * 86_400_000;
 const DEFAULT_LOG_FILE = './outputs/.tmp/wx-summary.log';
 let SETTINGS_SAVE_QUEUE = Promise.resolve();
+const SECRETS_RECOVERY_STATE = new Map();
+const SETTINGS_RECOVERY_STATE = new Map();
 
 export function defaultSettings() {
   return {
@@ -137,21 +139,27 @@ function stripSensitive(settings) {
 }
 
 export async function loadSecrets({ file = SECRETS_FILE } = {}) {
+  const key = recoveryStateKey(file);
   try {
     const encrypted = await fsp.readFile(file);
     const text = await unprotectToText(encrypted);
     const parsed = JSON.parse(text || '{}');
+    SECRETS_RECOVERY_STATE.delete(key);
     return { secrets: { api_key: parsed.api_key || '', manual_key: parsed.manual_key || '' }, invalid: false };
   } catch (e) {
-    if (e?.code === 'ENOENT') return { secrets: { api_key: '', manual_key: '' }, invalid: false };
+    if (e?.code === 'ENOENT') {
+      const recovered = SECRETS_RECOVERY_STATE.get(key);
+      return recovered
+        ? { secrets: { api_key: '', manual_key: '' }, invalid: true, ...recovered }
+        : { secrets: { api_key: '', manual_key: '' }, invalid: false };
+    }
     const backup = await backupInvalidSecretsFile(file).catch(() => '');
-    return {
-      secrets: { api_key: '', manual_key: '' },
-      invalid: true,
+    const recovered = rememberRecoveryState(SECRETS_RECOVERY_STATE, file, {
       backup_path: backup,
       backup_relative_path: backup ? toProjectRelativeSafe(backup) : '',
       error: e?.message || String(e),
-    };
+    });
+    return { secrets: { api_key: '', manual_key: '' }, invalid: true, ...recovered };
   }
 }
 
@@ -165,24 +173,27 @@ async function backupInvalidSecretsFile(file) {
 }
 
 async function loadSettingsFile(file = SETTINGS_FILE) {
+  const key = recoveryStateKey(file);
   try {
     const raw = await fsp.readFile(file, 'utf-8');
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw Object.assign(new Error('settings.json must contain a JSON object'), { code: 'SETTINGS_INVALID_SHAPE' });
     }
+    SETTINGS_RECOVERY_STATE.delete(key);
     return { raw: parsed, invalid: null };
   } catch (e) {
-    if (e?.code === 'ENOENT') return { raw: {}, invalid: null };
+    if (e?.code === 'ENOENT') {
+      const recovered = SETTINGS_RECOVERY_STATE.get(key);
+      return recovered ? { raw: {}, invalid: recovered } : { raw: {}, invalid: null };
+    }
     const backup = await backupInvalidSettingsFile(file);
-    return {
-      raw: {},
-      invalid: {
-        backup_path: backup,
-        backup_relative_path: toProjectRelativeSafe(backup),
-        error: e?.message || String(e),
-      },
-    };
+    const recovered = rememberRecoveryState(SETTINGS_RECOVERY_STATE, file, {
+      backup_path: backup,
+      backup_relative_path: toProjectRelativeSafe(backup),
+      error: e?.message || String(e),
+    });
+    return { raw: {}, invalid: recovered };
   }
 }
 
@@ -200,6 +211,35 @@ function settingsBackupTimestamp(date) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
+function recoveryStateKey(file) {
+  return path.resolve(file);
+}
+
+function rememberRecoveryState(store, file, info = {}) {
+  const recovered = {
+    backup_path: info.backup_path || '',
+    backup_relative_path: info.backup_relative_path || (info.backup_path ? toProjectRelativeSafe(info.backup_path) : ''),
+    error: info.error || '',
+  };
+  store.set(recoveryStateKey(file), recovered);
+  return recovered;
+}
+
+function publicRecoveryInfo(info = null) {
+  if (!info) return null;
+  return {
+    backup_relative_path: info.backup_relative_path || (info.backup_path ? toProjectRelativeSafe(info.backup_path) : ''),
+    error: redactRecoveryError(info.error || ''),
+  };
+}
+
+function redactRecoveryError(value = '') {
+  return String(value || '')
+    .replaceAll(PROJECT_ROOT, '[redacted-path]')
+    .replace(/[A-Za-z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*/g, '[redacted-path]')
+    .slice(0, 500);
+}
+
 function toProjectRelativeSafe(file) {
   return path.relative(PROJECT_ROOT, file).replaceAll(path.sep, '/');
 }
@@ -208,6 +248,7 @@ export async function saveSecrets(secrets, { file = SECRETS_FILE } = {}) {
   const tmp = await stageSecretsFile(secrets, file);
   try {
     await fsp.rename(tmp, file);
+    SECRETS_RECOVERY_STATE.delete(recoveryStateKey(file));
   } catch (e) {
     await fsp.rm(tmp, { force: true }).catch(() => {});
     throw e;
@@ -240,13 +281,9 @@ export async function loadSettings({ includeSecrets = false, settingsFile = SETT
   merged.wechat.manual_key_set = !!secretState.secrets.manual_key;
   merged._secrets_invalid = !!secretState.invalid;
   if (secretState.invalid) {
-    merged._secrets_invalid_info = {
-      backup_path: secretState.backup_path || '',
-      backup_relative_path: secretState.backup_relative_path || '',
-      error: secretState.error || '',
-    };
+    merged._secrets_invalid_info = publicRecoveryInfo(secretState);
   }
-  if (invalid) merged._settings_invalid = invalid;
+  if (invalid) merged._settings_invalid = publicRecoveryInfo(invalid);
   if (includeSecrets) {
     merged.llm.api_key = secretState.secrets.api_key;
     merged.wechat.manual_key = secretState.secrets.manual_key;
@@ -613,9 +650,11 @@ async function saveSettingsPatchUnlocked(patch, { settingsFile = SETTINGS_FILE, 
     if (secretsChanged) stagedSecrets = await stageSecretsFile(nextSecrets, secretsFile);
     await writeJsonAtomic(settingsFile, stripSensitive(merged));
     settingsWritten = true;
+    SETTINGS_RECOVERY_STATE.delete(recoveryStateKey(settingsFile));
     if (stagedSecrets) {
       await fsp.rename(stagedSecrets, secretsFile);
       stagedSecrets = '';
+      SECRETS_RECOVERY_STATE.delete(recoveryStateKey(secretsFile));
     }
   } catch (e) {
     if (stagedSecrets) await fsp.rm(stagedSecrets, { force: true }).catch(() => {});

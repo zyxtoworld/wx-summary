@@ -819,6 +819,32 @@ function assertApiAccess(req, parsedUrl) {
   }
 }
 
+const LOG_REDACT_KEYS = new Set([
+  'group',
+  'group_name',
+  'group_id',
+  'account',
+  'account_id',
+  'cursor_key',
+  'ref',
+  'refs',
+  'matches',
+  'base_url',
+]);
+const LOG_PATH_KEYS = new Set([
+  'project_root',
+  'path',
+  'main_path',
+  'file_name',
+  'command_line',
+  'account_root',
+  'db_storage',
+  'file_path',
+  'relative_path',
+  'digest_path',
+  'digest_relative_path',
+]);
+
 async function sanitizedLogTail(limit = 200, loadedSettings = null) {
   const safeLimit = Math.max(1, Math.min(500, Number(limit) || 200));
   const settings = loadedSettings || await loadSettings();
@@ -832,11 +858,54 @@ async function sanitizedLogTail(limit = 200, loadedSettings = null) {
 }
 
 function sanitizeLogLine(line = '') {
-  return sanitizeText(line)
+  const parsed = parseLogJsonSuffix(line);
+  if (parsed) {
+    const prefix = redactEmbeddedDiagnosticPaths(sanitizeText(parsed.prefix || ''));
+    return `${prefix}${JSON.stringify(sanitizeLogValue(parsed.value))}`;
+  }
+  return redactEmbeddedDiagnosticPaths(sanitizeText(line))
     .replace(/"group"\s*:\s*"([^"\\]|\\.)*"/g, '"group":"[redacted-group]"')
     .replace(/"group_name"\s*:\s*"([^"\\]|\\.)*"/g, '"group_name":"[redacted-group]"')
+    .replace(/"ref"\s*:\s*"([^"\\]|\\.)*"/g, '"ref":"[redacted-group-ref]"')
+    .replace(/"refs"\s*:\s*\[[^\r\n]*?\]/g, '"refs":["[redacted-group-ref]"]')
+    .replace(/"matches"\s*:\s*\[[^\r\n]*?\]/g, '"matches":["[redacted-group-ref]"]')
+    .replace(/"base_url"\s*:\s*"([^"\\]|\\.)*"/g, '"base_url":"[redacted-url]"')
     .replace(/"(account_id|group_id|cursor_key)"\s*:\s*"([^"\\]|\\.)*"/g, '"$1":"[redacted-id]"')
     .replace(/"(project_root|path|main_path|file_name|command_line|account_root|db_storage|file_path|relative_path|digest_path|digest_relative_path)"\s*:\s*"([^"\\]|\\.)*"/g, '"$1":"[redacted-path]"');
+}
+
+function parseLogJsonSuffix(line = '') {
+  const text = String(line || '');
+  const index = text.indexOf('{');
+  if (index < 0) return null;
+  try {
+    return { prefix: text.slice(0, index), value: JSON.parse(text.slice(index)) };
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeLogValue(value, key = '') {
+  const cleanKey = String(key || '').toLowerCase();
+  if (LOG_REDACT_KEYS.has(cleanKey)) {
+    if (cleanKey === 'base_url') return '[redacted-url]';
+    if (cleanKey === 'matches' || cleanKey === 'refs') return Array.isArray(value) ? value.map(() => '[redacted-group-ref]') : '[redacted-group-ref]';
+    if (cleanKey.includes('account') || cleanKey.includes('group_id') || cleanKey === 'cursor_key') return '[redacted-id]';
+    return '[redacted-group]';
+  }
+  if (Array.isArray(value)) return value.map(item => sanitizeLogValue(item, cleanKey));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [entryKey, entryValue] of Object.entries(value)) {
+      out[entryKey] = sanitizeLogValue(entryValue, entryKey);
+    }
+    return out;
+  }
+  if (typeof value === 'string') {
+    if (LOG_PATH_KEYS.has(cleanKey)) return '[redacted-path]';
+    return redactEmbeddedDiagnosticPaths(sanitizeText(value));
+  }
+  return value;
 }
 
 const DIAGNOSTIC_PATH_KEYS = new Set([
@@ -1375,6 +1444,9 @@ async function handleApi(req, res, parsedUrl) {
       ok: !settings._secrets_invalid,
       dpapi_ok: process.platform === 'win32' ? !settings._secrets_invalid : null,
       invalid: !!settings._secrets_invalid,
+      api_key_configured: !!settings.llm.api_key_set,
+      manual_key_configured: !!settings.wechat.manual_key_set,
+      missing: !settings.llm.api_key_set && !settings.wechat.manual_key_set,
     };
     const weixinBinary = {
       external_user_baseline: externalBinary,
@@ -1399,6 +1471,7 @@ async function handleApi(req, res, parsedUrl) {
     };
     const diagnosticsPayload = {
       ok: true,
+      generated_at: new Date().toISOString(),
       diagnostic_scope: lightweight ? 'acceptance' : 'full',
       project_root: PROJECT_ROOT,
       service,
