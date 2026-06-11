@@ -51,7 +51,14 @@ export async function getGroupCursor(groupId) {
   const key = normalizeGroupId(groupId);
   if (!key) return '';
   const cursors = await loadCursors();
-  return normalizeCursorValue(cursors[key]);
+  return normalizeCursorState(cursors[key]).last_seq;
+}
+
+export async function getGroupCursorState(groupId) {
+  const key = normalizeGroupId(groupId);
+  if (!key) return emptyCursorState();
+  const cursors = await loadCursors();
+  return normalizeCursorState(cursors[key]);
 }
 
 export async function setGroupCursor(groupId, lastSeq) {
@@ -63,6 +70,28 @@ export async function setGroupCursor(groupId, lastSeq) {
   cursors[key] = value;
   await writeJsonAtomic(CURSORS_FILE, sortObject(cursors));
   return { group_id: key, last_seq: value };
+}
+
+export async function setGroupCursorState(groupId, state = {}) {
+  const key = normalizeGroupId(groupId);
+  if (!key) throw Object.assign(new Error('group_id is required'), { status: 400 });
+  const normalized = normalizeCursorState({
+    ...state,
+    last_seq: state.last_seq || state.lastSeq || state.cursor || state.latest_cursor,
+  });
+  if (!normalized.last_seq) throw Object.assign(new Error('last_seq is required'), { status: 400 });
+  const cursors = await loadCursors();
+  cursors[key] = {
+    version: 2,
+    last_seq: normalized.last_seq,
+    seen: normalized.seen,
+    updated_at: normalizeCursorText(state.updated_at || new Date().toISOString(), 64),
+    window_since: normalizeCursorText(state.window_since, 32),
+    window_until: normalizeCursorText(state.window_until, 32),
+    message_count: Math.max(0, Math.trunc(Number(state.message_count || normalized.seen.length || 0)) || 0),
+  };
+  await writeJsonAtomic(CURSORS_FILE, sortObject(cursors));
+  return { group_id: key, ...cursors[key] };
 }
 
 export async function clearGroupCursor(groupId) {
@@ -79,10 +108,49 @@ function normalizeGroupId(value) {
   return String(value || '').trim();
 }
 
+function emptyCursorState() {
+  return { last_seq: '', seen: [], updated_at: '', window_since: '', window_until: '', message_count: 0 };
+}
+
+function normalizeCursorState(value) {
+  if (!value) return emptyCursorState();
+  if (typeof value === 'string' || typeof value === 'number') {
+    return { ...emptyCursorState(), last_seq: normalizeCursorValue(value) };
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) return emptyCursorState();
+  return {
+    last_seq: normalizeCursorValue(value.last_seq || value.lastSeq || value.cursor || value.latest_cursor),
+    seen: normalizeSeenList(value.seen || value.message_ids || value.messages),
+    updated_at: normalizeCursorText(value.updated_at, 64),
+    window_since: normalizeCursorText(value.window_since, 32),
+    window_until: normalizeCursorText(value.window_until, 32),
+    message_count: Math.max(0, Math.trunc(Number(value.message_count || 0)) || 0),
+  };
+}
+
+function normalizeSeenList(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const item = normalizeCursorText(value, 80);
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+    if (out.length >= 20000) break;
+  }
+  return out;
+}
+
 function normalizeCursorValue(value) {
   const raw = String(value ?? '').trim();
   if (!raw) return '';
-  return raw.replace(/[^\w:.-]/g, '').slice(0, 128);
+  return raw.replace(/[^\w:.-]/g, '').slice(0, 256);
+}
+
+function normalizeCursorText(value, maxLength) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return raw.replace(/[^\w:.,@+ -]/g, '').slice(0, maxLength);
 }
 
 function sortObject(obj) {

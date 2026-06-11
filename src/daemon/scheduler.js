@@ -1,9 +1,10 @@
+import crypto from 'node:crypto';
 import { collectMessages, listAccounts, listGroups } from '../collector/index.js';
 import { durationToMs, loadSettings } from '../config/settings.js';
 import { discardRenderedHistoryItem, saveRenderedPng } from '../renderer/output.js';
 import { renderDigestPngDataUrl } from '../renderer/server-png.js';
 import { summarizeDigest, sanitizeText } from '../summarizer/llm.js';
-import { getGroupCursor, setGroupCursor } from '../store/cursors.js';
+import { getGroupCursorState, setGroupCursorState } from '../store/cursors.js';
 import { logError, logInfo, logWarn } from '../lib/logger.js';
 
 const state = {
@@ -20,6 +21,7 @@ const state = {
 
 let timer = null;
 let activeRunPromise = null;
+const MAX_CURSOR_SEEN_MESSAGES = 20000;
 
 export async function startScheduler({ immediate = false } = {}) {
   stopScheduler();
@@ -228,12 +230,22 @@ async function runGroupDigest({ settings, account, group, window }) {
     min_messages: minMessages,
   });
   const cursorKey = groupCursorKey(account, group);
-  const previousCursor = await getGroupCursor(cursorKey);
+  const cursorState = await getGroupCursorState(cursorKey);
+  const previousCursor = cursorState.last_seq;
+  const previousSeen = new Set(cursorState.seen || []);
   const windowMessageCount = collection.message_count || 0;
-  const latestWindowCursor = latestMessageCursor(collection.messages);
-  if (previousCursor) {
-    const newMessages = messagesAfterCursor(collection.messages, previousCursor);
+  const windowMessages = Array.isArray(collection.messages) ? collection.messages : [];
+  const latestWindowCursor = latestMessageCursor(windowMessages);
+  if (previousSeen.size || previousCursor) {
+    const newMessages = previousSeen.size
+      ? messagesNotSeen(windowMessages, previousSeen)
+      : messagesAfterCursor(windowMessages, previousCursor);
     if (!newMessages.length && windowMessageCount) {
+      await setGroupCursorState(cursorKey, schedulerCursorState({
+        cursor: latestWindowCursor || previousCursor,
+        messages: windowMessages,
+        window,
+      }));
       return {
         account_id: accountIdentity(account),
         account: account.name || accountIdentity(account),
@@ -271,7 +283,7 @@ async function runGroupDigest({ settings, account, group, window }) {
     };
   }
   const latestCursor = latestMessageCursor(collection.messages);
-  if (shouldSkipUnchangedCursor(previousCursor, latestCursor)) {
+  if (!previousSeen.size && shouldSkipUnchangedCursor(previousCursor, latestCursor)) {
     return {
       account_id: accountIdentity(account),
       account: account.name || accountIdentity(account),
@@ -296,9 +308,13 @@ async function runGroupDigest({ settings, account, group, window }) {
   digest.source_label = collection.source_label;
   const pngDataUrl = await renderDigestPngDataUrl(digest, settings.render);
   const saved = await saveRenderedPng({ settings, digest, png_data_url: pngDataUrl });
-  const cursor = latestCursor || String(Date.now());
+  const cursor = latestWindowCursor || latestCursor || String(Date.now());
   try {
-    await setGroupCursor(cursorKey, cursor);
+    await setGroupCursorState(cursorKey, schedulerCursorState({
+      cursor,
+      messages: windowMessages,
+      window,
+    }));
   } catch (e) {
     const message = sanitizeText(e?.message || String(e));
     await discardRenderedHistoryItem(settings, saved).catch(cleanupError => {
@@ -438,6 +454,40 @@ function messagesAfterCursor(messages = [], previousCursor = '') {
   });
 }
 
+function messagesNotSeen(messages = [], seen = new Set()) {
+  return (Array.isArray(messages) ? messages : []).filter(message => !seen.has(messageIdentity(message)));
+}
+
+function schedulerCursorState({ cursor, messages = [], window = {} } = {}) {
+  return {
+    last_seq: cursor || latestMessageCursor(messages),
+    seen: messageIdentityList(messages),
+    window_since: window.since || '',
+    window_until: window.until || '',
+    message_count: Array.isArray(messages) ? messages.length : 0,
+  };
+}
+
+function messageIdentityList(messages = []) {
+  const ordered = [...(Array.isArray(messages) ? messages : [])].sort(compareMessageCursor);
+  const recent = ordered.slice(Math.max(0, ordered.length - MAX_CURSOR_SEEN_MESSAGES));
+  return [...new Set(recent.map(messageIdentity).filter(Boolean))];
+}
+
+function messageIdentity(message = {}) {
+  const raw = JSON.stringify([
+    normalizeCursorNumber(message.timestamp),
+    normalizeCursorNumber(message.sort_seq),
+    normalizeCursorNumber(message.local_id),
+    String(message.server_id || ''),
+    String(message.id || ''),
+    String(message.sender || ''),
+    String(message.type || ''),
+    String(message.content || '').slice(0, 500),
+  ]);
+  return `m.${crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24)}`;
+}
+
 function cursorObjectFromValue(value) {
   const text = String(value || '').trim();
   if (!text) return null;
@@ -486,6 +536,9 @@ export const __schedulerInternals = {
   selectScheduledGroups,
   latestMessageCursor,
   messagesAfterCursor,
+  messagesNotSeen,
+  messageIdentity,
+  schedulerCursorState,
   accountIdentity,
   groupCursorKey,
   shouldSkipUnchangedCursor,
