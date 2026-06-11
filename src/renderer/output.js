@@ -10,6 +10,11 @@ export function historyIndexPath(settings) {
   return path.join(outputDirFromSettings(settings), 'index.json');
 }
 
+async function readHistoryIndex(settings) {
+  const list = await readJson(historyIndexPath(settings), []);
+  return Array.isArray(list) ? list : [];
+}
+
 export async function saveRenderedPng({ settings, digest, png_data_url, signal = null }) {
   throwIfOutputAborted(signal);
   const base = outputDirFromSettings(settings);
@@ -53,15 +58,17 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
   try {
     await upsertHistory(settings, item, { signal });
   } catch (e) {
-    if (isOutputAbortError(e)) await cleanupRenderedPair(filePath, digestPath);
+    if (isOutputAbortError(e)) {
+      await removeHistoryItem(settings, item.digest_id).catch(() => {});
+      await cleanupRenderedPair(filePath, digestPath);
+    }
     throw e;
   }
   return item;
 }
 
 export async function listHistory(settings) {
-  const list = await readJson(historyIndexPath(settings), []);
-  return Array.isArray(list) ? list.slice(0, 50) : [];
+  return (await readHistoryIndex(settings)).slice(0, 50);
 }
 
 export async function cleanupOldDigests(settings) {
@@ -93,7 +100,7 @@ export async function cleanupOldDigests(settings) {
 }
 
 export async function findHistoryItem(settings, digestId) {
-  const list = await listHistory(settings);
+  const list = await readHistoryIndex(settings);
   return list.find(item => item.digest_id === digestId) || null;
 }
 
@@ -409,10 +416,22 @@ async function upsertHistory(settings, item, { signal = null } = {}) {
   await withHistoryWriteLock(async () => {
     throwIfOutputAborted(signal);
     const file = historyIndexPath(settings);
-    const list = await readJson(file, []);
+    const list = await readHistoryIndex(settings);
     const next = [item, ...list.filter(x => x.digest_id !== item.digest_id)].slice(0, 200);
     throwIfOutputAborted(signal);
     await writeJsonAtomic(file, next);
+    throwIfOutputAborted(signal);
+  });
+}
+
+async function removeHistoryItem(settings, digestId) {
+  const id = String(digestId || '');
+  if (!id) return;
+  await withHistoryWriteLock(async () => {
+    const file = historyIndexPath(settings);
+    const list = await readHistoryIndex(settings);
+    const next = list.filter(item => item.digest_id !== id);
+    if (next.length !== list.length) await writeJsonAtomic(file, next);
   });
 }
 

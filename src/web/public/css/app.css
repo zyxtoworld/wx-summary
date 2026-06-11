@@ -265,6 +265,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 }
 .group-list li:hover { background: var(--bg); }
 .group-list li.selected { background: var(--bg); }
+.group-list.locked li {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+.group-list.locked li:hover { background: transparent; }
+.group-list.locked li.selected:hover { background: var(--bg); }
 .group-list li.non-whitelist:not(.selected) .gname,
 .group-list li.non-whitelist:not(.selected) .meta {
   opacity: 0.58;
@@ -462,8 +468,11 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
   border-radius: var(--radius-xs);
   padding: 2px 6px;
   font-size: 12px;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
-.chip .x { cursor: pointer; color: var(--muted); }
+.chip .x { cursor: pointer; color: var(--muted); flex: 0 0 auto; }
 .chip .x:hover { color: var(--danger); }
 
 .override-editor {
@@ -526,9 +535,14 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 }
 .progress-stages {
   list-style: none; margin: 0; padding: 0;
-  display: flex; gap: var(--gap-4); font-size: 13px;
+  display: flex; flex-wrap: wrap; gap: var(--gap-3); font-size: 13px;
 }
-.progress-stages li { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.progress-stages li {
+  display: flex; align-items: center; gap: 6px; color: var(--muted);
+  min-width: min(220px, 100%);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
 .progress-stages li.done { color: var(--text); }
 .progress-stages li.running { color: var(--primary); }
 .progress-stages li.error { color: var(--danger); }

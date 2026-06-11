@@ -814,13 +814,14 @@ async function renderDigest() {
           _state_digest.selectedGroups.has(g.id) ? 'selected' : '',
           g.non_whitelist ? 'non-whitelist' : '',
         ].filter(Boolean).join(' ')}">
-          <input type="checkbox" ${_state_digest.selectedGroups.has(g.id) ? 'checked' : ''} />
+          <input type="checkbox" ${_state_digest.selectedGroups.has(g.id) ? 'checked' : ''} ${_state_digest.generating ? 'disabled' : ''} />
           ${g.starred ? '<span class="star">★</span>' : ''}
           <span class="gname">${escapeHtml(g.name)}</span>
           <span class="meta">${fmtTimeAgo(g.last_msg_at)}</span>
         </li>`).join('');
     document.querySelectorAll('#group-list li').forEach(li => {
       li.addEventListener('click', e => {
+        if (_state_digest.generating) return;
         const cb = li.querySelector('input');
         if (e.target.tagName !== 'INPUT') cb.checked = !cb.checked;
         const id = li.dataset.id;
@@ -830,6 +831,7 @@ async function renderDigest() {
         updateSelectedCount();
       });
     });
+    updateDigestSelectionLock();
     updateSelectedCount();
   }
   function updateSelectedCount() {
@@ -842,8 +844,8 @@ async function renderDigest() {
   function updateWhitelistButton() {
     if (!whitelistButton) return;
     const currentWhitelistCount = groups.filter(g => whitelistRefs.some(ref => groupRefMatches(ref, g, accountId))).length;
-    whitelistButton.disabled = currentWhitelistCount === 0;
-    whitelistButton.title = currentWhitelistCount ? '选择设置页白名单里的群' : '当前账号尚未配置白名单';
+    whitelistButton.dataset.hasWhitelist = currentWhitelistCount ? '1' : '0';
+    updateDigestSelectionLock();
   }
   paint();
   updateWhitelistButton();
@@ -868,6 +870,7 @@ async function renderDigest() {
       });
   }
   document.getElementById('select-whitelist').addEventListener('click', () => {
+    if (_state_digest.generating) return;
     groups.filter(g => whitelistRefs.some(ref => groupRefMatches(ref, g, accountId))).forEach(g => _state_digest.selectedGroups.add(g.id));
     paint(document.getElementById('group-search').value);
   });
@@ -1127,6 +1130,21 @@ function digestRenderPayload(selection = currentDigestRenderSelection()) {
   };
 }
 
+function digestRenderSelectionFromSaved(render = {}, fallback = currentDigestRenderSelection()) {
+  const saved = render && typeof render === 'object' && !Array.isArray(render) ? render : {};
+  const theme = ['light', 'dark'].includes(saved.theme) ? saved.theme : normalizeDigestTheme(fallback.theme);
+  const fontSize = saved.font_size === 'large' ? 'large' : saved.font_size === 'normal' ? 'normal' : normalizeDigestFontSize(fallback.fontsize);
+  const accentColor = String(saved.accent_color || '').toUpperCase();
+  const matchedAccent = DIGEST_ACCENTS.find(item =>
+    item.light.toUpperCase() === accentColor || item.dark.toUpperCase() === accentColor
+  );
+  return {
+    theme,
+    fontsize: fontSize,
+    accent: matchedAccent?.id || normalizeDigestAccent(fallback.accent),
+  };
+}
+
 function closeRerenderPanels() {
   document.querySelectorAll('.rerender-popover').forEach(el => el.remove());
 }
@@ -1382,6 +1400,22 @@ function updateDigestCancelButton() {
   button.textContent = _state_digest.abortController?.signal?.aborted ? '正在取消...' : '取消生成';
 }
 
+function updateDigestSelectionLock() {
+  const locked = !!_state_digest.generating;
+  document.getElementById('group-list')?.classList.toggle('locked', locked);
+  document.querySelectorAll('#group-list input[type="checkbox"]').forEach(input => {
+    input.disabled = locked;
+  });
+  const whitelistButton = document.getElementById('select-whitelist');
+  if (whitelistButton) {
+    const hasWhitelist = whitelistButton.dataset.hasWhitelist === '1';
+    whitelistButton.disabled = locked || !hasWhitelist;
+    whitelistButton.title = locked
+      ? '生成中不能修改群选择'
+      : (hasWhitelist ? '选择设置页白名单里的群' : '当前账号尚未配置白名单');
+  }
+}
+
 function digestStageText(stage = {}) {
   const icon = stage.status === 'done' ? '✓' : stage.status === 'running' ? '⟳' : stage.status === 'error' ? '✗' : '·';
   const detail = stage.status === 'running'
@@ -1425,6 +1459,7 @@ async function generateDigest({ previewText = false } = {}) {
   if (generateButton) generateButton.disabled = true;
   if (previewButton) previewButton.disabled = true;
   updateDigestCancelButton();
+  updateDigestSelectionLock();
   const $progress = document.getElementById('progress-card');
   const $stages = document.getElementById('progress-stages');
   const $fill = document.getElementById('progress-fill');
@@ -1666,7 +1701,6 @@ async function generateDigest({ previewText = false } = {}) {
           }),
         });
         digests[i] = digest;
-        _state_digest.lastDigest = digest;
         if (previewText) {
           renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
         } else {
@@ -1674,6 +1708,13 @@ async function generateDigest({ previewText = false } = {}) {
             if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
             const livePreviewCard = document.getElementById('preview-card');
             if (livePreviewCard) livePreviewCard.classList.remove('hidden');
+            _state_digest.lastDigest = digest;
+            _state_digest.lastSavedItem = null;
+            const revealButton = document.getElementById('btn-reveal');
+            if (revealButton) {
+              revealButton.disabled = true;
+              revealButton.title = '保存后可用';
+            }
             const canvas = drawDigestCanvas(digest);
             if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
             upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
@@ -1682,7 +1723,6 @@ async function generateDigest({ previewText = false } = {}) {
               if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
               digest.file_path = saved.item.file_path;
-              const revealButton = document.getElementById('btn-reveal');
               if (revealButton) {
                 revealButton.disabled = false;
                 revealButton.title = '在文件夹中显示最后一张';
@@ -1760,6 +1800,7 @@ async function generateDigest({ previewText = false } = {}) {
     const finalPreviewButton = document.getElementById('btn-preview-text');
     if (finalGenerateButton) finalGenerateButton.disabled = _state_digest.selectedGroups.size === 0;
     if (finalPreviewButton) finalPreviewButton.disabled = _state_digest.selectedGroups.size === 0;
+    updateDigestSelectionLock();
     paintDigestProgressSnapshot();
   }
 }
@@ -2847,26 +2888,41 @@ function showHistoryModal(item) {
       }
     }
   });
-  modal.querySelector('[data-rerender]').addEventListener('click', e => {
-    showDigestRerenderPanel({
-      anchor: e.currentTarget,
-      statusTarget: status,
-      initial: currentDigestRenderSelection(),
-      onSave: async selection => {
-        const r = await api('/api/rerender-history', {
-          method: 'POST',
-          body: { digest_id: item.digest_id, render: digestRenderPayload(selection) },
-        });
-        Object.assign(item, r.item || {});
-        const freshUrl = historyImageUrl(item.digest_id, Date.now());
-        watchHistoryImage();
-        image.src = freshUrl;
-        downloadButton.href = freshUrl;
-        downloadButton.setAttribute('download', '');
-        downloadButton.classList.remove('disabled');
-        return r;
-      },
-    });
+  const rerenderButton = modal.querySelector('[data-rerender]');
+  rerenderButton.addEventListener('click', async e => {
+    if (rerenderButton.disabled) return;
+    rerenderButton.disabled = true;
+    status.className = 'status';
+    status.textContent = '正在读取原渲染设置...';
+    try {
+      const saved = await api(`/api/history-digest/${encodeURIComponent(item.digest_id)}`);
+      const initial = digestRenderSelectionFromSaved(saved.digest?.__render);
+      status.textContent = '';
+      showDigestRerenderPanel({
+        anchor: e.currentTarget,
+        statusTarget: status,
+        initial,
+        onSave: async selection => {
+          const r = await api('/api/rerender-history', {
+            method: 'POST',
+            body: { digest_id: item.digest_id, render: digestRenderPayload(selection) },
+          });
+          Object.assign(item, r.item || {});
+          const freshUrl = historyImageUrl(item.digest_id, Date.now());
+          watchHistoryImage();
+          image.src = freshUrl;
+          downloadButton.href = freshUrl;
+          downloadButton.setAttribute('download', '');
+          downloadButton.classList.remove('disabled');
+          return r;
+        },
+      });
+    } catch (err) {
+      status.className = 'status err';
+      status.textContent = `读取原渲染设置失败：${err.message || '未知错误'}`;
+    } finally {
+      rerenderButton.disabled = !canRerender;
+    }
   });
 }
 
@@ -3564,6 +3620,11 @@ async function renderSettings() {
     if (keyMode === 'manual' && manualKey && manualKeys.invalid.length) {
       $st.className = 'status err';
       $st.textContent = '✗ 手动密钥每条必须是 64 或 96 位 hex';
+      return;
+    }
+    if (keyMode === 'manual' && !manualKeys.keys.length && !s.wechat.manual_key_set) {
+      $st.className = 'status err';
+      $st.textContent = '✗ 手动模式需要填写至少一条 64 或 96 位 hex 密钥；不填写请切回自动模式';
       return;
     }
     const wechatPatch = keyMode === 'manual'
