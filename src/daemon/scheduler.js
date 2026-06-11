@@ -218,7 +218,7 @@ async function runGroupDigestWithRetry({ attempts = 2, ...args }) {
 async function runGroupDigest({ settings, account, group, window }) {
   const override = schedulerOverrideForGroup(settings.scheduler?.per_group, group, account);
   const minMessages = override?.min_messages || settings.scheduler.min_messages_per_digest;
-  const collection = await collectMessages({
+  let collection = await collectMessages({
     account_id: accountIdentity(account),
     group_id: group.id,
     group_name: group.name,
@@ -227,7 +227,34 @@ async function runGroupDigest({ settings, account, group, window }) {
     filters: override?.keywords?.length ? { keywords: override.keywords } : {},
     min_messages: minMessages,
   });
-  if (collection.below_minimum || !collection.message_count) {
+  const cursorKey = groupCursorKey(account, group);
+  const previousCursor = await getGroupCursor(cursorKey);
+  const windowMessageCount = collection.message_count || 0;
+  const latestWindowCursor = latestMessageCursor(collection.messages);
+  if (previousCursor) {
+    const newMessages = messagesAfterCursor(collection.messages, previousCursor);
+    if (!newMessages.length && windowMessageCount) {
+      return {
+        account_id: accountIdentity(account),
+        account: account.name || accountIdentity(account),
+        group_id: group.id,
+        group: group.name,
+        generated: false,
+        message_count: 0,
+        window_message_count: windowMessageCount,
+        detail: 'no_new_messages',
+        cursor: latestWindowCursor || previousCursor,
+      };
+    }
+    collection = {
+      ...collection,
+      messages: newMessages,
+      message_count: newMessages.length,
+      window_message_count: windowMessageCount,
+      since: newMessages[0]?.time || collection.since,
+    };
+  }
+  if (!collection.message_count || collection.message_count < Number(minMessages || 0)) {
     return {
       account_id: accountIdentity(account),
       account: account.name || accountIdentity(account),
@@ -235,14 +262,13 @@ async function runGroupDigest({ settings, account, group, window }) {
       group: group.name,
       generated: false,
       message_count: collection.message_count || 0,
+      window_message_count: collection.window_message_count || windowMessageCount,
       detail: 'below_minimum',
       min_messages: minMessages,
       keyword_override: override?.keywords || [],
     };
   }
-  const cursorKey = groupCursorKey(account, group);
   const latestCursor = latestMessageCursor(collection.messages);
-  const previousCursor = await getGroupCursor(cursorKey);
   if (shouldSkipUnchangedCursor(previousCursor, latestCursor)) {
     return {
       account_id: accountIdentity(account),
@@ -301,6 +327,7 @@ async function runGroupDigest({ settings, account, group, window }) {
     group: group.name,
     generated: true,
     message_count: collection.message_count,
+    window_message_count: collection.window_message_count || windowMessageCount,
     digest_id: digest.digest_id,
     file_path: saved.file_path,
     cursor,
@@ -380,12 +407,15 @@ function schedulerWindow(value, now = new Date()) {
 
 function latestMessageCursor(messages = []) {
   const latest = [...messages].sort((a, b) => compareMessageCursor(b, a))[0];
-  if (!latest) return '';
-  const timestamp = normalizeCursorNumber(latest.timestamp);
-  const sortSeq = normalizeCursorNumber(latest.sort_seq);
-  const localId = normalizeCursorNumber(latest.local_id);
-  const serverId = cursorComponent(latest.server_id);
-  const messageId = cursorComponent(latest.id);
+  return latest ? messageCursor(latest) : '';
+}
+
+function messageCursor(message = {}) {
+  const timestamp = normalizeCursorNumber(message.timestamp);
+  const sortSeq = normalizeCursorNumber(message.sort_seq);
+  const localId = normalizeCursorNumber(message.local_id);
+  const serverId = cursorComponent(message.server_id);
+  const messageId = cursorComponent(message.id);
   const parts = [
     timestamp ? `ts.${timestamp}` : '',
     sortSeq ? `seq.${sortSeq}` : '',
@@ -393,7 +423,34 @@ function latestMessageCursor(messages = []) {
     serverId ? `sid.${serverId}` : '',
     messageId ? `id.${messageId}` : '',
   ].filter(Boolean);
-  return parts.join(':') || cursorComponent(latest.server_id || latest.local_id || latest.timestamp);
+  return parts.join(':') || cursorComponent(message.server_id || message.local_id || message.timestamp);
+}
+
+function messagesAfterCursor(messages = [], previousCursor = '') {
+  const cursor = cursorObjectFromValue(previousCursor);
+  if (!cursor) return Array.isArray(messages) ? messages : [];
+  return (Array.isArray(messages) ? messages : []).filter(message => {
+    const current = messageCursor(message);
+    if (current && current === previousCursor) return false;
+    return compareMessageCursor(message, cursor) > 0;
+  });
+}
+
+function cursorObjectFromValue(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const out = {};
+  for (const part of text.split(':')) {
+    const [key, ...rest] = part.split('.');
+    const raw = rest.join('.');
+    if (!key || !raw) continue;
+    if (key === 'ts') out.timestamp = normalizeCursorNumber(raw);
+    else if (key === 'seq') out.sort_seq = normalizeCursorNumber(raw);
+    else if (key === 'lid') out.local_id = normalizeCursorNumber(raw);
+    else if (key === 'sid') out.server_id = raw;
+    else if (key === 'id') out.id = raw;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 function compareMessageCursor(a = {}, b = {}) {
@@ -426,6 +483,7 @@ export const __schedulerInternals = {
   schedulerWindow,
   selectScheduledGroups,
   latestMessageCursor,
+  messagesAfterCursor,
   accountIdentity,
   groupCursorKey,
   shouldSkipUnchangedCursor,
