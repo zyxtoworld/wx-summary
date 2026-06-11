@@ -1890,9 +1890,10 @@ async function generateDigest({ previewText = false } = {}) {
     if (s.status === 'running') {
       const previous = li._runningStage;
       const nextDetail = stripElapsedDetail(s.detail);
+      const resetElapsed = !previous || previous.label !== s.label || previous.stageName !== (s.stageName || s.name || '') || s.resetElapsed;
       li._runningStage = {
         ...s,
-        startedAt: previous?.startedAt || Date.now(),
+        startedAt: resetElapsed ? Date.now() : (previous?.startedAt || Date.now()),
         baseDetail: s.detail == null ? (previous?.baseDetail || '') : nextDetail,
         timer: previous?.timer || null,
       };
@@ -1952,7 +1953,7 @@ async function generateDigest({ previewText = false } = {}) {
       status: stage.status,
       detail: stage.status === 'done'
         ? (previewText ? '准备整理文本预览' : '准备绘制长图')
-        : '等待摘要数据到达浏览器',
+        : (stage.detail || '等待摘要数据到达浏览器'),
     };
   }
   function normalizeServerStageForClient(stage = {}) {
@@ -2035,15 +2036,28 @@ async function generateDigest({ previewText = false } = {}) {
         if (previewText) {
           const nextDigests = digests.slice();
           nextDigests[i] = digest;
+          const previewCount = nextDigests.filter(Boolean).length;
           upsertStage(groupStage(i, {
             name: 'rendering',
             label: '整理文本预览',
             status: 'running',
-            detail: `合并 ${nextDigests.filter(Boolean).length}/${targets.length} 个群为 Markdown`,
+            detail: `准备合并 ${previewCount}/${targets.length} 个群为 Markdown`,
+            resetElapsed: true,
+          }));
+          await waitForBrowserPaint();
+          if (controller.signal.aborted) return;
+          upsertStage(groupStage(i, {
+            name: 'rendering',
+            label: '刷新文本预览',
+            status: 'running',
+            detail: '写入 Markdown 预览区域',
+            resetElapsed: true,
           }));
           await waitForBrowserPaint();
           if (controller.signal.aborted) return;
           renderTextPreviews(nextDigests.filter(Boolean), { complete: false, total: targets.length });
+          await waitForBrowserPaint();
+          if (controller.signal.aborted) return;
           digests[i] = digest;
           upsertStage(groupStage(i, {
             name: 'rendering',
@@ -2055,6 +2069,14 @@ async function generateDigest({ previewText = false } = {}) {
             ].filter(Boolean).join(' · '),
           }));
         } else {
+          upsertStage(groupStage(i, {
+            name: 'rendering',
+            label: '等待本地渲染队列',
+            status: 'running',
+            detail: '长图绘制和 PNG 保存按顺序执行',
+            resetElapsed: true,
+          }));
+          await waitForBrowserPaint();
           await enqueueRender(async () => {
             if (controller.signal.aborted) return;
             const livePreviewCard = document.getElementById('preview-card');
@@ -2069,13 +2091,26 @@ async function generateDigest({ previewText = false } = {}) {
             }
             upsertStage(groupStage(i, {
               name: 'rendering',
-              label: '绘制长图',
+              label: '准备长图画布',
               status: 'running',
               detail: [
                 digest.topics?.length ? `${digest.topics.length} 条主线` : '',
                 digest.links?.length ? `${digest.links.length} 个链接` : '',
-                '正在排版并绘制 Canvas',
+                '测量布局和页面高度',
               ].filter(Boolean).join(' · '),
+              resetElapsed: true,
+            }));
+            await waitForBrowserPaint();
+            if (controller.signal.aborted) {
+              hideUncommittedDigestPreview();
+              return;
+            }
+            upsertStage(groupStage(i, {
+              name: 'rendering',
+              label: '绘制 Canvas',
+              status: 'running',
+              detail: '生成浏览器长图预览',
+              resetElapsed: true,
             }));
             await waitForBrowserPaint();
             if (controller.signal.aborted) {
@@ -2942,18 +2977,19 @@ async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null
   await waitForBrowserPaint();
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   const png_data_url = canvasToPngDataUrl(canvas);
+  const pngSize = formatByteSize(pngDataUrlByteSize(png_data_url));
   notifyLocalProgress(onProgress, {
     name: 'encoding',
     label: '编码 PNG',
     status: 'done',
-    detail: formatByteSize(pngDataUrlByteSize(png_data_url)),
+    detail: pngSize,
   });
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   notifyLocalProgress(onProgress, {
     name: 'saving',
     label: '保存 PNG 文件',
     status: 'running',
-    detail: '写入 outputs/digests',
+    detail: [pngSize, '写入 outputs/digests'].filter(Boolean).join(' · '),
   });
   await waitForBrowserPaint();
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });

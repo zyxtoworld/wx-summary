@@ -1683,7 +1683,12 @@ async function runDigestSSE(req, res, body) {
     logInfo('digest_started', { account_id: accountId, group_id: groupId, group: groupName, since, until, preview_text: !!body.preview_text, batch_id: normalizeDigestBatchId(body.batch_id) });
 
     ensureActive();
-    sendStage({ name: 'fetching', label: '拉取消息', status: 'running' });
+    sendStage({
+      name: 'fetching',
+      label: '拉取消息',
+      status: 'running',
+      detail: '准备读取数据库密钥、账号目录和消息分片',
+    });
     const collection = await collectMessages({
       group_id: groupId,
       group_name: groupName,
@@ -1778,7 +1783,12 @@ async function runDigestSSE(req, res, body) {
     sendStage({ name: 'summarizing', label: 'AI 总结', status: 'done', detail: [digest.model, linkStatusDetail(digest.link_status)].filter(Boolean).join(' · ') });
     logInfo('digest_summarized', { group_id: groupId, digest_id: digest.digest_id, model: digest.model, topics: digest.topics?.length || 0, links: digest.links?.length || 0 });
 
-    sendStage({ name: 'rendering', label: body.preview_text ? '生成文本预览' : '渲染长图', status: 'running' });
+    sendStage({
+      name: 'rendering',
+      label: body.preview_text ? '生成文本预览' : '渲染长图',
+      status: 'running',
+      detail: body.preview_text ? '摘要已完成，发送到浏览器整理 Markdown' : '摘要已完成，发送到浏览器绘制 Canvas',
+    });
     sendEvent('digest', { ...digest, preview_text: !!body.preview_text });
     sendStage({ name: 'rendering', label: body.preview_text ? '生成文本预览' : '渲染长图', status: 'done' });
     sendEvent('done', { digest_id: digest.digest_id, preview_text: !!body.preview_text });
