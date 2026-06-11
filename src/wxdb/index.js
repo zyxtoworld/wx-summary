@@ -975,7 +975,7 @@ export async function listChatroomsFromWxDb({ account_id = '', raw_keys = [] } =
   }
 }
 
-export async function collectMessagesFromWxDb({ account_id = '', group_id, since, until, raw_keys = [], signal, onProgress = null } = {}) {
+export async function collectMessagesFromWxDb({ account_id = '', group_id, since, until, raw_keys = [], signal, onProgress = null, pre_media_filter = null } = {}) {
   throwIfAborted(signal);
   if (!group_id) return null;
   if (!since) {
@@ -1109,28 +1109,40 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
 
   out.sort((a, b) => a.timestamp - b.timestamp || a.sort_seq - b.sort_seq || a.local_id - b.local_id || String(a.id || '').localeCompare(String(b.id || '')));
   throwIfAborted(signal);
+  const scannedCount = out.length;
   notifyProgress(onProgress, {
     phase: 'fetch_senders',
     label: '拉取消息 · 补全发送人',
-    detail: `${out.length} 条消息 · ${readableShards}/${dbFiles.length} 个分片可读`,
+    detail: `${scannedCount} 条消息 · ${readableShards}/${dbFiles.length} 个分片可读`,
   });
   await hydrateSenderNames(account, raw_keys, out, group_id, signal);
   throwIfAborted(signal);
+  const messagesForOutput = typeof pre_media_filter === 'function' ? out.filter(pre_media_filter) : out;
+  if (messagesForOutput.length !== out.length) {
+    notifyProgress(onProgress, {
+      phase: 'fetch_prefilter',
+      label: '拉取消息 · 预筛选',
+      detail: `媒体解析前保留 ${messagesForOutput.length}/${out.length} 条`,
+    });
+  }
   notifyProgress(onProgress, {
     phase: 'fetch_media',
     label: '拉取消息 · 解析媒体',
-    detail: '定位本地图片、视频关键帧和语音元信息',
+    detail: messagesForOutput.length === out.length
+      ? '定位本地图片、视频关键帧和语音元信息'
+      : `仅解析筛选后 ${messagesForOutput.length} 条消息的媒体`,
   });
-  await enrichMessageMedia(account, raw_keys, out, signal);
+  await enrichMessageMedia(account, raw_keys, messagesForOutput, signal);
   throwIfAborted(signal);
-  const scannedCount = out.length;
   return {
     source: 'wxdb',
     account: redactAccount(account),
     group_id,
     table: tableName,
-    messages: out,
+    messages: messagesForOutput,
     scanned_message_count: scannedCount,
+    pre_filter_message_count: scannedCount,
+    pre_media_filtered_count: messagesForOutput.length,
     searched_shard_count: dbFiles.length,
     readable_shard_count: readableShards,
     matching_shard_count: matchingShards,
@@ -2943,17 +2955,24 @@ async function getImageKeyCandidatesForSamples(samples) {
   }
   if (!unique.length) return [];
   const sampleHash = crypto.createHash('sha256').update(Buffer.concat(unique)).digest('hex');
-  if (imageKeyCache.keys.length && Date.now() - imageKeyCache.at < IMAGE_KEY_CACHE_MS && unique.some(sample => imageKeyCache.keys.some(key => validateImageKeyCandidate(key, [sample])))) {
+  const cacheFresh = imageKeyCache.keys.length && Date.now() - imageKeyCache.at < IMAGE_KEY_CACHE_MS;
+  if (cacheFresh && imageKeyCache.sampleHash === sampleHash && samplesCoveredByImageKeys(unique, imageKeyCache.keys)) {
     return imageKeyCache.keys;
   }
+  if (cacheFresh && samplesCoveredByImageKeys(unique, imageKeyCache.keys)) return imageKeyCache.keys;
   // Message/image bytes always come from local DB/file copies; this memory scan only finds AES key material.
   try {
-    const keys = await scanImageKeysForValidationSamples(unique);
+    const keys = [...(cacheFresh ? imageKeyCache.keys : [])];
+    addUniqueStrings(keys, await scanImageKeysForValidationSamples(unique.filter(sample => !keys.some(key => validateImageKeyCandidate(key, [sample])))));
     imageKeyCache = { at: Date.now(), sampleHash, keys };
     return keys;
   } catch {
-    return [];
+    return cacheFresh ? imageKeyCache.keys : [];
   }
+}
+
+function samplesCoveredByImageKeys(samples, keys) {
+  return samples.every(sample => keys.some(key => validateImageKeyCandidate(key, [sample])));
 }
 
 async function scanImageKeysForValidationSamples(samples) {
@@ -2963,7 +2982,7 @@ async function scanImageKeysForValidationSamples(samples) {
   addUniqueStrings(keys, await probeImageKeys(samplePlan, false));
   if (!keys.length) addUniqueStrings(keys, await probeImageKeys(samplePlan, true));
 
-  for (const sample of samplePlan) {
+  for (const sample of samples) {
     if (keys.some(key => validateImageKeyCandidate(key, [sample]))) continue;
     addUniqueStrings(keys, await probeImageKeys([sample], false));
     if (keys.some(key => validateImageKeyCandidate(key, [sample]))) continue;

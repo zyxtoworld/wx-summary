@@ -129,16 +129,18 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         raw_keys: bundle.rawKeys,
         signal,
         onProgress,
+        pre_media_filter: createPreMediaFilter(filters),
       }),
     });
     throwIfAborted(signal);
     if (real) {
       const rawMessages = Array.isArray(real.messages) ? real.messages : [];
       const filterActive = filtersAreActive(filters);
+      const preFilterCount = Number(real.pre_filter_message_count || real.scanned_message_count || rawMessages.length) || rawMessages.length;
       notifyProgress(onProgress, {
         phase: 'fetch_filter',
         label: filterActive ? '拉取消息 · 应用筛选' : '拉取消息 · 整理消息',
-        detail: filterActive ? `筛选前 ${rawMessages.length} 条` : `读取到 ${rawMessages.length} 条`,
+        detail: filterActive ? `筛选前 ${preFilterCount} 条` : `读取到 ${rawMessages.length} 条`,
       });
       const filtered = applyFilters(rawMessages, filters).map(redactMessageSecrets);
       const mediaStatus = summarizeMediaStatus(filtered);
@@ -147,7 +149,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         label: '拉取消息 · 准备送入 AI',
         detail: [
           `${filtered.length} 条可总结消息`,
-          filterActive ? `筛选前 ${rawMessages.length} 条` : '',
+          filterActive ? `筛选前 ${preFilterCount} 条` : '',
           mediaStatus ? `${mediaStatus.attached}/${mediaStatus.media_messages} 条媒体已附加` : '',
         ].filter(Boolean).join(' · '),
       });
@@ -160,7 +162,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         until,
         messages: filtered,
         message_count: filtered.length,
-        pre_filter_message_count: rawMessages.length,
+        pre_filter_message_count: preFilterCount,
         scanned_message_count: real.scanned_message_count,
         table: real.table || '',
         searched_shard_count: real.searched_shard_count,
@@ -170,7 +172,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         truncated: !!real.truncated,
         media_status: mediaStatus,
         filter_active: filterActive,
-        no_matching_filters: filterActive && rawMessages.length > 0 && filtered.length === 0,
+        no_matching_filters: filterActive && preFilterCount > 0 && filtered.length === 0,
         below_minimum: Number(min_messages || 0) > 0 && filtered.length < Number(min_messages || 0),
       };
     }
@@ -180,6 +182,18 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
     const msg = e?.message ? `读取本机微信数据库失败：${e.message}` : '读取本机微信数据库失败。';
     throw Object.assign(new Error(msg), { status: e?.status || 502 });
   }
+}
+
+function createPreMediaFilter(filters = {}) {
+  const senders = normalizeFilterTerms(filters.senders || []);
+  const excluded = new Set(filters.exclude_types || filters.excludeTypes || []);
+  if (!senders.length && !excluded.size) return null;
+  return message => {
+    if (excluded.has(message?.type)) return false;
+    if (!senders.length) return true;
+    const sender = normalizeSearchText(message?.sender);
+    return senders.some(term => sender === term || sender.includes(term));
+  };
 }
 
 function validateMessageTimeRange(since, until) {
@@ -485,6 +499,7 @@ function uniqueStrings(items) {
 export const __collectorInternals = {
   applyFilters,
   clearDbKeyRuntimeCache,
+  createPreMediaFilter,
   dbRawKeyCandidateBundle,
   dbRawKeyCandidates,
   messageSearchText,
