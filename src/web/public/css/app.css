@@ -481,6 +481,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 }
 .chip .x { cursor: pointer; color: var(--muted); flex: 0 0 auto; }
 .chip .x:hover { color: var(--danger); }
+.chip .x.disabled { cursor: not-allowed; opacity: 0.5; }
+.chip .x.disabled:hover { color: var(--muted); }
 
 .override-editor {
   flex: 1;

@@ -959,6 +959,7 @@ async function renderDigest() {
     const name = box.dataset.name;
     const inp = box.querySelector('input');
     function removeChip(span, value) {
+      if (_state_digest.generating) return;
       _state_digest.filters[name] = _state_digest.filters[name].filter(x => x !== value);
       span.remove();
     }
@@ -974,6 +975,7 @@ async function renderDigest() {
       box.insertBefore(span, inp);
     }
     function addChip(v, { syncState = true } = {}) {
+      if (_state_digest.generating) return;
       v = v.trim();
       if (!v) return;
       if (_state_digest.filters[name].includes(v)) return;
@@ -982,6 +984,7 @@ async function renderDigest() {
     }
     (_state_digest.filters[name] || []).forEach(v => renderChip(v));
     box._commitPendingChip = () => {
+      if (_state_digest.generating) return;
       const value = inp.value.trim();
       if (!value) return;
       addChip(value);
@@ -1004,11 +1007,13 @@ async function renderDigest() {
   // 排除类型
   document.querySelectorAll('input[name="ex"]').forEach(cb => {
     cb.addEventListener('change', () => {
+      if (_state_digest.generating) return;
       if (cb.checked) _state_digest.filters.excludeTypes.add(cb.value);
       else _state_digest.filters.excludeTypes.delete(cb.value);
     });
   });
   document.getElementById('min-messages')?.addEventListener('change', e => {
+    if (_state_digest.generating) return;
     _state_digest.minMessages = Math.max(1, parseInt(e.target.value || '5', 10) || 5);
     e.target.value = _state_digest.minMessages;
   });
@@ -1031,18 +1036,25 @@ async function renderDigest() {
         drawDigestCanvas(_state_digest.lastDigest);
       },
       onSave: async selection => {
+        const previousSelection = currentDigestRenderSelection();
         applyDigestRenderSelection(selection);
         drawDigestCanvas(_state_digest.lastDigest);
         if (!_state_digest.lastSavedItem?.digest_id) return { previewOnly: true };
-        const r = await api('/api/rerender-history', {
-          method: 'POST',
-          body: {
-            digest_id: _state_digest.lastSavedItem.digest_id,
-            render: digestRenderPayload(selection),
-          },
-        });
-        _state_digest.lastSavedItem = r.item || _state_digest.lastSavedItem;
-        return r;
+        try {
+          const r = await api('/api/rerender-history', {
+            method: 'POST',
+            body: {
+              digest_id: _state_digest.lastSavedItem.digest_id,
+              render: digestRenderPayload(selection),
+            },
+          });
+          _state_digest.lastSavedItem = r.item || _state_digest.lastSavedItem;
+          return r;
+        } catch (err) {
+          applyDigestRenderSelection(previousSelection);
+          drawDigestCanvas(_state_digest.lastDigest);
+          throw err;
+        }
       },
     });
   });
@@ -1190,6 +1202,19 @@ function digestRenderPayload(selection = currentDigestRenderSelection()) {
     theme,
     font_size: normalizeDigestFontSize(selection.fontsize),
     accent_color: digestAccentColor(selection.accent, theme === 'dark'),
+  };
+}
+
+function currentDigestBatchSnapshot() {
+  const minMessagesInput = document.getElementById('min-messages');
+  return {
+    filters: {
+      senders: [...(_state_digest.filters.senders || [])],
+      keywords: [...(_state_digest.filters.keywords || [])],
+      exclude_types: [...(_state_digest.filters.excludeTypes || [])],
+    },
+    min_messages: Math.max(1, parseInt(minMessagesInput?.value || String(_state_digest.minMessages || 5), 10) || 5),
+    render: currentDigestRenderSelection(),
   };
 }
 
@@ -1469,6 +1494,23 @@ function updateDigestSelectionLock() {
   document.querySelectorAll('#group-list input[type="checkbox"]').forEach(input => {
     input.disabled = locked;
   });
+  document.querySelectorAll([
+    '#quick-range button',
+    '#custom-range input',
+    '.chip-input input',
+    '.chip-input .x',
+    'input[name="ex"]',
+    '#min-messages',
+    'input[name="theme"]',
+    'input[name="fontsize"]',
+  ].join(',')).forEach(control => {
+    if (control.classList?.contains('x')) {
+      control.classList.toggle('disabled', locked);
+      control.setAttribute('aria-disabled', locked ? 'true' : 'false');
+    } else {
+      control.disabled = locked;
+    }
+  });
   const whitelistButton = document.getElementById('select-whitelist');
   if (whitelistButton) {
     const hasWhitelist = whitelistButton.dataset.hasWhitelist === '1';
@@ -1515,6 +1557,7 @@ async function generateDigest({ previewText = false } = {}) {
   const batchId = createDigestBatchId();
   _state_digest.abortController = controller;
   _state_digest.activeBatchId = batchId;
+  const batchSnapshot = currentDigestBatchSnapshot();
   const accountId = selectedAccountId();
   const generateButton = document.getElementById('btn-generate');
   const previewButton = document.getElementById('btn-preview-text');
@@ -1750,6 +1793,7 @@ async function generateDigest({ previewText = false } = {}) {
           until,
           batchId,
           previewText,
+          batchSnapshot,
           signal: controller.signal,
           onStage: stage => upsertStage({
             ...groupStage(i, stage),
@@ -1770,11 +1814,11 @@ async function generateDigest({ previewText = false } = {}) {
               revealButton.disabled = true;
               revealButton.title = '保存后可用';
             }
-            const canvas = drawDigestCanvas(digest);
+            const canvas = drawDigestCanvas(digest, null, batchSnapshot.render);
             if (controller.signal.aborted) return;
             upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
             try {
-              const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal, batchId });
+              const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal, batchId, renderSelection: batchSnapshot.render });
               if (controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
               digest.file_path = saved.item.file_path;
@@ -2010,7 +2054,7 @@ async function rememberRecentGroups(targets, allGroups, accountId = selectedAcco
   await api('/api/settings', { method: 'PUT', signal, body: { groups: { recent: nextRecentGroups } } });
 }
 
-async function runSingleDigestRequest({ target, accountId, since, until, batchId, previewText, signal, onStage }) {
+async function runSingleDigestRequest({ target, accountId, since, until, batchId, previewText, batchSnapshot = currentDigestBatchSnapshot(), signal, onStage }) {
   let digest = null;
   let modelError = null;
   const resp = await fetch('/api/digest', {
@@ -2025,12 +2069,8 @@ async function runSingleDigestRequest({ target, accountId, since, until, batchId
       since,
       until,
       preview_text: previewText,
-      filters: {
-        senders: _state_digest.filters.senders,
-        keywords: _state_digest.filters.keywords,
-        exclude_types: [..._state_digest.filters.excludeTypes],
-      },
-      min_messages: parseInt(document.getElementById('min-messages').value || '5', 10),
+      filters: batchSnapshot.filters || {},
+      min_messages: batchSnapshot.min_messages,
     }),
   });
   if (!resp.ok) throw new Error(parseHttpErrorMessage(await resp.text(), resp.status));
@@ -2247,17 +2287,17 @@ function isStrongTodoForRender(todo = {}) {
 }
 
 // ---------- Canvas 长图渲染（前端预览，1080×N） ----------
-function drawDigestCanvas(d, targetCanvas = null) {
+function drawDigestCanvas(d, targetCanvas = null, renderSelection = currentDigestRenderSelection()) {
   const W = 1080;
   const padding = 16;
   const cardInset = 16;
   const bodyIndent = 28;
   const metaIndent = 30;
-  const renderTheme = normalizeDigestTheme(_state_digest.theme);
+  const renderTheme = normalizeDigestTheme(renderSelection.theme);
   const isDark = renderTheme === 'dark' || (renderTheme === 'auto' && (document.body.classList.contains('is-dark') || document.documentElement.dataset.theme === 'dark'));
-  const fontScale = _state_digest.fontsize === 'large' ? 1.14 : 1;
+  const fontScale = normalizeDigestFontSize(renderSelection.fontsize) === 'large' ? 1.14 : 1;
   const s = value => Math.round(value * fontScale);
-  const primary = digestAccentColor(_state_digest.accent, isDark);
+  const primary = digestAccentColor(renderSelection.accent, isDark);
   const COLORS = isDark
     ? { bg: '#0E0E10', card: '#1A1A1D', border: '#2A2A2E', hairline: '#34343A', text: '#EDEDED', muted: '#9CA3AF', meta: '#D1D5DB', primary, warnBg: '#3F2D00', warnFg: '#FDE68A', dangerBg: '#3F1414', dangerFg: '#FCA5A5' }
     : { bg: '#FAFAFA', card: '#FFFFFF', border: '#E5E5E5', hairline: '#E5E7EB', text: '#111111', muted: '#6B7280', meta: '#374151', primary, warnBg: '#FEF3C7', warnFg: '#92400E', dangerBg: '#FEE2E2', dangerFg: '#991B1B' };
@@ -2539,12 +2579,12 @@ function drawDigestCanvas(d, targetCanvas = null) {
   return canvas;
 }
 
-async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null, batchId = '' } = {}) {
+async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null, batchId = '', renderSelection = currentDigestRenderSelection() } = {}) {
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   const canvas = renderedCanvas || document.getElementById('digest-canvas') || drawDigestCanvas(digest);
   const png_data_url = canvas.toDataURL('image/png');
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
-  return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload() }, png_data_url } });
+  return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload(renderSelection) }, png_data_url } });
 }
 
 function renderTextPreview(d) {
@@ -2892,6 +2932,23 @@ function historyItemCacheBust(item = {}) {
   return item.rerendered_at || item.created_at || item.file_path || item.digest_id || '';
 }
 
+function historyDownloadFilename(item = {}) {
+  const parts = [
+    item.group || '摘要',
+    item.since,
+    item.until,
+  ]
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+    .join('__')
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .slice(0, 140)
+    .replace(/[._\s-]+$/g, '');
+  return `${parts || 'wx-summary'}_${item.digest_id || Date.now()}.png`;
+}
+
 function historyArtifactState(item = {}) {
   return {
     fileMissing: item.file_exists === false,
@@ -2989,7 +3046,7 @@ function showHistoryModal(item) {
         ${fileMissing ? '' : `<img data-zoomable src="${imageUrl}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`}
       </div>
       <div class="preview-actions">
-        <a class="btn" data-download href="${imageUrl}" download>⬇ 下载 PNG</a>
+        <a class="btn" data-download href="${imageUrl}" download="${escapeHtml(historyDownloadFilename(item))}">⬇ 下载 PNG</a>
         <button class="btn" data-copy>📋 复制到剪贴板</button>
         <button class="btn" data-reveal>📁 在文件夹中显示</button>
         <button class="btn btn-ghost" data-rerender ${canRerender ? '' : `disabled title="${escapeHtml(rerenderTitle)}"`}>🔄 重新渲染</button>
@@ -3010,7 +3067,7 @@ function showHistoryModal(item) {
     revealButton.disabled = false;
     downloadButton.classList.remove('disabled');
     downloadButton.href = historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now());
-    downloadButton.setAttribute('download', '');
+    downloadButton.setAttribute('download', historyDownloadFilename(item));
   };
   const disableImageActions = () => {
     copyButton.disabled = true;
@@ -3107,7 +3164,7 @@ function showHistoryModal(item) {
           watchHistoryImage();
           if (image) image.src = freshUrl;
           downloadButton.href = freshUrl;
-          downloadButton.setAttribute('download', '');
+          downloadButton.setAttribute('download', historyDownloadFilename(item));
           downloadButton.classList.remove('disabled');
           restoreImageActions();
           modalBody.classList.remove('has-note');
