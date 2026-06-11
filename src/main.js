@@ -839,11 +839,51 @@ function hasToken(req, parsedUrl) {
   return req.headers['x-wx-token'] === SESSION_TOKEN || parsedUrl.searchParams.get('token') === SESSION_TOKEN;
 }
 
+function requestHostInfo(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(`http://${raw}`);
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+    const port = parsed.port || '';
+    return { hostname, port };
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedLoopbackHost(value = '') {
+  const host = requestHostInfo(value);
+  if (!host) return false;
+  const allowedHosts = new Set(['127.0.0.1', 'localhost', '::1']);
+  const allowedPort = String(ACTIVE_PORT || DEFAULT_PORT);
+  return allowedHosts.has(host.hostname) && (!host.port || host.port === allowedPort);
+}
+
+function isAllowedLoopbackOrigin(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return true;
+  try {
+    const origin = new URL(raw);
+    if (origin.protocol !== 'http:') return false;
+    return isAllowedLoopbackHost(origin.host);
+  } catch {
+    return false;
+  }
+}
+
+function assertAllowedRequestHost(req) {
+  if (isAllowedLoopbackHost(req.headers.host || '')) return;
+  const err = new Error('invalid host');
+  err.status = 403;
+  throw err;
+}
+
 function assertJsonMutationRequest(req) {
   const type = String(req.headers['content-type'] || '').toLowerCase();
   if (!type.includes('application/json')) throw Object.assign(new Error('Content-Type must be application/json'), { status: 415 });
   const origin = req.headers.origin;
-  if (origin && origin !== `http://${req.headers.host}`) {
+  if (origin && !isAllowedLoopbackOrigin(origin)) {
     throw Object.assign(new Error('invalid origin'), { status: 403 });
   }
 }
@@ -1116,7 +1156,6 @@ function publicOutputItem(item = {}) {
     'since',
     'until',
     'relative_path',
-    'digest_relative_path',
     'model',
     'message_count',
     'created_at',
@@ -2089,6 +2128,12 @@ async function runDigestSSE(req, res, body, requestId = null) {
 }
 
 function handle(req, res) {
+  try {
+    assertAllowedRequestHost(req);
+  } catch (e) {
+    send(res, e?.status || 403, sanitizeText(e?.message || 'invalid host'));
+    return;
+  }
   const parsedUrl = new URL(req.url, `http://${req.headers.host || HOST}`);
   if (parsedUrl.pathname === '/') {
     serveIndex(res).catch(e => send(res, 500, sanitizeText(e?.message || String(e))));

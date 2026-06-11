@@ -342,9 +342,9 @@ export function normalizeSettings(settings) {
   s.link_preview.max_related_bytes = finiteInteger(s.link_preview.max_related_bytes, 98304, 8192, 1024 * 1024);
   s.link_preview.max_related_chars = finiteInteger(s.link_preview.max_related_chars, 800, 200, 5000);
   s.groups = s.groups && typeof s.groups === 'object' ? s.groups : {};
-  s.groups.whitelist = normalizeGroupRefs(s.groups.whitelist, 500);
+  s.groups.whitelist = normalizeGroupRefs(s.groups.whitelist, 500, { allowLegacyStrings: true });
   s.groups.overrides = Array.isArray(s.groups.overrides) ? s.groups.overrides : [];
-  s.groups.recent = normalizeGroupRefs(s.groups.recent, 5);
+  s.groups.recent = normalizeGroupRefs(s.groups.recent, 5, { allowLegacyStrings: false });
   s.scheduler = s.scheduler && typeof s.scheduler === 'object' ? s.scheduler : {};
   s.scheduler.enabled = !!s.scheduler.enabled;
   s.scheduler.default_interval = normalizeDurationText(s.scheduler.default_interval, '30m', { max_ms: MAX_SCHEDULER_INTERVAL_MS });
@@ -398,12 +398,12 @@ function normalizeAvailableModels(value, limit = 1000) {
   return out;
 }
 
-function normalizeGroupRefs(value, limit) {
+function normalizeGroupRefs(value, limit, { allowLegacyStrings = true } = {}) {
   if (!Array.isArray(value)) return [];
   const out = [];
   const seen = new Set();
   for (const item of value) {
-    const ref = normalizeGroupRef(item);
+    const ref = normalizeGroupRef(item, { allowLegacyStrings });
     if (!ref) continue;
     const key = typeof ref === 'string'
       ? `legacy:${ref}`
@@ -416,10 +416,11 @@ function normalizeGroupRefs(value, limit) {
   return out;
 }
 
-function normalizeGroupRef(item) {
+function normalizeGroupRef(item, { allowLegacyStrings = true } = {}) {
   if (typeof item === 'string') {
     const legacy = item.trim();
-    return legacy || null;
+    if (!allowLegacyStrings || !legacy || /^\[object\s+Object\]$/i.test(legacy)) return null;
+    return legacy;
   }
   if (!plainObject(item)) return null;
   const accountId = String(item.account_id || item.account || '').trim();

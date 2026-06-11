@@ -3740,8 +3740,6 @@ function showHistoryModal(item) {
       </div>
     </div>`;
   document.body.appendChild(modal);
-  modal.querySelector('[data-close]').addEventListener('click', () => modal.remove());
-  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
   const status = modal.querySelector('[data-status]');
   let image = modal.querySelector('[data-zoomable]');
   const modalBody = modal.querySelector('.modal-body');
@@ -3750,6 +3748,12 @@ function showHistoryModal(item) {
   const copyButton = modal.querySelector('[data-copy]');
   const revealButton = modal.querySelector('[data-reveal]');
   const rerenderButton = modal.querySelector('[data-rerender]');
+  const closeModal = () => {
+    revokeObjectUrl(image?.dataset?.objectUrl);
+    modal.remove();
+  };
+  modal.querySelector('[data-close]').addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
   const restoreImageActions = () => {
     delete copyButton.dataset.keepDisabled;
     delete revealButton.dataset.keepDisabled;
