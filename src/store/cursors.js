@@ -13,6 +13,7 @@ export async function loadCursors({ file = CURSORS_FILE } = {}) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw Object.assign(new Error('cursors.json must contain a JSON object'), { code: 'CURSORS_INVALID_SHAPE' });
     }
+    validateCursorStore(raw);
     return raw;
   } catch (e) {
     if (e?.code === 'ENOENT') return {};
@@ -110,6 +111,36 @@ function normalizeGroupId(value) {
 
 function emptyCursorState() {
   return { last_seq: '', seen: [], updated_at: '', window_since: '', window_until: '', message_count: 0 };
+}
+
+function validateCursorStore(store = {}) {
+  for (const [key, value] of Object.entries(store)) {
+    if (!normalizeGroupId(key)) {
+      throw Object.assign(new Error('cursor entry key must not be empty'), { code: 'CURSORS_INVALID_ENTRY', cursor_key: key });
+    }
+    validateCursorEntry(key, value);
+  }
+}
+
+function validateCursorEntry(key, value) {
+  if (typeof value === 'string' || typeof value === 'number') {
+    if (!normalizeCursorValue(value)) {
+      throw Object.assign(new Error(`cursor entry ${key} has an empty last_seq`), { code: 'CURSORS_INVALID_ENTRY', cursor_key: key });
+    }
+    return;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw Object.assign(new Error(`cursor entry ${key} must be a cursor string or object`), { code: 'CURSORS_INVALID_ENTRY', cursor_key: key });
+  }
+  const lastSeq = normalizeCursorValue(value.last_seq || value.lastSeq || value.cursor || value.latest_cursor);
+  if (!lastSeq) {
+    throw Object.assign(new Error(`cursor entry ${key} is missing last_seq`), { code: 'CURSORS_INVALID_ENTRY', cursor_key: key });
+  }
+  for (const listKey of ['seen', 'message_ids', 'messages']) {
+    if (Object.hasOwn(value, listKey) && value[listKey] != null && !Array.isArray(value[listKey])) {
+      throw Object.assign(new Error(`cursor entry ${key}.${listKey} must be an array`), { code: 'CURSORS_INVALID_ENTRY', cursor_key: key });
+    }
+  }
 }
 
 function normalizeCursorState(value) {

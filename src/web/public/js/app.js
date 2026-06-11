@@ -88,7 +88,6 @@ async function route() {
   const rawHash = location.hash.replace(/^#/, '') || '/digest';
   const hash = rawHash.split('?')[0] || '/digest';
   const fn = routes[hash] || renderDigest;
-  if (fn !== renderDigest) abortActiveDigest('切换页面');
   closeTransientOverlays();
   // 设置导航 active
   document.querySelectorAll('.nav a').forEach(a => {
@@ -1516,7 +1515,6 @@ async function generateDigest({ previewText = false } = {}) {
   const batchId = createDigestBatchId();
   _state_digest.abortController = controller;
   _state_digest.activeBatchId = batchId;
-  const digestRouteSeq = _routeSeq;
   const accountId = selectedAccountId();
   const generateButton = document.getElementById('btn-generate');
   const previewButton = document.getElementById('btn-preview-text');
@@ -1573,7 +1571,7 @@ async function generateDigest({ previewText = false } = {}) {
   try {
     const cache = getDigestGroupCache(accountId);
     groups = digestGroupCacheHasData(cache) ? cache.groups : await fetchDigestGroups(accountId, { force: true });
-    if (digestRouteSeq !== _routeSeq || controller.signal.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+    if (controller.signal.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   } catch (e) {
     const abortReason = _state_digest.abortReason;
     if (_state_digest.abortController === controller) {
@@ -1586,7 +1584,6 @@ async function generateDigest({ previewText = false } = {}) {
     }
     if (generateButton) generateButton.disabled = false;
     if (previewButton) previewButton.disabled = false;
-    if (digestRouteSeq !== _routeSeq) return;
     if ($progress && $stages && $fill) {
       $progress.classList.remove('hidden');
       $fill.style.width = '0%';
@@ -1743,7 +1740,7 @@ async function generateDigest({ previewText = false } = {}) {
     });
 
     await runClientPool(targets, prepareConcurrency, async (target, i) => {
-      if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
+      if (controller.signal.aborted) return;
       upsertStage(groupStage(i, { name: 'fetching', label: '拉取消息/解析媒体', status: 'running' }));
       try {
         const digest = await runSingleDigestRequest({
@@ -1763,7 +1760,7 @@ async function generateDigest({ previewText = false } = {}) {
           renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
         } else {
           await enqueueRender(async () => {
-            if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
+            if (controller.signal.aborted) return;
             const livePreviewCard = document.getElementById('preview-card');
             if (livePreviewCard) livePreviewCard.classList.remove('hidden');
             _state_digest.lastDigest = digest;
@@ -1774,11 +1771,11 @@ async function generateDigest({ previewText = false } = {}) {
               revealButton.title = '保存后可用';
             }
             const canvas = drawDigestCanvas(digest);
-            if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
+            if (controller.signal.aborted) return;
             upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
             try {
               const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal, batchId });
-              if (digestRouteSeq !== _routeSeq || controller.signal.aborted) return;
+              if (controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
               digest.file_path = saved.item.file_path;
               if (revealButton) {
@@ -1888,7 +1885,7 @@ async function runClientPool(items, concurrency, worker, signal = null) {
 }
 
 function scrollDigestWorkIntoView(element) {
-  if (!element) return;
+  if (!element || !element.isConnected) return;
   requestAnimationFrame(() => {
     try {
       element.scrollIntoView({ behavior: 'smooth', block: 'start' });

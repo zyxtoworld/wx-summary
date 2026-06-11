@@ -232,14 +232,11 @@ async function runGroupDigest({ settings, account, group, window }) {
   const cursorKey = groupCursorKey(account, group);
   const cursorState = await getGroupCursorState(cursorKey);
   const previousCursor = cursorState.last_seq;
-  const previousSeen = new Set(cursorState.seen || []);
   const windowMessageCount = collection.message_count || 0;
   const windowMessages = Array.isArray(collection.messages) ? collection.messages : [];
   const latestWindowCursor = latestMessageCursor(windowMessages);
-  if (previousSeen.size || previousCursor) {
-    const newMessages = previousSeen.size
-      ? messagesNotSeen(windowMessages, previousSeen)
-      : messagesAfterCursor(windowMessages, previousCursor);
+  if ((cursorState.seen || []).length || previousCursor) {
+    const newMessages = newMessagesForCursorState(windowMessages, cursorState);
     if (!newMessages.length && windowMessageCount) {
       await setGroupCursorState(cursorKey, schedulerCursorState({
         cursor: latestWindowCursor || previousCursor,
@@ -459,6 +456,16 @@ function messagesNotSeen(messages = [], seen = new Set()) {
   return (Array.isArray(messages) ? messages : []).filter(message => !seen.has(messageIdentity(message)));
 }
 
+function newMessagesForCursorState(messages = [], cursorState = {}) {
+  const previousCursor = cursorState.last_seq || '';
+  const previousSeen = new Set(Array.isArray(cursorState.seen) ? cursorState.seen : []);
+  if (!previousSeen.size) return messagesAfterCursor(messages, previousCursor);
+  if (previousSeen.size >= MAX_CURSOR_SEEN_MESSAGES && previousCursor) {
+    return messagesNotSeen(messagesAfterCursor(messages, previousCursor), previousSeen);
+  }
+  return messagesNotSeen(messages, previousSeen);
+}
+
 function schedulerCursorState({ cursor, messages = [], window = {} } = {}) {
   return {
     last_seq: cursor || latestMessageCursor(messages),
@@ -538,6 +545,7 @@ export const __schedulerInternals = {
   latestMessageCursor,
   messagesAfterCursor,
   messagesNotSeen,
+  newMessagesForCursorState,
   messageIdentity,
   schedulerCursorState,
   accountIdentity,
