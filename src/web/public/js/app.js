@@ -1651,6 +1651,8 @@ function resetDigestProgressSnapshot({ previewText = false } = {}) {
     logText: '',
     logStatusClass: 'status',
     logStatusText: '',
+    currentClass: '',
+    currentText: '',
   };
   paintDigestProgressSnapshot();
 }
@@ -1680,6 +1682,7 @@ function setDigestProgressLogPrompt(summary = '') {
 function paintDigestProgressSnapshot() {
   const snapshot = _state_digest.progress;
   const card = document.getElementById('progress-card');
+  const current = document.getElementById('progress-current');
   const stages = document.getElementById('progress-stages');
   const fill = document.getElementById('progress-fill');
   const tools = document.getElementById('progress-log-tools');
@@ -1694,6 +1697,13 @@ function paintDigestProgressSnapshot() {
   }
   card.classList.remove('hidden');
   fill.style.width = snapshot.fill || '0%';
+  if (current) {
+    const currentState = digestProgressCurrentState(snapshot);
+    current.className = ['progress-current', currentState.className, currentState.text ? '' : 'hidden'].filter(Boolean).join(' ');
+    current.textContent = currentState.text;
+    snapshot.currentClass = currentState.className;
+    snapshot.currentText = currentState.text;
+  }
   stages.innerHTML = '';
   for (const stage of snapshot.stages || []) {
     const li = document.createElement('li');
@@ -1774,6 +1784,39 @@ function digestStageText(stage = {}) {
     ? formatDigestElapsedDetail(stage.baseDetail || '', stage.startedAt)
     : (stage.detail || '');
   return `${icon} ${stage.label || ''}${detail ? ' (' + detail + ')' : ''}`;
+}
+
+function digestProgressCurrentState(snapshot = {}) {
+  const stages = Array.isArray(snapshot.stages) ? snapshot.stages : [];
+  const running = [...stages].reverse().find(stage => stage.status === 'running');
+  if (running) {
+    return {
+      className: 'running',
+      text: `正在：${digestStageText(running).replace(/^⟳\s*/, '')}`,
+    };
+  }
+  const error = [...stages].reverse().find(stage => stage.status === 'error');
+  if (error) {
+    return {
+      className: 'error',
+      text: `失败：${digestStageText(error).replace(/^✗\s*/, '')}`,
+    };
+  }
+  const cancelled = [...stages].reverse().find(stage => stage.status === 'cancelled');
+  if (cancelled) {
+    return {
+      className: 'cancelled',
+      text: `已取消：${digestStageText(cancelled).replace(/^·\s*/, '')}`,
+    };
+  }
+  const lastDone = [...stages].reverse().find(stage => stage.status === 'done');
+  if (lastDone) {
+    return {
+      className: 'done',
+      text: `最近完成：${digestStageText(lastDone).replace(/^✓\s*/, '')}`,
+    };
+  }
+  return { className: '', text: '' };
 }
 
 function hideUncommittedDigestPreview() {
@@ -1920,7 +1963,7 @@ async function generateDigest({ previewText = false } = {}) {
   const stageSnapshots = new Map();
   const stagesOrder = previewText
     ? ['fetching', 'summarizing', 'received', 'text_inspect', 'text_merge', 'text_refresh']
-    : ['fetching', 'summarizing', 'received', 'render_queue', 'render_setup', 'render_measure', 'render_draw', 'encoding', 'saving'];
+    : ['fetching', 'summarizing', 'received', 'digest_inspect', 'render_queue', 'render_setup', 'render_measure', 'render_draw', 'encoding', 'saving'];
   function stripElapsedDetail(detail = '') {
     return stripDigestElapsedDetail(detail);
   }
@@ -2067,9 +2110,15 @@ async function generateDigest({ previewText = false } = {}) {
     const mapped = serverStageForClient(stage);
     if (!mapped) return null;
     if ((mapped.name === 'fetching' || mapped.name === 'summarizing') && mapped.status === 'running') {
+      const fallbackPhase = mapped.name === 'fetching' ? 'fetch_wait' : 'llm_wait';
+      const fallbackLabel = mapped.name === 'fetching' ? '拉取消息 · 等待本机数据库' : 'AI 总结 · 等待模型进度';
+      const phase = mapped.phase || fallbackPhase;
+      const label = mapped.label && !['拉取消息', 'AI 总结'].includes(mapped.label) ? mapped.label : fallbackLabel;
       return {
         ...mapped,
-        name: serverStageSubstepName(mapped),
+        phase,
+        label,
+        name: serverStageSubstepName({ ...mapped, phase }),
         stageName: mapped.name,
       };
     }
@@ -2198,6 +2247,26 @@ async function generateDigest({ previewText = false } = {}) {
             detail: previewCount < targets.length ? `已刷新 ${previewCount}/${targets.length}，继续等待其余群` : '预览已刷新，可导出 Markdown',
           }));
         } else {
+          const digestStats = [
+            digest.topics?.length ? `${digest.topics.length} 条主线` : '',
+            digest.links?.length ? `${digest.links.length} 个链接` : '',
+            digestQuotesForRender(digest).length ? `${digestQuotesForRender(digest).length} 条金句` : '',
+            digestTodosForRender(digest).length ? `${digestTodosForRender(digest).length} 个后续关注` : '',
+          ].filter(Boolean).join(' · ');
+          upsertStage(groupStage(i, {
+            name: 'digest_inspect',
+            label: '检查摘要结构',
+            status: 'running',
+            detail: digestStats || '核对标题、正文和数据概览',
+            resetElapsed: true,
+          }));
+          if (!(await waitForVisibleDigestProgress(controller.signal))) throw digestAbortError();
+          upsertStage(groupStage(i, {
+            name: 'digest_inspect',
+            label: '检查摘要结构',
+            status: 'done',
+            detail: digestStats || '摘要结构已就绪',
+          }));
           upsertStage(groupStage(i, {
             name: 'render_queue',
             label: '等待本地渲染队列',
@@ -2380,7 +2449,7 @@ async function generateDigest({ previewText = false } = {}) {
       setDigestProgressFill('100%');
       if (!failures.every(f => f.error === '已取消')) showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
     } else if (doneDigests.length === targets.length) {
-      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个群`, status: 'done' });
+      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `${previewText ? '文本预览' : '长图'}已完成 ${doneDigests.length} 个群`, status: 'done' });
       setDigestProgressFill('100%');
     }
   } catch (e) {
@@ -3152,10 +3221,17 @@ async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null
     name: 'saving',
     label: '保存 PNG 文件',
     status: 'running',
-    detail: [pngSize, '上传到本地服务', '写入历史记录'].filter(Boolean).join(' · '),
+    detail: [pngSize, '上传到本地服务', '等待写入历史记录'].filter(Boolean).join(' · '),
   });
   if (!(await waitForVisibleDigestProgress(signal))) throw digestAbortError();
-  return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload(renderSelection) }, png_data_url } });
+  const saved = await api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload(renderSelection) }, png_data_url } });
+  notifyLocalProgress(onProgress, {
+    name: 'saving',
+    label: '保存 PNG 文件',
+    status: 'done',
+    detail: saved?.item?.relative_path || '历史记录已更新',
+  });
+  return saved;
 }
 
 function renderTextPreview(d) {

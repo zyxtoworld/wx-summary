@@ -1030,6 +1030,11 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
       opened = await openCopiedSqlCipherDb(account, file.path, raw_keys);
       readableShards++;
       throwIfAborted(signal);
+      notifyProgress(onProgress, {
+        phase: 'fetch_shard_opened',
+        label: '拉取消息 · 打开消息分片',
+        detail: `${shardIndex}/${dbFiles.length} 已打开，检查会话表`,
+      });
       const exists = opened.db.prepare('select name from sqlite_master where type = ? and name = ?').get(['table', tableName]);
       if (!exists) continue;
       matchingShards++;
@@ -1065,6 +1070,13 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
       const senderIds = [...new Set(rows.map(r => Number(r.real_sender_id || 0)).filter(Boolean))];
       const senderMap = new Map();
       const stmt = opened.db.prepare('select rowid, user_name from Name2Id where rowid = ?');
+      if (senderIds.length) {
+        notifyProgress(onProgress, {
+          phase: 'fetch_sender_ids',
+          label: '拉取消息 · 解析发送人索引',
+          detail: `${file.name} 需要补全 ${senderIds.length} 个发送人`,
+        });
+      }
       for (const id of senderIds) {
         throwIfAborted(signal);
         const sender = stmt.get([id]);
@@ -1129,6 +1141,11 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
   });
   await hydrateSenderNames(account, raw_keys, out, group_id, signal);
   throwIfAborted(signal);
+  notifyProgress(onProgress, {
+    phase: 'fetch_senders_done',
+    label: '拉取消息 · 发送人已补全',
+    detail: `${out.length} 条消息已按时间排序`,
+  });
   const messagesForOutput = typeof pre_media_filter === 'function' ? out.filter(pre_media_filter) : out;
   if (messagesForOutput.length !== out.length) {
     notifyProgress(onProgress, {
@@ -1146,6 +1163,11 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
   });
   await enrichMessageMedia(account, raw_keys, messagesForOutput, signal);
   throwIfAborted(signal);
+  notifyProgress(onProgress, {
+    phase: 'fetch_media_done',
+    label: '拉取消息 · 媒体解析完成',
+    detail: `${messagesForOutput.length} 条消息可进入筛选和总结`,
+  });
   return {
     source: 'wxdb',
     account: redactAccount(account),

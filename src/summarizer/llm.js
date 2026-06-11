@@ -343,6 +343,14 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
   const linkPreviewStatusByUrl = enriched.__link_preview_by_url || new Map();
   const linkPolicy = { allow_private_networks: linkPreviewAllowsPrivateNetworks(settings.link_preview) };
   throwIfAborted(signal);
+  notifyProgress(onProgress, {
+    phase: 'prepare_context',
+    label: 'AI 总结 · 整理上下文',
+    detail: [
+      `${enriched.length} 条消息`,
+      linkPreviewStatus ? linkPreviewProgressDetail(linkPreviewStatus) : '',
+    ].filter(Boolean).join(' · '),
+  });
   const contextualMessages = attachGlobalNearbyContexts(enriched);
   const chunkableMessages = prepareMessagesForChunking(contextualMessages, llm);
   let raw;
@@ -401,9 +409,14 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     signal,
     onProgress,
   });
+  notifyProgress(onProgress, {
+    phase: 'llm_quality',
+    label: 'AI 总结 · 成稿质检',
+    detail: '检查空摘要、兜底痕迹、语言和链接字段',
+  });
   assertDigestPublishable(raw, { messageCount: sourceMessages.length, ...linkPolicy });
 
-  return normalizeDigest(raw, {
+  const digest = normalizeDigest(raw, {
     groupName,
     since,
     until,
@@ -414,6 +427,17 @@ export async function summarizeDigest({ settings, groupName, since, until, messa
     linkPreviewStatusByUrl,
     ...linkPolicy,
   });
+  notifyProgress(onProgress, {
+    phase: 'llm_ready',
+    label: 'AI 总结 · 摘要结构已完成',
+    detail: [
+      `${digest.topics?.length || 0} 条主线`,
+      `${digest.links?.length || 0} 个链接`,
+      digest.quotes?.length ? `${digest.quotes.length} 条金句` : '',
+      digest.todos?.length ? `${digest.todos.length} 个后续关注` : '',
+    ].filter(Boolean).join(' · '),
+  });
+  return digest;
 }
 
 async function summarizeMessageChunks({ settings, model, groupName, since, until, chunks, signal, onProgress }) {

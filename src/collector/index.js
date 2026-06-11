@@ -381,7 +381,12 @@ async function runWithDbKeys({ dbName, action, initialKeyBundle = null, onProgre
     label: '拉取消息 · 校验数据库密钥',
     detail: `${dbName || '数据库'}：先试缓存和手动密钥`,
   });
-  const quick = initialKeyBundle || await dbRawKeyCandidateBundle({ memoryScan: false });
+  const quick = initialKeyBundle || await dbRawKeyCandidateBundle({ memoryScan: false, onProgress });
+  notifyProgress(onProgress, {
+    phase: 'fetch_key_verify',
+    label: '拉取消息 · 验证数据库密钥',
+    detail: keyCandidateProgressDetail(quick.diagnostics, dbName),
+  });
   try {
     return await action(quick);
   } catch (e) {
@@ -393,7 +398,12 @@ async function runWithDbKeys({ dbName, action, initialKeyBundle = null, onProgre
       label: '拉取消息 · 扫描数据库密钥',
       detail: `${dbName || '数据库'}：缓存未命中，开始只读扫描候选密钥`,
     });
-    const full = await dbRawKeyCandidateBundle({ memoryScan: true });
+    const full = await dbRawKeyCandidateBundle({ memoryScan: true, onProgress });
+    notifyProgress(onProgress, {
+      phase: 'fetch_key_verify_full',
+      label: '拉取消息 · 验证扫描候选',
+      detail: keyCandidateProgressDetail(full.diagnostics, dbName),
+    });
     try {
       return await action(full);
     } catch (fallbackError) {
@@ -402,17 +412,47 @@ async function runWithDbKeys({ dbName, action, initialKeyBundle = null, onProgre
   }
 }
 
+function keyCandidateProgressDetail(diagnostics = {}, dbName = '') {
+  const d = diagnostics || {};
+  return [
+    dbName || '数据库',
+    d.cache_hit ? '命中候选缓存' : '',
+    `候选 ${Number(d.total_candidate_count || 0) || 0} 条`,
+    Number(d.manual_key_count || 0) ? `手动 ${Number(d.manual_key_count || 0)}` : '',
+    Number(d.verified_key_count || 0) ? `已验证 ${Number(d.verified_key_count || 0)}` : '',
+    Number(d.local_candidate_count || 0) ? `本地 ${Number(d.local_candidate_count || 0)}` : '',
+    d.memory_scan_attempted ? `内存 ${Number(d.memory_candidate_count || 0) || 0}` : '',
+  ].filter(Boolean).join(' · ');
+}
+
 async function dbRawKeyCandidates() {
   return (await dbRawKeyCandidateBundle()).rawKeys;
 }
 
-async function dbRawKeyCandidateBundle({ memoryScan = true } = {}) {
+async function dbRawKeyCandidateBundle({ memoryScan = true, onProgress = null } = {}) {
   const settings = await loadSettings({ includeSecrets: true }).catch(() => null);
   const manual = splitManualKeys(settings?.wechat?.manual_key);
   const shouldScanLocal = !manual.length || memoryScan;
+  notifyProgress(onProgress, {
+    phase: shouldScanLocal ? 'fetch_key_local' : 'fetch_key_manual',
+    label: shouldScanLocal ? '拉取消息 · 搜索本地密钥候选' : '拉取消息 · 使用手动密钥候选',
+    detail: shouldScanLocal
+      ? [manual.length ? `手动 ${manual.length} 条` : '', VERIFIED_RAW_KEY_CACHE.length ? `已验证 ${VERIFIED_RAW_KEY_CACHE.length} 条` : '', '检查本地 key 文件'].filter(Boolean).join(' · ')
+      : `手动 ${manual.length} 条`,
+  });
   const local = shouldScanLocal
     ? await scanLocalWeixinKeyCandidates({ include_raw: true, cache: !memoryScan }).catch(() => null)
     : null;
+  notifyProgress(onProgress, {
+    phase: 'fetch_key_local_done',
+    label: '拉取消息 · 本地候选已整理',
+    detail: [
+      manual.length ? `手动 ${manual.length}` : '',
+      VERIFIED_RAW_KEY_CACHE.length ? `已验证 ${VERIFIED_RAW_KEY_CACHE.length}` : '',
+      shouldScanLocal ? `本地候选 ${Number(local?.unique_candidate_count || local?.candidate_count || 0) || 0}` : '',
+      shouldScanLocal && Number(local?.file_stats?.scanned || 0) ? `文件 ${Number(local.file_stats.scanned || 0)}` : '',
+    ].filter(Boolean).join(' · ') || '暂无本地候选',
+  });
   const cacheKey = JSON.stringify({
     platform: process.platform,
     memoryScan,
@@ -424,14 +464,33 @@ async function dbRawKeyCandidateBundle({ memoryScan = true } = {}) {
   if (DB_KEY_CANDIDATE_CACHE
     && DB_KEY_CANDIDATE_CACHE.key === cacheKey
     && Date.now() - DB_KEY_CANDIDATE_CACHE.at < DB_KEY_CANDIDATE_CACHE_MS) {
+    notifyProgress(onProgress, {
+      phase: 'fetch_key_cache',
+      label: '拉取消息 · 命中密钥候选缓存',
+      detail: `候选 ${Number(DB_KEY_CANDIDATE_CACHE.rawKeys?.length || 0) || 0} 条`,
+    });
     return {
       rawKeys: DB_KEY_CANDIDATE_CACHE.rawKeys,
       diagnostics: { ...DB_KEY_CANDIDATE_CACHE.diagnostics, cache_hit: true },
     };
   }
+  if (memoryScan) {
+    notifyProgress(onProgress, {
+      phase: 'fetch_key_memory',
+      label: '拉取消息 · 只读扫描微信进程',
+      detail: '缓存候选未命中，扫描内存里的数据库 key 候选',
+    });
+  }
   const scan = memoryScan
     ? await probeWxKey({ scan: true, include_raw: true, scan_all_processes: false })
     : null;
+  if (memoryScan) {
+    notifyProgress(onProgress, {
+      phase: 'fetch_key_memory_done',
+      label: '拉取消息 · 内存候选已整理',
+      detail: `内存候选 ${Number(scan?.unique_candidate_count || scan?.candidate_count || 0) || 0} 条`,
+    });
+  }
   const rawKeys = uniqueStrings([...manual, ...VERIFIED_RAW_KEY_CACHE, ...(local?.raw_candidates || []), ...(scan?._raw_candidates || [])]);
   const diagnostics = {
     cache_hit: false,
