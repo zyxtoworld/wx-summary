@@ -281,8 +281,10 @@ function fmtTimeAgo(ts) {
 function quickRangeToDates(key) {
   const now = new Date();
   const since = new Date(now);
+  let includeSeconds = true;
   if (key === 'today') since.setHours(0, 0, 0, 0);
   else if (key === 'yesterday') {
+    includeSeconds = false;
     since.setDate(since.getDate() - 1);
     since.setHours(0, 0, 0, 0);
     now.setHours(0, 0, 0, 0);
@@ -294,12 +296,13 @@ function quickRangeToDates(key) {
     since.setDate(now.getDate() - (day - 1));
     since.setHours(0, 0, 0, 0);
   }
-  return { since: fmtDateTime(since), until: fmtDateTime(now) };
+  return { since: fmtDateTime(since, { includeSeconds }), until: fmtDateTime(now, { includeSeconds }) };
 }
 
-function fmtDateTime(d) {
+function fmtDateTime(d, { includeSeconds = false } = {}) {
   const pad = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const base = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return includeSeconds ? `${base}:${pad(d.getSeconds())}` : base;
 }
 
 const SUPERSCRIPT_RENDER_MAP = {
@@ -818,7 +821,7 @@ async function renderDigest() {
     }
     $list.innerHTML = visibleGroups
       .map(g => `
-        <li data-id="${g.id}" class="${[
+        <li data-id="${escapeHtml(g.id)}" class="${[
           _state_digest.selectedGroups.has(g.id) ? 'selected' : '',
           g.non_whitelist ? 'non-whitelist' : '',
         ].filter(Boolean).join(' ')}">

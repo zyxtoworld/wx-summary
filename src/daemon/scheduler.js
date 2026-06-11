@@ -373,8 +373,8 @@ function groupRefMatchScore(ref, group = {}, account = {}, { legacyKeys = [] } =
 function schedulerWindow(value, now = new Date()) {
   const ms = durationToMs(value) || durationToMs('4h');
   return {
-    since: formatLocalDateTime(new Date(now.getTime() - ms)),
-    until: formatLocalDateTime(now),
+    since: formatLocalDateTime(new Date(now.getTime() - ms), { includeSeconds: true }),
+    until: formatLocalDateTime(now, { includeSeconds: true }),
   };
 }
 
@@ -416,9 +416,10 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function formatLocalDateTime(date) {
+function formatLocalDateTime(date, { includeSeconds = false } = {}) {
   const p = n => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`;
+  const base = `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`;
+  return includeSeconds ? `${base}:${p(date.getSeconds())}` : base;
 }
 
 export const __schedulerInternals = {

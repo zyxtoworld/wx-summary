@@ -2134,7 +2134,7 @@ function messageTimeBounds(sinceSeconds, untilSeconds) {
     since_s: since,
     until_s: until,
     since_ms: since * 1000,
-    until_ms: until * 1000,
+    until_ms: until * 1000 + 999,
   };
 }
 
