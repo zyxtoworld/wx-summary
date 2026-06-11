@@ -650,6 +650,16 @@ function settingsPatchTouchesManualKey(patch = {}) {
     && (Object.hasOwn(patch.wechat, 'manual_key') || Object.hasOwn(patch.wechat, 'clear_manual_key'));
 }
 
+async function digestAccountIdFromRequest(body = {}) {
+  const requested = String(body.account_id || '').trim();
+  if (requested) return requested;
+  const accounts = await listAccounts().catch(() => []);
+  if (accounts.length > 1) {
+    throw Object.assign(new Error('检测到多个微信账号，请先在页面右上角选择账号后再生成摘要。'), { status: 400 });
+  }
+  return accounts[0]?.id || accounts[0]?.wxid || '';
+}
+
 async function handleApi(req, res, parsedUrl) {
   const pathname = parsedUrl.pathname;
 
@@ -1272,7 +1282,7 @@ async function runDigestSSE(req, res, body) {
     const groupName = body.group_name || body.groups?.[0]?.name || '未命名会话';
     const since = body.since || '';
     const until = body.until || 'now';
-    const accountId = body.account_id || '';
+    const accountId = await digestAccountIdFromRequest(body);
     logInfo('digest_started', { account_id: accountId, group_id: groupId, group: groupName, since, until, preview_text: !!body.preview_text, batch_id: normalizeDigestBatchId(body.batch_id) });
 
     ensureActive();

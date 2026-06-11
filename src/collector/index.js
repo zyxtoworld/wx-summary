@@ -104,6 +104,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
   if (!since) {
     throw Object.assign(new Error('请先选择要总结的起始时间，避免误读全部历史消息。'), { status: 400 });
   }
+  validateMessageTimeRange(since, until);
 
   try {
     throwIfAborted(signal);
@@ -141,6 +142,35 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
     const msg = e?.message ? `读取本机微信数据库失败：${e.message}` : '读取本机微信数据库失败。';
     throw Object.assign(new Error(msg), { status: e?.status || 502 });
   }
+}
+
+function validateMessageTimeRange(since, until) {
+  const start = parseMessageDateTime(since, '起始时间');
+  const end = parseMessageDateTime(until || 'now', '结束时间', { allowNow: true });
+  if (start && end && start > end) {
+    throw Object.assign(new Error('起始时间不能晚于结束时间。'), { status: 400 });
+  }
+}
+
+function parseMessageDateTime(value, label, { allowNow = false } = {}) {
+  const text = String(value || '').trim();
+  if (allowNow && (!text || text === 'now')) return new Date();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) {
+    throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm。`), { status: 400 });
+  }
+  const [, y, mo, d, h, mi, s = '0'] = match;
+  const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
+  const valid = date.getFullYear() === Number(y)
+    && date.getMonth() === Number(mo) - 1
+    && date.getDate() === Number(d)
+    && date.getHours() === Number(h)
+    && date.getMinutes() === Number(mi)
+    && date.getSeconds() === Number(s);
+  if (!valid) {
+    throw Object.assign(new Error(`${label}格式无效，请使用真实存在的日期时间。`), { status: 400 });
+  }
+  return date;
 }
 
 function redactMessageSecrets(message) {

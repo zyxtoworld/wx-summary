@@ -785,29 +785,51 @@ export async function copyDbFile(account, dbFile) {
     throw err;
   }
 
-  const copyId = [
-    new Date().toISOString().replace(/[:.]/g, '-'),
-    process.pid,
-    crypto.randomUUID().slice(0, 8),
-  ].join('-');
   const category = path.basename(path.dirname(source));
-  const targetDir = path.join(TMP_DIR, 'db', account.id, copyId, category);
-  await ensureDir(targetDir);
-  const target = path.join(targetDir, path.basename(source));
-  await fsp.copyFile(source, target);
-  const sidecars = await copyDbSidecars(source, target);
-  const copied = await fsp.stat(target);
-  const header = await readHeader(target);
-  return {
-    source_category: category,
-    source_name: path.basename(source),
-    target_path: target,
-    bytes: copied.size,
-    sha256_16: await sha256Prefix(target),
-    encrypted_like: !header.equals(SQLITE_HEADER),
-    sqlite_header: header.equals(SQLITE_HEADER),
-    sidecars,
-  };
+  let lastStabilityError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const copyId = [
+      new Date().toISOString().replace(/[:.]/g, '-'),
+      process.pid,
+      crypto.randomUUID().slice(0, 8),
+    ].join('-');
+    const targetDir = path.join(TMP_DIR, 'db', account.id, copyId, category);
+    const target = path.join(targetDir, path.basename(source));
+    try {
+      const before = await dbCopySourceSnapshot(source);
+      await ensureDir(targetDir);
+      await fsp.copyFile(source, target);
+      const sidecars = await copyDbSidecars(source, target);
+      const after = await dbCopySourceSnapshot(source);
+      if (!sameDbCopySourceSnapshot(before, after)) {
+        lastStabilityError = Object.assign(new Error('微信数据库正在写入，无法取得一致的临时副本，请稍后重试。'), { status: 409 });
+        await removeCopiedDb(target).catch(() => {});
+        await sleepForDbCopyRetry(attempt);
+        continue;
+      }
+      const copied = await fsp.stat(target);
+      const header = await readHeader(target);
+      return {
+        source_category: category,
+        source_name: path.basename(source),
+        target_path: target,
+        bytes: copied.size,
+        sha256_16: await sha256Prefix(target),
+        encrypted_like: !header.equals(SQLITE_HEADER),
+        sqlite_header: header.equals(SQLITE_HEADER),
+        sidecars,
+      };
+    } catch (e) {
+      await removeCopiedDb(target).catch(() => {});
+      if (attempt < 2 && isTransientDbCopyError(e)) {
+        lastStabilityError = e;
+        await sleepForDbCopyRetry(attempt);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastStabilityError || Object.assign(new Error('微信数据库临时副本复制失败。'), { status: 409 });
 }
 
 async function copyDbSidecars(source, target) {
@@ -827,6 +849,42 @@ async function copyDbSidecars(source, target) {
     });
   }
   return sidecars;
+}
+
+async function dbCopySourceSnapshot(source) {
+  const files = [source, `${source}-wal`, `${source}-shm`];
+  const out = [];
+  for (const file of files) {
+    const st = await fsp.stat(file).catch(() => null);
+    out.push({
+      name: path.basename(file),
+      exists: !!st?.isFile(),
+      size: st?.isFile() ? st.size : 0,
+      mtimeMs: st?.isFile() ? Math.round(st.mtimeMs) : 0,
+    });
+  }
+  return out;
+}
+
+function sameDbCopySourceSnapshot(a = [], b = []) {
+  if (a.length !== b.length) return false;
+  return a.every((item, index) => {
+    const other = b[index] || {};
+    return item.name === other.name
+      && item.exists === other.exists
+      && item.size === other.size
+      && item.mtimeMs === other.mtimeMs;
+  });
+}
+
+function isTransientDbCopyError(error) {
+  const code = String(error?.code || '');
+  if (['ENOENT', 'EBUSY', 'EPERM', 'EACCES'].includes(code)) return true;
+  return /being used|busy|no such file|permission|access/i.test(String(error?.message || ''));
+}
+
+async function sleepForDbCopyRetry(attempt) {
+  await new Promise(resolve => setTimeout(resolve, 120 * (attempt + 1)));
 }
 
 export async function readDbInventory(accountId = '') {
@@ -906,6 +964,9 @@ export async function listChatroomsFromWxDb({ account_id = '', raw_keys = [] } =
 export async function collectMessagesFromWxDb({ account_id = '', group_id, since, until, raw_keys = [], signal } = {}) {
   throwIfAborted(signal);
   if (!group_id) return null;
+  if (!since) {
+    throw Object.assign(new Error('请提供起始时间，避免误读全部历史消息。'), { status: 400 });
+  }
   const accounts = await discoverWxAccounts();
   throwIfAborted(signal);
   const account = pickAccount(accounts, account_id);
@@ -916,8 +977,11 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
     .filter(f => /^message_\d+\.db$/i.test(f.name))
     .sort((a, b) => new Date(b.last_write_time) - new Date(a.last_write_time));
   throwIfAborted(signal);
-  const sinceTs = toUnixSeconds(since, 0);
-  const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000));
+  const sinceTs = toUnixSeconds(since, 0, '起始时间');
+  const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000), '结束时间');
+  if (sinceTs > untilTs) {
+    throw Object.assign(new Error('起始时间不能晚于结束时间。'), { status: 400 });
+  }
   const timeBounds = messageTimeBounds(sinceTs, untilTs);
   const out = [];
   const shardErrors = [];
@@ -1472,61 +1536,68 @@ async function loadSqlCipher() {
 
 async function openCopiedSqlCipherDb(account, source, rawKeys) {
   const copied = await copyDbFile(account, source);
-  const found = await findRawKeyForCopiedDb(copied.target_path, rawKeys);
-  const Database = await loadSqlCipher();
-  if (found?.raw) {
-    const db = new Database(copied.target_path);
-    try {
-      applySqlCipherKeyProfile(db, found.raw, found.profile);
-      db.prepare('select count(*) as c from sqlite_master').get();
-    } catch (e) {
-      try { db.close(); } catch {}
-      await removeCopiedDb(copied.target_path);
-      throw e;
-    }
-    return {
-      db,
-      raw_key: persistableRawKey(found.raw),
-      key_hash: crypto.createHash('sha256').update(found.raw).digest('hex').slice(0, 12),
-      key_profile: found.profile.id,
-      copied,
-      close() {
+  let handedOff = false;
+  try {
+    const found = await findRawKeyForCopiedDb(copied.target_path, rawKeys);
+    const Database = await loadSqlCipher();
+    if (found?.raw) {
+      const db = new Database(copied.target_path);
+      try {
+        applySqlCipherKeyProfile(db, found.raw, found.profile);
+        db.prepare('select count(*) as c from sqlite_master').get();
+      } catch (e) {
         try { db.close(); } catch {}
-        return removeCopiedDb(copied.target_path);
-      },
-    };
-  }
-  const verified = await scanVerifiedWeixinV4KeysForCopiedDb(copied.target_path);
-  if (verified.raw_keys.length) {
-    const manual = await openWeixinV4DecryptedDb(copied.target_path, [...verified.raw_keys, ...rawKeys], Database);
+        throw e;
+      }
+      handedOff = true;
+      return {
+        db,
+        raw_key: persistableRawKey(found.raw),
+        key_hash: crypto.createHash('sha256').update(found.raw).digest('hex').slice(0, 12),
+        key_profile: found.profile.id,
+        copied,
+        close() {
+          try { db.close(); } catch {}
+          return removeCopiedDb(copied.target_path);
+        },
+      };
+    }
+    const verified = await scanVerifiedWeixinV4KeysForCopiedDb(copied.target_path);
+    if (verified.raw_keys.length) {
+      const manual = await openWeixinV4DecryptedDb(copied.target_path, [...verified.raw_keys, ...rawKeys], Database);
+      if (manual?.db) {
+        handedOff = true;
+        return {
+          db: manual.db,
+          raw_key: persistableRawKey(manual.raw_key),
+          key_hash: manual.key_hash,
+          key_profile: `${manual.key_profile}:verified_memory_hmac`,
+          copied,
+          close() {
+            return closeCopiedDb(copied.target_path, manual.db, manual.plain_path);
+          },
+        };
+      }
+    }
+    const manual = await openWeixinV4DecryptedDb(copied.target_path, rawKeys, Database);
     if (manual?.db) {
+      handedOff = true;
       return {
         db: manual.db,
         raw_key: persistableRawKey(manual.raw_key),
         key_hash: manual.key_hash,
-        key_profile: `${manual.key_profile}:verified_memory_hmac`,
+        key_profile: manual.key_profile,
         copied,
         close() {
           return closeCopiedDb(copied.target_path, manual.db, manual.plain_path);
         },
       };
     }
+    throw new Error(`no raw key matched ${path.basename(source)}`);
+  } catch (e) {
+    if (!handedOff) await removeCopiedDb(copied.target_path).catch(() => {});
+    throw e;
   }
-  const manual = await openWeixinV4DecryptedDb(copied.target_path, rawKeys, Database);
-  if (manual?.db) {
-    return {
-      db: manual.db,
-      raw_key: persistableRawKey(manual.raw_key),
-      key_hash: manual.key_hash,
-      key_profile: manual.key_profile,
-      copied,
-      close() {
-        return closeCopiedDb(copied.target_path, manual.db, manual.plain_path);
-      },
-    };
-  }
-  await removeCopiedDb(copied.target_path);
-  throw new Error(`no raw key matched ${path.basename(source)}`);
 }
 
 async function scanVerifiedWeixinV4KeysForCopiedDb(dbPath) {
@@ -2025,10 +2096,24 @@ function normalizeWxTimestamp(value) {
   return n > 10_000_000_000 ? n : n * 1000;
 }
 
-function toUnixSeconds(value, fallback) {
-  if (!value || value === 'now') return fallback;
-  const date = new Date(String(value).replace(' ', 'T'));
-  if (Number.isNaN(date.getTime())) return fallback;
+function toUnixSeconds(value, fallback, label = '时间') {
+  const text = String(value || '').trim();
+  if (!text || text === 'now') return fallback;
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) {
+    throw Object.assign(new Error(`${label}格式无效，请使用 YYYY-MM-DD HH:mm。`), { status: 400 });
+  }
+  const [, y, mo, d, h, mi, s = '0'] = match;
+  const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
+  const valid = date.getFullYear() === Number(y)
+    && date.getMonth() === Number(mo) - 1
+    && date.getDate() === Number(d)
+    && date.getHours() === Number(h)
+    && date.getMinutes() === Number(mi)
+    && date.getSeconds() === Number(s);
+  if (!valid) {
+    throw Object.assign(new Error(`${label}格式无效，请使用真实存在的日期时间。`), { status: 400 });
+  }
   return Math.floor(date.getTime() / 1000);
 }
 
