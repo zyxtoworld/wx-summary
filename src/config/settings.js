@@ -327,6 +327,8 @@ export function normalizeSettings(settings) {
   s.llm.max_messages_per_call = finiteInteger(s.llm.max_messages_per_call, 800, 1, 20000);
   s.llm.max_image_chars_per_call = finiteInteger(s.llm.max_image_chars_per_call, 300000, 100000, 2 * 1024 * 1024);
   s.llm.ai_concurrency = finiteInteger(s.llm.ai_concurrency, 2, 1, Number.MAX_SAFE_INTEGER);
+  s.llm.available_models = normalizeAvailableModels(s.llm.available_models);
+  s.llm.models_fetched_at = s.llm.models_fetched_at ? String(s.llm.models_fetched_at).trim() : null;
   s.llm.capabilities = normalizeLlmCapabilities(s.llm.capabilities);
   s.link_preview = s.link_preview && typeof s.link_preview === 'object' ? s.link_preview : {};
   s.link_preview.enabled = true;
@@ -380,6 +382,20 @@ function plainObject(value) {
 function normalizeStringList(value, limit) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map(item => String(item || '').trim()).filter(Boolean))].slice(0, limit);
+}
+
+function normalizeAvailableModels(value, limit = 1000) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of value) {
+    const id = String((typeof item === 'string' ? item : item?.id) || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id: id.slice(0, 300) });
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 function normalizeGroupRefs(value, limit) {
@@ -634,6 +650,13 @@ async function saveSettingsPatchUnlocked(patch, { settingsFile = SETTINGS_FILE, 
     const err = new Error('output.dir must stay inside outputs/ and outside outputs/.tmp');
     err.status = 400;
     throw err;
+  }
+  if (nextPatch.llm && Object.hasOwn(nextPatch.llm, 'available_models')) {
+    const models = normalizeAvailableModels(nextPatch.llm.available_models);
+    nextPatch.llm.available_models = models;
+    if (!Object.hasOwn(nextPatch.llm, 'models_fetched_at')) {
+      nextPatch.llm.models_fetched_at = models.length ? new Date().toISOString() : null;
+    }
   }
   const merged = normalizeSettings(deepMerge(stripSensitive(current), nextPatch));
   const validationErrors = validateSettingsObject(merged, { requireBaseUrl: !!nextPatch.llm });

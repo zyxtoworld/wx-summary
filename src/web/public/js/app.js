@@ -5,12 +5,35 @@ const TOKEN = window.__WX_TOKEN__;
 const $app = document.getElementById('app');
 const MAX_SCHEDULER_INTERVAL_MS = 24 * 24 * 60 * 60 * 1000;
 let _appState = null;
+let _appAccounts = [];
 let _keyboardShortcutsAttached = false;
 let _routeSeq = 0;
 let _customRangeOutsideClickAttached = false;
+let _setupWizardDraft = null;
+
+function accountOptionValue(account = {}) {
+  return String(account.id || account.wxid || '').trim();
+}
 
 function selectedAccountId() {
-  return document.getElementById('account-switcher')?.value || '';
+  return String(document.getElementById('account-switcher')?.value || '').trim();
+}
+
+function accountSelectionRequiredMessage() {
+  if (selectedAccountId()) return '';
+  if (_appAccounts.length) return '请先在页面右上角选择微信账号。';
+  const sel = document.getElementById('account-switcher');
+  const text = sel?.textContent || '';
+  if (text.includes('未检测到微信账号')) return '未检测到微信账号，请先登录微信后重试。';
+  if (sel?.disabled && sel.textContent) return '账号列表不可用，请先重试检测微信账号。';
+  return '未检测到微信账号，请先登录微信后重试。';
+}
+
+async function ensureSelectedAccountId() {
+  const current = selectedAccountId();
+  if (current) return current;
+  await refreshTopbarAccounts();
+  return selectedAccountId();
 }
 
 function wechatAppLabel(platform = _appState?.platform) {
@@ -184,17 +207,19 @@ async function bootstrap() {
   const sel = document.getElementById('account-switcher');
   if (sel) {
     if (accountResult.error) {
+      _appAccounts = [];
       sel.innerHTML = `<option value="">账号读取失败：${escapeHtml(accountResult.error.message || '未知错误')}</option>`;
       sel.disabled = true;
     } else {
       const accounts = accountResult.accounts || [];
+      _appAccounts = accounts;
       const previousValue = sel.value;
       const hadListener = sel.dataset.bound === '1';
       if (hadListener) sel.removeEventListener('change', handleAccountSwitch);
       sel.innerHTML = accounts.length
-        ? accounts.map(a => `<option value="${escapeHtml(a.id || a.wxid)}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
+        ? accounts.map(a => `<option value="${escapeHtml(accountOptionValue(a))}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
         : '<option value="">未检测到微信账号</option>';
-      if (previousValue && accounts.some(a => (a.id || a.wxid) === previousValue)) sel.value = previousValue;
+      if (previousValue && accounts.some(a => accountOptionValue(a) === previousValue)) sel.value = previousValue;
       sel.disabled = !accounts.length;
       sel.addEventListener('change', handleAccountSwitch);
       sel.dataset.bound = '1';
@@ -223,12 +248,14 @@ bootstrap();
 async function refreshTopbarAccounts() {
   try {
     const accounts = await api('/api/accounts');
+    _appAccounts = accounts;
     const sel = document.getElementById('account-switcher');
+    if (!sel) return accounts;
     const previousValue = sel?.value || '';
     sel.innerHTML = accounts.length
-      ? accounts.map(a => `<option value="${escapeHtml(a.id || a.wxid)}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
+      ? accounts.map(a => `<option value="${escapeHtml(accountOptionValue(a))}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
       : '<option value="">未检测到微信账号</option>';
-    const stillAvailable = previousValue && accounts.some(a => (a.id || a.wxid) === previousValue);
+    const stillAvailable = previousValue && accounts.some(a => accountOptionValue(a) === previousValue);
     if (stillAvailable) sel.value = previousValue;
     else if (previousValue && sel.value !== previousValue) resetDigestAccountState();
     sel.disabled = !accounts.length;
@@ -238,6 +265,7 @@ async function refreshTopbarAccounts() {
     }
     return accounts;
   } catch (e) {
+    _appAccounts = [];
     const sel = document.getElementById('account-switcher');
     if (sel) {
       sel.innerHTML = `<option value="">账号读取失败：${escapeHtml(e.message || '未知错误')}</option>`;
@@ -859,6 +887,8 @@ async function renderDigest() {
       <button class="link-btn" id="wechat-manual-key">填写手动密钥</button>`;
     document.getElementById('wechat-retry').addEventListener('click', async () => {
       _appState = await api('/api/state?refresh=true');
+      DIGEST_GROUP_CACHE.clear();
+      await refreshTopbarAccounts();
       route();
     });
     document.getElementById('wechat-manual-key').addEventListener('click', () => { location.hash = '#/settings'; });
@@ -884,6 +914,8 @@ async function renderDigest() {
       <button class="link-btn" id="wechat-manual-key">填写手动密钥</button>`;
     document.getElementById('wechat-retry').addEventListener('click', async () => {
       _appState = await api('/api/state?refresh=true');
+      DIGEST_GROUP_CACHE.clear();
+      await refreshTopbarAccounts();
       route();
     });
     document.getElementById('wechat-manual-key').addEventListener('click', () => { location.hash = '#/settings'; });
@@ -3742,7 +3774,7 @@ async function renderSettings() {
   const settingsRouteSeq = _routeSeq;
   const s = await api('/api/settings');
   if (settingsRouteSeq !== _routeSeq) return;
-  const settingsAccountId = selectedAccountId();
+  let settingsAccountId = selectedAccountId();
   const statePromise = api('/api/state').catch(() => ({ platform: '', project_root: '' }));
   let settingsState = _appState || { platform: '', project_root: '' };
 
@@ -3795,6 +3827,14 @@ async function renderSettings() {
   function sameLlmIdentity(a, b) {
     return JSON.stringify(a || {}) === JSON.stringify(b || {});
   }
+  function savedLlmIdentity() {
+    return {
+      provider: s.llm.provider || 'openai',
+      base_url: normalizeSettingsBaseUrl(s.llm.base_url || ''),
+      model: s.llm.model || '',
+      long_context_model: s.llm.long_context_model || s.llm.model || '',
+    };
+  }
   function clearLlmCapabilitySnapshot() {
     lastLlmCapabilitySnapshot = null;
   }
@@ -3817,16 +3857,15 @@ async function renderSettings() {
       if (!item.ok && item.error) target[item.name].error = String(item.error).slice(0, 300);
     }
   }
-  function capabilitySnapshotFromTest(result = {}) {
-    const identity = currentLlmIdentity();
+  function capabilitySnapshotFromTest(result = {}, identity = currentLlmIdentity()) {
     const modelResults = Array.isArray(result.model_results) && result.model_results.length
       ? result.model_results
       : [{ role: 'model', model: result.model, checked_at: result.checked_at, capabilities: result.capabilities || [] }];
     const baseResult = modelResults.find(item => item.role === 'model') || modelResults[0] || {};
     const longResult = modelResults.find(item => item.role === 'long_context');
     const snapshot = {
-      provider: result.provider || selectedProvider(),
-      base_url: normalizeSettingsBaseUrl(result.base_url || document.getElementById('s-baseurl').value),
+      provider: result.provider || identity.provider || selectedProvider(),
+      base_url: normalizeSettingsBaseUrl(result.base_url || identity.base_url || document.getElementById('s-baseurl').value),
       model: baseResult.model || result.model || identity.model,
       long_context_model: identity.long_context_model,
       checked_at: result.checked_at || baseResult.checked_at || new Date().toISOString(),
@@ -4000,13 +4039,19 @@ async function renderSettings() {
     $st.className = 'status'; $st.textContent = '测试中...';
     try {
       const key = document.getElementById('s-apikey').value.trim();
-      const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, model, long_context_model: longModel || model };
+      const testedIdentity = currentLlmIdentity();
+      const payload = { provider: testedIdentity.provider, base_url: testedIdentity.base_url, model: testedIdentity.model, long_context_model: testedIdentity.long_context_model };
       if (key) payload.api_key = key;
       const r = await api('/api/test-llm', {
         method: 'POST',
         body: payload,
       });
-      lastLlmCapabilitySnapshot = capabilitySnapshotFromTest(r);
+      if (!sameLlmIdentity(currentLlmIdentity(), testedIdentity)) {
+        $st.className = 'status warn';
+        $st.textContent = '测试期间表单已变化，旧连通结果已忽略。请重新测试。';
+        return;
+      }
+      lastLlmCapabilitySnapshot = capabilitySnapshotFromTest(r, testedIdentity);
       const modelResults = Array.isArray(r.model_results) && r.model_results.length
         ? r.model_results
         : [{ role: 'model', model: r.model, ok: r.ok, capabilities: r.capabilities || [] }];
@@ -4071,7 +4116,11 @@ async function renderSettings() {
       },
     };
     const capabilities = currentCapabilitySnapshotForSave();
-    payload.llm.capabilities = capabilities || null;
+    if (capabilities) {
+      payload.llm.capabilities = capabilities;
+    } else if (apiKey || !sameLlmIdentity(savedLlmIdentity(), currentLlmIdentity())) {
+      payload.llm.capabilities = {};
+    }
     if (apiKey) payload.llm.api_key = apiKey;
     $st.className = 'status';
     $st.textContent = '保存中...';
@@ -4176,6 +4225,15 @@ async function renderSettings() {
     groupsLoaded = false;
     paintWl();
     paintOverrideEditor();
+    settingsAccountId = selectedAccountId();
+    const settingsAccountMessage = accountSelectionRequiredMessage();
+    if (settingsAccountMessage) {
+      groups = [];
+      groupsLoadError = new Error(settingsAccountMessage);
+      paintWl();
+      paintOverrideEditor();
+      return;
+    }
     try {
       const loaded = await api(`/api/groups?account=${encodeURIComponent(settingsAccountId)}`);
       if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-whitelist')) return;
@@ -4576,6 +4634,13 @@ async function renderSettings() {
       });
       if (r.settings?.wechat) s.wechat = r.settings.wechat;
       document.getElementById('s-manual-key').value = '';
+      if (Object.keys(wechatPatch).length) {
+        DIGEST_GROUP_CACHE.clear();
+        void refreshAppStateSilently();
+        void refreshTopbarAccounts()
+          .catch(() => [])
+          .then(() => loadSettingsGroupsInBackground());
+      }
       $st.className = 'status ok';
       const savedManualCount = keyMode === 'manual' ? manualKeys.keys.length : 0;
       if (savedManualCount) {
@@ -4778,14 +4843,29 @@ function formatModelConnectivityResult(result = {}) {
 // ---------- 首次启动向导 ----------
 async function renderSetup() {
   $app.appendChild(tplOf('tpl-setup'));
-  const state = await api('/api/state');
-  let step = 1;
+  const [state, setupSettings] = await Promise.all([
+    api('/api/state'),
+    api('/api/settings').catch(() => ({})),
+  ]);
+  let step = _setupWizardDraft?.step || 1;
   const $body = document.getElementById('setup-body');
   const $title = document.getElementById('setup-title');
   const $step = document.getElementById('setup-step');
   const $back = document.getElementById('setup-back');
   const $next = document.getElementById('setup-next');
-  const wizardData = { llm: {}, wechat: {}, whitelist: new Map() };
+  const existingWhitelistRefs = mergeGroupRefs(Array.isArray(setupSettings.groups?.whitelist) ? setupSettings.groups.whitelist : []);
+  if (!_setupWizardDraft?.data) {
+    _setupWizardDraft = {
+      step,
+      data: {
+        llm: {},
+        wechat: {},
+        whitelist: new Map(existingWhitelistRefs.map(ref => [groupRefKey(ref), ref]).filter(([key]) => key && key !== '*::')),
+        whitelistDirty: false,
+      },
+    };
+  }
+  const wizardData = _setupWizardDraft.data;
   let setupPaintSeq = 0;
   function normalizeSetupBaseUrl(value) {
     return String(value || '').trim().replace(/\/+$/, '');
@@ -4800,8 +4880,24 @@ async function renderSetup() {
   function sameSetupLlmIdentity(a, b) {
     return JSON.stringify(a || {}) === JSON.stringify(b || {});
   }
+  async function setupSelectedAccountId() {
+    return await ensureSelectedAccountId();
+  }
+  function setupWhitelistHasGroup(group, accountId) {
+    return [...wizardData.whitelist.values()].some(ref => groupRefMatches(ref, group, accountId));
+  }
+  function removeSetupWhitelistGroup(group, accountId) {
+    for (const [key, ref] of wizardData.whitelist.entries()) {
+      if (groupRefMatches(ref, group, accountId)) wizardData.whitelist.delete(key);
+    }
+  }
+  function addSetupWhitelistGroup(group, accountId) {
+    const ref = groupRefForPayload(group, accountId);
+    wizardData.whitelist.set(groupRefKey(ref), ref);
+  }
 
   function paint() {
+    if (_setupWizardDraft) _setupWizardDraft.step = step;
     const paintSeq = ++setupPaintSeq;
     $step.textContent = step;
     $back.disabled = step === 1;
@@ -4937,7 +5033,7 @@ async function renderSetup() {
       $title.textContent = '检测微信';
       $body.innerHTML = `
         <p>检测本机微信进程并尝试提取数据库密钥...</p>
-        <p>当前版本能识别 Weixin 主进程、数据根目录和 db_storage，并用只读权限扫描 key 候选。</p>
+        <p>当前版本能识别 Weixin 主进程、本机微信数据目录和数据库密钥候选，并用只读权限扫描 key。</p>
         <p>已能读取本机群列表、文本、引用、图片、文件、视频关键帧、语音/音频元信息；媒体解封失败时会保留时间、发送人和文件元信息，不假装看过或听过内容。</p>
         <p class="muted">${escapeHtml(state.wechat?.message || '检测中')}</p>
         <div class="form-row"><label>手动密钥（可选）</label><textarea id="w-manual-key" rows="3" spellcheck="false" autocomplete="off" placeholder="自动失败时填一条或多条 64/96 位 hex">${escapeHtml(wizardData.wechat.manual_key || '')}</textarea></div>
@@ -4948,8 +5044,16 @@ async function renderSetup() {
       $next.disabled = true;
       $next.textContent = '读取群列表...';
       $body.innerHTML = '<p class="muted small">正在读取本机微信群列表...</p>';
-      const setupAccountId = selectedAccountId();
-      api(`/api/groups?account=${encodeURIComponent(setupAccountId)}`).then(groups => {
+      (async () => {
+        const setupAccountId = await setupSelectedAccountId();
+        if (step !== 4 || paintSeq !== setupPaintSeq) return;
+        if (!setupAccountId) {
+          $next.disabled = false;
+          $next.textContent = '跳过白名单并完成';
+          $body.innerHTML = `<p class="status warn">${escapeHtml(accountSelectionRequiredMessage())}</p><p class="muted small">可以先完成 AI 配置；登录微信或账号列表恢复后，再到设置页选择白名单。</p>`;
+          return;
+        }
+        const groups = await api(`/api/groups?account=${encodeURIComponent(setupAccountId)}`);
         if (step !== 4 || paintSeq !== setupPaintSeq) return;
         $next.disabled = false;
         $next.textContent = '完成';
@@ -4973,18 +5077,23 @@ async function renderSetup() {
             ? visible.map(g => {
               const ref = groupRefForPayload(g, setupAccountId);
               const key = groupRefKey(ref);
-              return `<label class="chip"><input type="checkbox" value="${escapeHtml(key)}" ${wizardData.whitelist.has(key) ? 'checked' : ''} /> ${escapeHtml(g.name)}</label>`;
+              return `<label class="chip"><input type="checkbox" value="${escapeHtml(key)}" ${setupWhitelistHasGroup(g, setupAccountId) ? 'checked' : ''} /> ${escapeHtml(g.name)}</label>`;
             }).join('')
             : '<span class="muted small">没有匹配的群。</span>';
           list.querySelectorAll('input[type="checkbox"]').forEach(input => {
             input.addEventListener('change', () => {
               const group = groups.find(g => groupRefKey(groupRefForPayload(g, setupAccountId)) === input.value);
-              if (input.checked && group) wizardData.whitelist.set(input.value, groupRefForPayload(group, setupAccountId));
-              else wizardData.whitelist.delete(input.value);
-              document.getElementById('w-whitelist-count').textContent = `已选 ${wizardData.whitelist.size} 个群`;
+              if (group) {
+                wizardData.whitelistDirty = true;
+                if (input.checked) addSetupWhitelistGroup(group, setupAccountId);
+                else removeSetupWhitelistGroup(group, setupAccountId);
+              }
+              paintWhitelist(search?.value || '');
             });
           });
-          document.getElementById('w-whitelist-count').textContent = `已选 ${wizardData.whitelist.size} 个群；当前显示 ${visible.length} 个`;
+          const currentCount = groups.filter(g => setupWhitelistHasGroup(g, setupAccountId)).length;
+          const hiddenCount = Math.max(0, wizardData.whitelist.size - currentCount);
+          document.getElementById('w-whitelist-count').textContent = `当前账号已选 ${currentCount} 个群；当前显示 ${visible.length} 个${hiddenCount ? `；另保留 ${hiddenCount} 个其他账号/旧白名单` : ''}`;
         };
         const search = document.getElementById('w-whitelist-search');
         search.addEventListener('input', () => paintWhitelist(search.value));
@@ -4993,17 +5102,18 @@ async function renderSetup() {
           groups
             .filter(g => !f || [g.name, g.id, g.pinyin, g.pinyin_initial].some(v => String(v || '').toLowerCase().includes(f)))
             .forEach(g => {
-              const ref = groupRefForPayload(g, setupAccountId);
-              wizardData.whitelist.set(groupRefKey(ref), ref);
+              addSetupWhitelistGroup(g, setupAccountId);
             });
+          wizardData.whitelistDirty = true;
           paintWhitelist(search.value);
         });
         document.getElementById('w-whitelist-clear').addEventListener('click', () => {
-          wizardData.whitelist.clear();
+          groups.forEach(g => removeSetupWhitelistGroup(g, setupAccountId));
+          wizardData.whitelistDirty = true;
           paintWhitelist(search.value);
         });
         paintWhitelist();
-      }).catch(e => {
+      })().catch(e => {
         if (step !== 4 || paintSeq !== setupPaintSeq) return;
         $next.disabled = false;
         $next.textContent = '跳过白名单并完成';
@@ -5013,7 +5123,7 @@ async function renderSetup() {
   }
   paint();
 
-  $back.addEventListener('click', () => { if (step > 1) { step--; paint(); } });
+  $back.addEventListener('click', () => { if (step > 1) { step--; if (_setupWizardDraft) _setupWizardDraft.step = step; paint(); } });
   $next.addEventListener('click', async () => {
     if (step === 2) {
       const provider = document.querySelector('input[name="w-provider"]:checked')?.value || 'openai';
@@ -5100,7 +5210,8 @@ async function renderSetup() {
     if (step === 4) {
       const wl = [...wizardData.whitelist.values()];
       const { model_identity: _modelIdentity, ...llmPayload } = wizardData.llm;
-      const payload = { llm: llmPayload, groups: { whitelist: wl } };
+      const payload = { llm: llmPayload };
+      if (wizardData.whitelistDirty) payload.groups = { whitelist: mergeGroupRefs(wl) };
       if (wizardData.wechat.manual_key) payload.wechat = { manual_key: wizardData.wechat.manual_key };
       $next.disabled = true;
       const oldText = $next.textContent;
@@ -5124,6 +5235,7 @@ async function renderSetup() {
         }
         _appState = await api('/api/state?refresh=true').catch(() => _appState);
         await refreshTopbarAccounts();
+        _setupWizardDraft = null;
         const alreadyDigest = location.hash === '#/digest';
         location.hash = '#/digest';
         if (alreadyDigest) await route();
@@ -5136,6 +5248,7 @@ async function renderSetup() {
       return;
     }
     step++;
+    if (_setupWizardDraft) _setupWizardDraft.step = step;
     paint();
   });
 }
