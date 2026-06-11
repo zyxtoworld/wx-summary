@@ -878,8 +878,8 @@ async function handleApi(req, res, parsedUrl) {
     const body = await readBody(req);
     const current = await loadSettings({ includeSecrets: true });
     const provider = body.provider || current.llm.provider;
-    const baseUrl = normalizeBaseUrl(body.base_url || current.llm.base_url);
-    const apiKey = body.api_key || current.llm.api_key;
+    const baseUrl = normalizeBaseUrl(bodyValueOrSaved(body, 'base_url', current.llm.base_url));
+    const apiKey = bodyValueOrSaved(body, 'api_key', current.llm.api_key);
     const result = await listModels({
       provider,
       base_url: baseUrl,
@@ -895,10 +895,10 @@ async function handleApi(req, res, parsedUrl) {
     const body = await readBody(req);
     const current = await loadSettings({ includeSecrets: true });
     const provider = body.provider || current.llm.provider;
-    const baseUrl = normalizeBaseUrl(body.base_url || current.llm.base_url);
-    const apiKey = body.api_key || current.llm.api_key;
-    const model = body.model || current.llm.model || current.llm.available_models?.[0]?.id || '';
-    const longContextModel = body.long_context_model || current.llm.long_context_model || model;
+    const baseUrl = normalizeBaseUrl(bodyValueOrSaved(body, 'base_url', current.llm.base_url));
+    const apiKey = bodyValueOrSaved(body, 'api_key', current.llm.api_key);
+    const model = bodyValueOrSaved(body, 'model', current.llm.model || current.llm.available_models?.[0]?.id || '');
+    const longContextModel = bodyValueOrSaved(body, 'long_context_model', current.llm.long_context_model || model);
     const targets = [{ role: 'model', model }];
     if (longContextModel && longContextModel !== model) targets.push({ role: 'long_context', model: longContextModel });
     const started = Date.now();
@@ -1419,6 +1419,10 @@ function emptyCollectionDetail(collection = {}) {
   }
   if (collection.table) parts.push(`会话表 ${sanitizeText(collection.table)}`);
   return parts.join('；');
+}
+
+function bodyValueOrSaved(body = {}, key, savedValue = '') {
+  return Object.prototype.hasOwnProperty.call(body, key) ? body[key] : savedValue;
 }
 
 async function runDigestSSE(req, res, body) {

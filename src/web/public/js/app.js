@@ -4267,9 +4267,19 @@ async function renderSetup() {
       const listButton = document.getElementById('w-list');
       listButton.addEventListener('click', () => withBusyButtons(listButton, async () => {
         const $st = document.getElementById('w-status');
+        const requestIdentity = setupLlmIdentityFromDom();
+        if (!requestIdentity.base_url) {
+          $st.className = 'status err';
+          $st.textContent = '✗ 请填写 Base URL';
+          return;
+        }
+        if (!requestIdentity.api_key) {
+          $st.className = 'status err';
+          $st.textContent = '✗ 请填写 API Key';
+          return;
+        }
         $st.className = 'status'; $st.textContent = '获取中...';
         try {
-          const requestIdentity = setupLlmIdentityFromDom();
           const r = await api('/api/list-models', {
             method: 'POST',
             body: { provider: requestIdentity.provider, base_url: requestIdentity.base_url, api_key: requestIdentity.api_key },
