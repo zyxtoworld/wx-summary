@@ -1301,6 +1301,11 @@ async function enrichMessageMedia(account, rawKeys, messages, signal) {
                 markMediaEnrichmentFailure(msg, e, '图片解密样本读取失败');
               }
             }
+          } else {
+            markMediaPayloadMissing(msg, '本机未找到或未下载图片文件，只能保留图片元信息');
+          }
+          if (localPath && !msg.media.local_available) {
+            markMediaPayloadMissing(msg, '本机图片路径已定位但文件不可读，只能保留图片元信息');
           }
         } else if (msg.type === 'file') {
           const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
@@ -1329,6 +1334,11 @@ async function enrichMessageMedia(account, rawKeys, messages, signal) {
               else if (isAudioLike(msg.media)) audioJobs.push({ msg, localPath });
             }
           }
+          if (!msg.media.local_available && isVideoLike(msg.media)) {
+            markMediaPayloadMissing(msg, '本机未找到或未下载视频文件，只能保留文件元信息');
+          } else if (!msg.media.local_available && isAudioLike(msg.media)) {
+            markMediaPayloadMissing(msg, '本机未找到或未下载音频文件，只能保留文件元信息');
+          }
           msg.content = formatFileContent(msg.media);
         } else if (msg.type === 'video') {
           const row = (fileByMd5Stmt && msg.media.md5 ? fileByMd5Stmt.get([msg.media.md5]) : null)
@@ -1352,6 +1362,8 @@ async function enrichMessageMedia(account, rawKeys, messages, signal) {
             msg.media.local_available = true;
             msg.media.local_path_hint = path.basename(localPath);
             videoJobs.push({ msg, localPath });
+          } else {
+            markMediaPayloadMissing(msg, '本机未找到或未下载视频文件，只能保留视频元信息');
           }
           msg.content = formatVideoContent(msg.media);
         } else if (msg.type === 'voice') {
@@ -1379,6 +1391,8 @@ async function enrichMessageMedia(account, rawKeys, messages, signal) {
             const st = await fsp.stat(localPath).catch(() => null);
             if (st?.isFile()) msg.media.size = msg.media.size || st.size;
             audioJobs.push({ msg, localPath });
+          } else {
+            markMediaPayloadMissing(msg, '本机未找到或未下载语音/音频文件，只能保留语音元信息');
           }
           msg.content = formatVoiceContent(msg.media);
         }

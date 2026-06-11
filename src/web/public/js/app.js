@@ -1017,7 +1017,8 @@ async function renderDigest() {
     });
   });
   document.getElementById('btn-download').addEventListener('click', downloadCanvas);
-  document.getElementById('btn-copy').addEventListener('click', copyCanvas);
+  const previewCopyButton = document.getElementById('btn-copy');
+  previewCopyButton.addEventListener('click', () => withBusyButtons(previewCopyButton, copyCanvas));
   document.getElementById('digest-canvas').addEventListener('click', () => {
     const canvas = document.getElementById('digest-canvas');
     if (!canvas.width || !canvas.height) return;
@@ -1026,7 +1027,8 @@ async function renderDigest() {
       src: canvas.toDataURL('image/png'),
     });
   });
-  document.getElementById('btn-reveal').addEventListener('click', async () => {
+  const previewRevealButton = document.getElementById('btn-reveal');
+  previewRevealButton.addEventListener('click', () => withBusyButtons(previewRevealButton, async () => {
     const item = _state_digest.lastSavedItem;
     if (!item) return;
     const status = document.getElementById('preview-status');
@@ -1046,7 +1048,7 @@ async function renderDigest() {
         status.textContent = `打开失败：${e.message || '未知错误'}`;
       }
     }
-  });
+  }));
 
   restoreDigestOutputs();
   paintDigestProgressSnapshot();
@@ -2127,12 +2129,25 @@ function digestLinkTitle(link = {}) {
 function digestDataRows(d = {}) {
   const renderedLinks = digestLinksForRender(d);
   const renderedTodos = digestTodosForRender(d);
+  const mediaRow = digestMediaStatusRow(d.media_status);
   return [
     `时间：${d.since || '未知'} ~ ${d.until || 'now'}`,
     `消息：${d.message_count || 0} 条${d.truncated ? `；已从 ${d.scanned_message_count || d.message_count || 0} 条中截取 ${d.input_message_count || d.message_count || 0} 条` : ''}`,
+    mediaRow,
     `内容：${d.topics?.length || 0} 条聊天主线，${renderedLinks.length} 个链接资料，${renderedTodos.length} 个后续关注，${digestQuotesForRender(d).length} 条群里金句`,
     `来源：${d.source_label || '本机数据'}；模型：${d.model || '未记录'}`,
-  ];
+  ].filter(Boolean);
+}
+
+function digestMediaStatusRow(mediaStatus = null) {
+  if (!mediaStatus || typeof mediaStatus !== 'object') return '';
+  const mediaMessages = Number(mediaStatus.media_messages || 0);
+  const metadataOnly = Number(mediaStatus.metadata_only || 0);
+  const attached = Number(mediaStatus.attached || 0);
+  if (!mediaMessages) return '';
+  return metadataOnly
+    ? `媒体：${mediaMessages} 条，其中 ${metadataOnly} 条仅按元信息总结${attached ? `，${attached} 条已附给 AI` : ''}`
+    : `媒体：${mediaMessages} 条，均已附给 AI 或按可用内容处理`;
 }
 
 function digestTodosForRender(d = {}) {
@@ -2953,7 +2968,7 @@ function showHistoryModal(item) {
     });
     return image;
   };
-  revealButton.addEventListener('click', async () => {
+  revealButton.addEventListener('click', () => withBusyButtons(revealButton, async () => {
     status.className = 'status';
     status.textContent = '正在打开文件夹...';
     try {
@@ -2964,8 +2979,8 @@ function showHistoryModal(item) {
       status.className = 'status err';
       status.textContent = `打开失败：${e.message || '未知错误'}`;
     }
-  });
-  copyButton.addEventListener('click', async () => {
+  }));
+  copyButton.addEventListener('click', () => withBusyButtons(copyButton, async () => {
     status.className = 'status';
     status.textContent = '复制中...';
     try {
@@ -2989,7 +3004,7 @@ function showHistoryModal(item) {
         status.textContent = details ? `复制失败：${details}。请下载 PNG。` : '复制失败，请下载 PNG。';
       }
     }
-  });
+  }));
   const rerenderButton = modal.querySelector('[data-rerender]');
   rerenderButton.addEventListener('click', async e => {
     if (rerenderButton.disabled) return;
@@ -3755,7 +3770,8 @@ async function renderSettings() {
   document.getElementById('s-retention').value = s.output.retention_days ?? 0;
   const openOutdirButton = document.getElementById('s-open-outdir');
   const saveRenderButton = document.getElementById('s-save-render');
-  openOutdirButton.addEventListener('click', () => withBusyButtons(openOutdirButton, async () => {
+  const renderOutputButtons = [openOutdirButton, saveRenderButton];
+  openOutdirButton.addEventListener('click', () => withBusyButtons(renderOutputButtons, async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
@@ -3774,7 +3790,7 @@ async function renderSettings() {
       $st.textContent = '✗ 打开失败：' + e.message;
     }
   }));
-  saveRenderButton.addEventListener('click', () => withBusyButtons(saveRenderButton, async () => {
+  saveRenderButton.addEventListener('click', () => withBusyButtons(renderOutputButtons, async () => {
     const $st = document.getElementById('s-render-status');
     const outDir = document.getElementById('s-outdir').value.trim();
     if (!outputDirLooksInsideProject(outDir, settingsState.project_root)) {
@@ -3785,7 +3801,7 @@ async function renderSettings() {
     $st.className = 'status';
     $st.textContent = '保存中...';
     try {
-      await api('/api/settings', {
+      const r = await api('/api/settings', {
         method: 'PUT',
         body: {
           render: {
@@ -3798,6 +3814,12 @@ async function renderSettings() {
           },
         },
       });
+      if (r.settings?.render) s.render = r.settings.render;
+      if (r.settings?.output) {
+        s.output = r.settings.output;
+        document.getElementById('s-outdir').value = s.output.dir || outDir;
+        document.getElementById('s-retention').value = s.output.retention_days ?? 0;
+      }
       $st.className = 'status ok';
       $st.textContent = '✓ 已保存';
     } catch (e) {

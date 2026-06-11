@@ -1375,6 +1375,15 @@ function manualAcceptanceChecks({ service = {}, localActionEvidence = {}, secret
   ];
 }
 
+function mediaStatusDetail(mediaStatus = null) {
+  if (!mediaStatus || typeof mediaStatus !== 'object') return '';
+  const mediaMessages = Number(mediaStatus.media_messages || 0);
+  const metadataOnly = Number(mediaStatus.metadata_only || 0);
+  if (!mediaMessages || !metadataOnly) return '';
+  const attached = Math.max(0, Number(mediaStatus.attached || 0));
+  return `媒体 ${mediaMessages} 条，其中 ${metadataOnly} 条仅按元信息总结${attached ? `，${attached} 条已附给 AI` : ''}`;
+}
+
 async function runDigestSSE(req, res, body) {
   const controller = new AbortController();
   let completed = false;
@@ -1466,7 +1475,11 @@ async function runDigestSSE(req, res, body) {
       name: 'fetching',
       label: '拉取消息',
       status: 'done',
-      detail: `${collection.message_count} 条${collection.no_matching_filters ? ` / 筛选前 ${collection.pre_filter_message_count || 0} 条` : (collection.truncated ? ` / 已截取 ${collection.scanned_message_count} 条` : '')} · ${collection.source_label}`,
+      detail: [
+        `${collection.message_count} 条${collection.no_matching_filters ? ` / 筛选前 ${collection.pre_filter_message_count || 0} 条` : (collection.truncated ? ` / 已截取 ${collection.scanned_message_count} 条` : '')}`,
+        mediaStatusDetail(collection.media_status),
+        collection.source_label,
+      ].filter(Boolean).join(' · '),
     });
     logInfo('digest_messages_collected', {
       account_id: accountId,
@@ -1488,7 +1501,16 @@ async function runDigestSSE(req, res, body) {
       logWarn('digest_below_minimum', { group_id: groupId, message_count: collection.message_count, min_messages: body.min_messages });
     }
 
-    sendStage({ name: 'summarizing', label: 'AI 总结', status: 'running', detail: `${collection.message_count} 条消息${collection.messages?.some(m => m.link_previews?.length) ? ' · 含链接打开结果' : ''}` });
+    sendStage({
+      name: 'summarizing',
+      label: 'AI 总结',
+      status: 'running',
+      detail: [
+        `${collection.message_count} 条消息`,
+        collection.messages?.some(m => m.link_previews?.length) ? '含链接打开结果' : '',
+        mediaStatusDetail(collection.media_status),
+      ].filter(Boolean).join(' · '),
+    });
     const digest = await summarizeDigest({
       settings,
       groupName: collection.group_name,
@@ -1510,6 +1532,7 @@ async function runDigestSSE(req, res, body) {
     digest.scanned_message_count = collection.scanned_message_count || collection.message_count;
     digest.truncated = !!collection.truncated;
     digest.source_label = collection.source_label;
+    digest.media_status = collection.media_status || null;
     sendStage({ name: 'summarizing', label: 'AI 总结', status: 'done', detail: digest.model });
     logInfo('digest_summarized', { group_id: groupId, digest_id: digest.digest_id, model: digest.model, topics: digest.topics?.length || 0, links: digest.links?.length || 0 });
 

@@ -136,6 +136,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         pre_filter_message_count: rawMessages.length,
         scanned_message_count: real.scanned_message_count,
         truncated: !!real.truncated,
+        media_status: summarizeMediaStatus(filtered),
         filter_active: filterActive,
         no_matching_filters: filterActive && rawMessages.length > 0 && filtered.length === 0,
         below_minimum: Number(min_messages || 0) > 0 && filtered.length < Number(min_messages || 0),
@@ -189,6 +190,41 @@ function redactMessageSecrets(message) {
     ...message,
     content: redactSecrets(message?.content),
   };
+}
+
+function summarizeMediaStatus(messages = []) {
+  const status = {
+    media_messages: 0,
+    attached: 0,
+    metadata_only: 0,
+    omitted: 0,
+  };
+  for (const msg of Array.isArray(messages) ? messages : []) {
+    const media = msg?.media || {};
+    if (!media || typeof media !== 'object') continue;
+    const isVisual = msg.type === 'image' || msg.type === 'video' || isVideoLikeMedia(media);
+    const isAudio = msg.type === 'voice' || isAudioLikeMedia(media);
+    if (!isVisual && !isAudio) continue;
+    status.media_messages++;
+    const attached = !!(media.data_url || media.frame_data_url || media.audio_data_url);
+    if (attached) status.attached++;
+    else status.metadata_only++;
+    if (media.payload_omitted_reason || !attached) status.omitted++;
+  }
+  return status.media_messages ? status : null;
+}
+
+function isVideoLikeMedia(media = {}) {
+  const ext = String(media.ext || '').toLowerCase();
+  const name = String(media.file_name || '').toLowerCase();
+  return ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm'].includes(ext) || /\.(mp4|mov|m4v|avi|mkv|webm)$/i.test(name);
+}
+
+function isAudioLikeMedia(media = {}) {
+  const ext = String(media.ext || '').toLowerCase();
+  const name = String(media.file_name || '').toLowerCase();
+  return ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'oga', 'webm', 'flac', 'amr', 'silk', 'aud'].includes(ext)
+    || /\.(mp3|wav|m4a|aac|ogg|oga|webm|flac|amr|silk|aud)$/i.test(name);
 }
 
 function applyFilters(messages, filters = {}) {

@@ -306,6 +306,7 @@ async function runGroupDigest({ settings, account, group, window }) {
   digest.scanned_message_count = collection.scanned_message_count || collection.message_count;
   digest.truncated = !!collection.truncated;
   digest.source_label = collection.source_label;
+  digest.media_status = collection.media_status || null;
   const pngDataUrl = await renderDigestPngDataUrl(digest, settings.render);
   const saved = await saveRenderedPng({ settings, digest, png_data_url: pngDataUrl });
   const cursor = latestWindowCursor || latestCursor || String(Date.now());

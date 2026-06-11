@@ -431,6 +431,7 @@ function persistedDigest(digest = {}) {
     scanned_message_count: Number(digest.scanned_message_count || digest.message_count || 0),
     truncated: !!digest.truncated,
     source_label: String(digest.source_label || ''),
+    media_status: cleanMediaStatus(digest.media_status),
     model: String(digest.model || ''),
     headline: String(digest.headline || ''),
     highlights: cleanHighlights(digest.highlights),
@@ -441,6 +442,19 @@ function persistedDigest(digest = {}) {
     quotes: cleanQuotes(digest.quotes),
     __render: cleanRender(digest.__render),
     created_at: String(digest.created_at || new Date().toISOString()),
+  };
+}
+
+function cleanMediaStatus(value) {
+  const status = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!status) return null;
+  const mediaMessages = Math.max(0, Number(status.media_messages || 0) || 0);
+  if (!mediaMessages) return null;
+  return {
+    media_messages: mediaMessages,
+    attached: Math.max(0, Number(status.attached || 0) || 0),
+    metadata_only: Math.max(0, Number(status.metadata_only || 0) || 0),
+    omitted: Math.max(0, Number(status.omitted || 0) || 0),
   };
 }
 
