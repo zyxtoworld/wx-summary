@@ -3,6 +3,7 @@
 
 const TOKEN = window.__WX_TOKEN__;
 const $app = document.getElementById('app');
+const MAX_SCHEDULER_INTERVAL_MS = 24 * 24 * 60 * 60 * 1000;
 let _appState = null;
 let _keyboardShortcutsAttached = false;
 let _routeSeq = 0;
@@ -134,6 +135,11 @@ function renderBootstrapError(error) {
 
 function handleAccountSwitch() {
   abortActiveDigest('切换账号');
+  resetDigestAccountState();
+  route();
+}
+
+function resetDigestAccountState() {
   _state_digest.selectedGroups.clear();
   _state_digest.lastDigest = null;
   _state_digest.lastSavedItem = null;
@@ -143,9 +149,10 @@ function handleAccountSwitch() {
   _state_digest.lastTextDone = 0;
   _state_digest.lastTextTotal = 0;
   _state_digest.lastTextPartialReason = '';
+  _state_digest.lastCanvasRenderKey = '';
+  _state_digest.lastSavedRenderKey = '';
   _state_digest.progress = null;
   stopDigestProgressPaintTimer();
-  route();
 }
 
 function abortActiveDigest(reason = '取消') {
@@ -214,9 +221,13 @@ async function refreshTopbarAccounts() {
   try {
     const accounts = await api('/api/accounts');
     const sel = document.getElementById('account-switcher');
+    const previousValue = sel?.value || '';
     sel.innerHTML = accounts.length
       ? accounts.map(a => `<option value="${escapeHtml(a.id || a.wxid)}">${escapeHtml(a.name)} (${escapeHtml(a.wxid)})</option>`).join('')
       : '<option value="">未检测到微信账号</option>';
+    const stillAvailable = previousValue && accounts.some(a => (a.id || a.wxid) === previousValue);
+    if (stillAvailable) sel.value = previousValue;
+    else if (previousValue && sel.value !== previousValue) resetDigestAccountState();
     sel.disabled = !accounts.length;
     if (sel.dataset.bound !== '1') {
       sel.addEventListener('change', handleAccountSwitch);
@@ -385,6 +396,10 @@ function parseDurationParts(value, fallback = '30m') {
   return { amount, unit: match[2] };
 }
 
+function durationPartScale(unit) {
+  return unit === 'm' ? 60 * 1000 : unit === 'h' ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+}
+
 function setDurationControl(fieldId, value, fallback) {
   const parts = parseDurationParts(value, fallback);
   const hidden = document.getElementById(fieldId);
@@ -395,15 +410,21 @@ function setDurationControl(fieldId, value, fallback) {
   if (unit) unit.value = parts.unit;
 }
 
-function getDurationControlValue(fieldId, fallback) {
+function getDurationControlValue(fieldId, fallback, { maxMs = 0 } = {}) {
   const fallbackParts = parseDurationParts(fallback);
-  const amount = Math.max(1, Math.min(999, parseInt(document.getElementById(`${fieldId}-value`)?.value || '', 10) || fallbackParts.amount));
+  let amount = Math.max(1, Math.min(999, parseInt(document.getElementById(`${fieldId}-value`)?.value || '', 10) || fallbackParts.amount));
   const unit = ['m', 'h', 'd'].includes(document.getElementById(`${fieldId}-unit`)?.value)
     ? document.getElementById(`${fieldId}-unit`).value
     : fallbackParts.unit;
+  if (maxMs) {
+    const maxAmount = Math.max(1, Math.floor(maxMs / durationPartScale(unit)));
+    amount = Math.min(amount, maxAmount);
+  }
   const value = `${amount}${unit}`;
   const hidden = document.getElementById(fieldId);
   if (hidden) hidden.value = value;
+  const amountInput = document.getElementById(`${fieldId}-value`);
+  if (amountInput) amountInput.value = amount;
   return value;
 }
 
@@ -679,6 +700,8 @@ let _state_digest = {
   lastTextDone: 0,
   lastTextTotal: 0,
   lastTextPartialReason: '',
+  lastCanvasRenderKey: '',
+  lastSavedRenderKey: '',
   generating: false,
   abortController: null,
   activeBatchId: '',
@@ -700,6 +723,8 @@ const DIGEST_ACCENTS = [
 ];
 const DIGEST_GROUP_CACHE_TTL_MS = 30 * 1000;
 const DIGEST_GROUP_CACHE = new Map();
+const DIGEST_CANVAS_MAX_DEVICE_SIDE = 32767;
+const DIGEST_CANVAS_MAX_DEVICE_PIXELS = 80_000_000;
 
 function digestGroupCacheKey(accountId = selectedAccountId()) {
   return accountId || '__default__';
@@ -1038,6 +1063,8 @@ async function renderDigest() {
       onPreview: selection => {
         applyDigestRenderSelection(selection);
         drawDigestCanvas(_state_digest.lastDigest);
+        _state_digest.lastCanvasRenderKey = digestRenderStateKey(selection);
+        updatePreviewSavedRenderState({ notify: true });
       },
       onSave: async selection => {
         const previousSelection = currentDigestRenderSelection();
@@ -1053,25 +1080,38 @@ async function renderDigest() {
             },
           });
           _state_digest.lastSavedItem = r.item || _state_digest.lastSavedItem;
+          _state_digest.lastCanvasRenderKey = digestRenderStateKey(selection);
+          _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
+          updatePreviewSavedRenderState();
           return r;
         } catch (err) {
           applyDigestRenderSelection(previousSelection);
           drawDigestCanvas(_state_digest.lastDigest);
+          _state_digest.lastCanvasRenderKey = digestRenderStateKey(previousSelection);
+          updatePreviewSavedRenderState();
           throw err;
         }
       },
     });
   });
-  document.getElementById('btn-download').addEventListener('click', downloadCanvas);
+  document.getElementById('btn-download').addEventListener('click', e => withBusyButtons(e.currentTarget, downloadCanvas));
   const previewCopyButton = document.getElementById('btn-copy');
   previewCopyButton.addEventListener('click', () => withBusyButtons(previewCopyButton, copyCanvas));
   document.getElementById('digest-canvas').addEventListener('click', () => {
     const canvas = document.getElementById('digest-canvas');
     if (!canvas.width || !canvas.height) return;
-    showImageZoomModal({
-      title: _state_digest.lastDigest?.group || '长图预览',
-      src: canvas.toDataURL('image/png'),
-    });
+    const status = document.getElementById('preview-status');
+    try {
+      showImageZoomModal({
+        title: _state_digest.lastDigest?.group || '长图预览',
+        src: canvasToPngDataUrl(canvas),
+      });
+    } catch (e) {
+      if (status) {
+        status.className = 'status err';
+        status.textContent = `打开预览失败：${e.message || '未知错误'}`;
+      }
+    }
   });
   const previewRevealButton = document.getElementById('btn-reveal');
   previewRevealButton.addEventListener('click', () => withBusyButtons(previewRevealButton, async () => {
@@ -1147,6 +1187,8 @@ function bindDigestRenderOptions() {
       _state_digest.theme = normalizeDigestTheme(radio.value);
       if (_state_digest.lastDigest && !document.getElementById('preview-card')?.classList.contains('hidden')) {
         drawDigestCanvas(_state_digest.lastDigest);
+        _state_digest.lastCanvasRenderKey = digestRenderStateKey();
+        updatePreviewSavedRenderState({ notify: true });
       }
     });
   });
@@ -1155,6 +1197,8 @@ function bindDigestRenderOptions() {
       _state_digest.fontsize = normalizeDigestFontSize(radio.value);
       if (_state_digest.lastDigest && !document.getElementById('preview-card')?.classList.contains('hidden')) {
         drawDigestCanvas(_state_digest.lastDigest);
+        _state_digest.lastCanvasRenderKey = digestRenderStateKey();
+        updatePreviewSavedRenderState({ notify: true });
       }
     });
   });
@@ -1207,6 +1251,28 @@ function digestRenderPayload(selection = currentDigestRenderSelection()) {
     font_size: normalizeDigestFontSize(selection.fontsize),
     accent_color: digestAccentColor(selection.accent, theme === 'dark'),
   };
+}
+
+function digestRenderStateKey(selection = currentDigestRenderSelection()) {
+  return JSON.stringify(digestRenderPayload(selection));
+}
+
+function updatePreviewSavedRenderState({ notify = false } = {}) {
+  const revealButton = document.getElementById('btn-reveal');
+  const status = document.getElementById('preview-status');
+  if (!_state_digest.lastDigest || !revealButton) return;
+  const hasSavedFile = !!_state_digest.lastSavedItem;
+  const currentKey = _state_digest.lastCanvasRenderKey || digestRenderStateKey();
+  const savedKey = _state_digest.lastSavedRenderKey || '';
+  const stale = hasSavedFile && savedKey && currentKey !== savedKey;
+  revealButton.disabled = !hasSavedFile;
+  revealButton.title = hasSavedFile
+    ? (stale ? '打开的是上次保存的文件，样式可能不是当前预览' : '在文件夹中显示最后一张')
+    : '保存后可用';
+  if (notify && status && stale) {
+    status.className = 'status warn';
+    status.textContent = '当前预览样式尚未保存；文件夹里仍是上次保存版本。';
+  }
 }
 
 function currentDigestBatchSnapshot() {
@@ -1615,6 +1681,8 @@ async function generateDigest({ previewText = false } = {}) {
   _state_digest.lastTextDone = 0;
   _state_digest.lastTextTotal = 0;
   _state_digest.lastTextPartialReason = '';
+  _state_digest.lastCanvasRenderKey = '';
+  _state_digest.lastSavedRenderKey = '';
   scrollDigestWorkIntoView($progress);
   const selectedIds = [..._state_digest.selectedGroups];
   let groups;
@@ -1669,7 +1737,9 @@ async function generateDigest({ previewText = false } = {}) {
 
   const stageMap = {};
   const stageSnapshots = new Map();
-  const stagesOrder = previewText ? ['fetching', 'summarizing', 'rendering'] : ['fetching', 'summarizing', 'rendering', 'saving'];
+  const stagesOrder = previewText
+    ? ['fetching', 'summarizing', 'received', 'rendering']
+    : ['fetching', 'summarizing', 'received', 'rendering', 'saving'];
   function stripElapsedDetail(detail = '') {
     return stripDigestElapsedDetail(detail);
   }
@@ -1768,6 +1838,17 @@ async function generateDigest({ previewText = false } = {}) {
       label: `[${index + 1}/${targets.length}] ${targets[index].name} · ${stage.label}`,
     };
   }
+  function serverStageForClient(stage = {}) {
+    if (stage.name !== 'rendering') return stage;
+    return {
+      name: 'received',
+      label: '接收摘要结果',
+      status: stage.status,
+      detail: stage.status === 'done'
+        ? (previewText ? '准备整理文本预览' : '准备绘制长图')
+        : '等待摘要数据到达浏览器',
+    };
+  }
 
   // 用 fetch + ReadableStream 解析 SSE（不用 EventSource 是为了带 X-WX-Token）
   try {
@@ -1802,13 +1883,32 @@ async function generateDigest({ previewText = false } = {}) {
           previewText,
           batchSnapshot,
           signal: controller.signal,
-          onStage: stage => upsertStage({
-            ...groupStage(i, stage),
-          }),
+          onStage: stage => {
+            const clientStage = serverStageForClient(stage);
+            if (clientStage) upsertStage(groupStage(i, clientStage));
+          },
         });
         digests[i] = digest;
+        upsertStage(groupStage(i, {
+          name: 'received',
+          label: '接收摘要结果',
+          status: 'done',
+          detail: [digest.model, `${digest.topics?.length || 0} 条主线`, `${digest.links?.length || 0} 个链接`].filter(Boolean).join(' · '),
+        }));
         if (previewText) {
+          upsertStage(groupStage(i, {
+            name: 'rendering',
+            label: '整理文本预览',
+            status: 'running',
+            detail: `已收到 ${digests.filter(Boolean).length}/${targets.length} 个群`,
+          }));
           renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
+          upsertStage(groupStage(i, {
+            name: 'rendering',
+            label: '整理文本预览',
+            status: 'done',
+            detail: `已整理 ${digests.filter(Boolean).length}/${targets.length}`,
+          }));
         } else {
           await enqueueRender(async () => {
             if (controller.signal.aborted) return;
@@ -1816,28 +1916,40 @@ async function generateDigest({ previewText = false } = {}) {
             if (livePreviewCard) livePreviewCard.classList.remove('hidden');
             _state_digest.lastDigest = digest;
             _state_digest.lastSavedItem = null;
+            _state_digest.lastCanvasRenderKey = digestRenderStateKey(batchSnapshot.render);
+            _state_digest.lastSavedRenderKey = '';
             const revealButton = document.getElementById('btn-reveal');
             if (revealButton) {
               revealButton.disabled = true;
               revealButton.title = '保存后可用';
             }
+            upsertStage(groupStage(i, {
+              name: 'rendering',
+              label: '绘制长图',
+              status: 'running',
+              detail: [digest.topics?.length ? `${digest.topics.length} 条主线` : '', digest.links?.length ? `${digest.links.length} 个链接` : ''].filter(Boolean).join(' · '),
+            }));
             const canvas = drawDigestCanvas(digest, null, batchSnapshot.render);
             if (controller.signal.aborted) return;
-            upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'running' }));
+            upsertStage(groupStage(i, {
+              name: 'rendering',
+              label: '绘制长图',
+              status: 'done',
+              detail: canvasDisplaySizeLabel(canvas),
+            }));
+            upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'running', detail: '写入 outputs/digests' }));
             try {
               const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal, batchId, renderSelection: batchSnapshot.render });
               if (controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
+              _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
               digest.file_path = saved.item.file_path;
-              if (revealButton) {
-                revealButton.disabled = false;
-                revealButton.title = '在文件夹中显示最后一张';
-              }
-              upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'done', detail: saved.item.relative_path }));
+              updatePreviewSavedRenderState();
+              upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'done', detail: saved.item.relative_path }));
               scrollDigestWorkIntoView(document.getElementById('preview-card'));
             } catch (e) {
               if (e?.name === 'AbortError' || controller.signal.aborted) {
-                upsertStage(groupStage(i, { name: 'saving', label: '保存长图', status: 'done', detail: '已取消' }));
+                upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'done', detail: '已取消' }));
                 return;
               }
               failures.push({ group: target.name, error: e.message });
@@ -2575,6 +2687,7 @@ function drawDigestCanvas(d, targetCanvas = null, renderSelection = currentDiges
   // 第一遍测高度
   const tmp = document.createElement('canvas').getContext('2d');
   const totalH = draw(tmp, true);
+  assertDigestCanvasSize(W, totalH, dpr);
 
   canvas.width = W * dpr;
   canvas.height = totalH * dpr;
@@ -2586,10 +2699,38 @@ function drawDigestCanvas(d, targetCanvas = null, renderSelection = currentDiges
   return canvas;
 }
 
+function assertDigestCanvasSize(width, height, dpr = 1) {
+  const deviceWidth = Math.ceil(Number(width || 0) * dpr);
+  const deviceHeight = Math.ceil(Number(height || 0) * dpr);
+  const pixels = deviceWidth * deviceHeight;
+  if (!deviceWidth || !deviceHeight || deviceWidth > DIGEST_CANVAS_MAX_DEVICE_SIDE || deviceHeight > DIGEST_CANVAS_MAX_DEVICE_SIDE || pixels > DIGEST_CANVAS_MAX_DEVICE_PIXELS) {
+    throw new Error(`长图内容过长，当前预计尺寸约 ${Math.round(width || 0)}×${Math.round(height || 0)}。请缩短时间范围、减少筛选后的内容，或改用「仅预览文本」。`);
+  }
+}
+
+function canvasToPngDataUrl(canvas) {
+  if (!canvas?.width || !canvas?.height) throw new Error('长图还没有渲染完成。');
+  const png = canvas.toDataURL('image/png');
+  if (!png || png === 'data:,' || !png.startsWith('data:image/png')) {
+    throw new Error('浏览器未能编码这张长图，可能是内容过长或画布尺寸超过限制。请缩短时间范围，或改用「仅预览文本」。');
+  }
+  return png;
+}
+
+function canvasToPngBlob(canvas) {
+  if (!canvas?.width || !canvas?.height) return Promise.reject(new Error('长图还没有渲染完成。'));
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(blob => {
+      if (blob) resolve(blob);
+      else reject(new Error('浏览器未能导出这张长图，可能是内容过长或画布尺寸超过限制。'));
+    }, 'image/png');
+  });
+}
+
 async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null, batchId = '', renderSelection = currentDigestRenderSelection() } = {}) {
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   const canvas = renderedCanvas || document.getElementById('digest-canvas') || drawDigestCanvas(digest);
-  const png_data_url = canvas.toDataURL('image/png');
+  const png_data_url = canvasToPngDataUrl(canvas);
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload(renderSelection) }, png_data_url } });
 }
@@ -2668,14 +2809,11 @@ function restoreDigestOutputs() {
     if (previewCard && canvas) {
       previewCard.classList.remove('hidden');
       drawDigestCanvas(_state_digest.lastDigest, canvas);
+      _state_digest.lastCanvasRenderKey = _state_digest.lastCanvasRenderKey || digestRenderStateKey();
       document.getElementById('btn-download')?.removeAttribute('disabled');
       document.getElementById('btn-copy')?.removeAttribute('disabled');
       document.getElementById('btn-rerender')?.removeAttribute('disabled');
-      const revealButton = document.getElementById('btn-reveal');
-      if (revealButton) {
-        revealButton.disabled = !_state_digest.lastSavedItem;
-        revealButton.title = _state_digest.lastSavedItem ? '在文件夹中显示最后一张' : '保存后可用';
-      }
+      updatePreviewSavedRenderState();
     }
   }
   if (_state_digest.lastTextMarkdown?.trim()) {
@@ -2791,22 +2929,44 @@ function splitAsciiWordOverflow(line, ch) {
   return { head, tail: match[1] + ch };
 }
 
-function downloadCanvas() {
+async function downloadCanvas() {
   const c = document.getElementById('digest-canvas');
-  c.toBlob(blob => {
+  const status = document.getElementById('preview-status');
+  try {
+    if (status) {
+      status.className = 'status';
+      status.textContent = '正在准备下载...';
+    }
+    const blob = await canvasToPngBlob(c);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `wx-summary_${(_state_digest.lastDigest?.group || 'digest').replace(/[^\w一-龥]/g, '_')}_${Date.now()}.png`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }, 'image/png');
+    if (status) {
+      status.className = 'status ok';
+      status.textContent = '✓ 已开始下载 PNG';
+    }
+  } catch (e) {
+    if (status) {
+      status.className = 'status err';
+      status.textContent = `下载失败：${e.message || '未知错误'}`;
+    }
+  }
 }
 
 function imageSizeLabel(size) {
   const width = Number(size?.width || 0);
   const height = Number(size?.height || 0);
   return width > 0 && height > 0 ? `${width}×${height}` : '';
+}
+
+function canvasDisplaySizeLabel(canvas) {
+  const width = Number(canvas?.width || 0);
+  const height = Number(canvas?.height || 0);
+  if (!width || !height) return '';
+  return `${Math.round(width / 2)}×${Math.round(height / 2)}`;
 }
 
 async function recordBrowserClipboardCopy({ digestId, clipboard } = {}) {
@@ -2823,7 +2983,6 @@ async function recordBrowserClipboardCopy({ digestId, clipboard } = {}) {
 
 async function copyCanvas() {
   const c = document.getElementById('digest-canvas');
-  const blob = await new Promise(r => c.toBlob(r, 'image/png'));
   const canvasSize = { width: c.width, height: c.height };
   const btn = document.getElementById('btn-copy');
   const status = document.getElementById('preview-status');
@@ -2833,6 +2992,7 @@ async function copyCanvas() {
       status.className = 'status';
       status.textContent = '复制中...';
     }
+    const blob = await canvasToPngBlob(c);
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
     void recordBrowserClipboardCopy({ digestId: _state_digest.lastSavedItem?.digest_id, clipboard: canvasSize });
     btn.textContent = '✓ 已复制';
@@ -3845,7 +4005,7 @@ async function renderSettings() {
       groups: { whitelist: mergeGroupRefs([...wl, ...perGroup.map(overrideGroupRef)]) },
       scheduler: {
         enabled: document.getElementById('s-scheduler').checked,
-        default_interval: getDurationControlValue('s-scheduler-interval', '30m'),
+        default_interval: getDurationControlValue('s-scheduler-interval', '30m', { maxMs: MAX_SCHEDULER_INTERVAL_MS }),
         digest_window: getDurationControlValue('s-scheduler-window', '4h'),
         min_messages_per_digest: parseInt(document.getElementById('s-scheduler-min').value || '30', 10),
         per_group: perGroup,

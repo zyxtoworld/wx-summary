@@ -7,6 +7,7 @@ import { protectText, unprotectToText } from './dpapi.js';
 export const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 export const SECRETS_FILE = path.join(DATA_DIR, 'secrets.bin');
 export const CURSORS_FILE = path.join(DATA_DIR, 'cursors.json');
+export const MAX_SCHEDULER_INTERVAL_MS = 24 * 86_400_000;
 const DEFAULT_LOG_FILE = './outputs/.tmp/wx-summary.log';
 let SETTINGS_SAVE_QUEUE = Promise.resolve();
 
@@ -276,7 +277,7 @@ export function normalizeSettings(settings) {
   s.groups.recent = normalizeGroupRefs(s.groups.recent, 5);
   s.scheduler = s.scheduler && typeof s.scheduler === 'object' ? s.scheduler : {};
   s.scheduler.enabled = !!s.scheduler.enabled;
-  s.scheduler.default_interval = normalizeDurationText(s.scheduler.default_interval, '30m');
+  s.scheduler.default_interval = normalizeDurationText(s.scheduler.default_interval, '30m', { max_ms: MAX_SCHEDULER_INTERVAL_MS });
   s.scheduler.digest_window = normalizeDurationText(s.scheduler.digest_window, '4h');
   s.scheduler.min_messages_per_digest = finiteInteger(s.scheduler.min_messages_per_digest, 30, 1, 10000);
   s.scheduler.per_group = normalizePerGroupOverrides([
@@ -452,9 +453,21 @@ export function durationToMs(value) {
   return n * scale;
 }
 
-function normalizeDurationText(value, fallback) {
+function normalizeDurationText(value, fallback, { max_ms = 0 } = {}) {
   const raw = String(value || '').trim().toLowerCase();
-  return durationToMs(raw) ? raw : fallback;
+  const ms = durationToMs(raw);
+  if (!ms) return fallback;
+  if (max_ms && ms > max_ms) return clampDurationText(raw, max_ms, fallback);
+  return raw;
+}
+
+function clampDurationText(raw, maxMs, fallback) {
+  const match = String(raw || '').trim().toLowerCase().match(/^(\d+)\s*([mhd])$/);
+  if (!match) return fallback;
+  const unit = match[2];
+  const scale = unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 86_400_000;
+  const amount = Math.max(1, Math.floor(Number(maxMs || 0) / scale));
+  return amount ? `${amount}${unit}` : fallback;
 }
 
 function outputDirIsSafe(value) {
@@ -489,7 +502,9 @@ export function validateSettingsObject(settings, { requireBaseUrl = false } = {}
     errors.push('output.dir must stay inside outputs/ and outside outputs/.tmp');
   }
   if (settings.web.host !== '127.0.0.1') errors.push('web.host is locked to 127.0.0.1');
-  if (!durationToMs(settings.scheduler.default_interval)) errors.push('scheduler.default_interval must look like 30m, 4h, or 1d');
+  const schedulerIntervalMs = durationToMs(settings.scheduler.default_interval);
+  if (!schedulerIntervalMs) errors.push('scheduler.default_interval must look like 30m, 4h, or 1d');
+  else if (schedulerIntervalMs > MAX_SCHEDULER_INTERVAL_MS) errors.push('scheduler.default_interval must be 24d or less');
   if (!durationToMs(settings.scheduler.digest_window)) errors.push('scheduler.digest_window must look like 30m, 4h, or 1d');
   return errors;
 }

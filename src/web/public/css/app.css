@@ -148,12 +148,21 @@ main { padding: var(--gap-5); max-width: 1280px; margin: 0 auto; width: 100%; }
   align-items: center;
   justify-content: space-between;
   gap: var(--gap-3);
+  flex-wrap: wrap;
   margin-bottom: var(--gap-3);
 }
-.card-head .card-title { margin: 0; }
+.card-head .card-title {
+  margin: 0;
+  min-width: 0;
+}
 .preview-actions.compact {
   align-items: center;
   gap: var(--gap-2);
+  min-width: 0;
+}
+.preview-actions.compact .status {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .notice-card {

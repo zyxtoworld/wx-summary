@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { collectMessages, listAccounts, listGroups } from '../collector/index.js';
-import { durationToMs, loadSettings } from '../config/settings.js';
+import { MAX_SCHEDULER_INTERVAL_MS, durationToMs, loadSettings } from '../config/settings.js';
 import { discardRenderedHistoryItem, saveRenderedPng } from '../renderer/output.js';
 import { renderDigestPngDataUrl } from '../renderer/server-png.js';
 import { summarizeDigest, sanitizeText } from '../summarizer/llm.js';
@@ -21,11 +21,14 @@ const state = {
 
 let timer = null;
 let activeRunPromise = null;
+let schedulerGeneration = 0;
 const MAX_CURSOR_SEEN_MESSAGES = 20000;
 
 export async function startScheduler({ immediate = false } = {}) {
   stopScheduler();
+  const generation = schedulerGeneration;
   const settings = await loadSettings({ includeSecrets: true });
+  if (generation !== schedulerGeneration) return getSchedulerStatus();
   state.enabled = !!settings.scheduler.enabled;
   state.interval_ms = durationToMs(settings.scheduler.default_interval);
   state.timer_active = false;
@@ -35,7 +38,7 @@ export async function startScheduler({ immediate = false } = {}) {
     logInfo('scheduler_disabled');
     return getSchedulerStatus();
   }
-  scheduleNext(settings, immediate ? 0 : state.interval_ms);
+  scheduleNext(settings, immediate ? 0 : state.interval_ms, generation);
   logInfo('scheduler_started', { interval_ms: state.interval_ms, next_run_at: state.next_run_at });
   return getSchedulerStatus();
 }
@@ -45,6 +48,7 @@ export async function restartScheduler() {
 }
 
 export async function stopScheduler({ wait = false, timeout_ms = 30000 } = {}) {
+  schedulerGeneration++;
   if (timer) clearTimeout(timer);
   timer = null;
   state.timer_active = false;
@@ -112,19 +116,23 @@ function waitForSchedulerRun(runPromise, timeoutMs) {
   ]);
 }
 
-function scheduleNext(settings, delayMs) {
-  const delay = Math.max(1000, Number(delayMs || 0));
+function scheduleNext(settings, delayMs, generation = schedulerGeneration) {
+  if (generation !== schedulerGeneration) return;
+  const delay = Math.min(MAX_SCHEDULER_INTERVAL_MS, Math.max(1000, Number(delayMs || 0)));
   state.timer_active = true;
   state.next_run_at = new Date(Date.now() + delay).toISOString();
   timer = setTimeout(async () => {
+    if (generation !== schedulerGeneration) return;
     timer = null;
     try {
       await runSchedulerOnce({ reason: 'timer' });
     } catch {
       // Keep the daemon alive; status carries the sanitized failure.
     } finally {
+      if (generation !== schedulerGeneration) return;
       const latest = await loadSettings({ includeSecrets: true }).catch(() => settings);
-      if (latest.scheduler?.enabled) scheduleNext(latest, durationToMs(latest.scheduler.default_interval));
+      if (generation !== schedulerGeneration) return;
+      if (latest.scheduler?.enabled) scheduleNext(latest, durationToMs(latest.scheduler.default_interval), generation);
       else {
         state.enabled = false;
         state.timer_active = false;
@@ -610,8 +618,8 @@ function cursorObjectFromValue(value) {
     if (key === 'ts') out.timestamp = normalizeCursorNumber(raw);
     else if (key === 'seq') out.sort_seq = normalizeCursorNumber(raw);
     else if (key === 'lid') out.local_id = normalizeCursorNumber(raw);
-    else if (key === 'sid') out.server_id = raw;
-    else if (key === 'id') out.id = raw;
+    else if (key === 'sid') out.server_id = decodeCursorComponent(raw);
+    else if (key === 'id') out.id = decodeCursorComponent(raw);
   }
   return Object.keys(out).length ? out : null;
 }
@@ -629,7 +637,17 @@ function normalizeCursorNumber(value) {
 }
 
 function cursorComponent(value) {
-  return String(value || '').trim().replace(/[^\w:.-]/g, '.').slice(0, 48);
+  const text = String(value || '').trim().slice(0, 120);
+  return text ? encodeURIComponent(text) : '';
+}
+
+function decodeCursorComponent(value) {
+  const text = String(value || '');
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
 }
 
 function sleep(ms) {

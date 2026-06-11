@@ -759,8 +759,14 @@ async function sanitizedLogTail(limit = 200, loadedSettings = null) {
     logFile = resolveInsideTmp(settings.logging.file || './outputs/.tmp/wx-summary.log', 'logging.file');
   } catch {}
   const log = await fsp.readFile(logFile, 'utf-8').catch(() => '');
-  const lines = log.split(/\r?\n/).map(line => sanitizeText(line)).filter(Boolean).slice(-safeLimit);
-  return lines.length ? lines : (await readLogTail(safeLimit)).map(line => sanitizeText(line)).filter(Boolean);
+  const lines = log.split(/\r?\n/).map(sanitizeLogLine).filter(Boolean).slice(-safeLimit);
+  return lines.length ? lines : (await readLogTail(safeLimit)).map(sanitizeLogLine).filter(Boolean);
+}
+
+function sanitizeLogLine(line = '') {
+  return sanitizeText(line)
+    .replace(/"group"\s*:\s*"([^"\\]|\\.)*"/g, '"group":"[redacted-group]"')
+    .replace(/"group_name"\s*:\s*"([^"\\]|\\.)*"/g, '"group_name":"[redacted-group]"');
 }
 
 async function postSaveSettingsWarnings(patch) {
