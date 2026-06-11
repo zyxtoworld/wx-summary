@@ -742,6 +742,7 @@ async function handleApi(req, res, parsedUrl) {
       wechat,
       scheduler: getSchedulerStatus(),
       secrets_invalid: settings._secrets_invalid,
+      settings_invalid: settings._settings_invalid || null,
     });
   }
 

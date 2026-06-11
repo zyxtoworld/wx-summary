@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { DATA_DIR, DEFAULT_DIGESTS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TMP_DIR, outputDirFromSettings, resolveInsideTmp } from '../lib/paths.js';
-import { cloneJson, deepMerge, ensureDir, readJson, writeJsonAtomic } from '../lib/json-store.js';
+import { cloneJson, deepMerge, ensureDir, writeJsonAtomic } from '../lib/json-store.js';
 import { protectText, unprotectToText } from './dpapi.js';
 
 export const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
@@ -99,6 +99,7 @@ function stripSensitive(settings) {
   delete clean.wechat.manual_key_set;
   delete clean.wechat.clear_manual_key;
   delete clean._secrets_invalid;
+  delete clean._settings_invalid;
   return clean;
 }
 
@@ -113,6 +114,46 @@ export async function loadSecrets({ file = SECRETS_FILE } = {}) {
     await fsp.rm(file, { force: true }).catch(() => {});
     return { secrets: { api_key: '', manual_key: '' }, invalid: true, error: e?.message || String(e) };
   }
+}
+
+async function loadSettingsFile(file = SETTINGS_FILE) {
+  try {
+    const raw = await fsp.readFile(file, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw Object.assign(new Error('settings.json must contain a JSON object'), { code: 'SETTINGS_INVALID_SHAPE' });
+    }
+    return { raw: parsed, invalid: null };
+  } catch (e) {
+    if (e?.code === 'ENOENT') return { raw: {}, invalid: null };
+    const backup = await backupInvalidSettingsFile(file);
+    return {
+      raw: {},
+      invalid: {
+        backup_path: backup,
+        backup_relative_path: toProjectRelativeSafe(backup),
+        error: e?.message || String(e),
+      },
+    };
+  }
+}
+
+async function backupInvalidSettingsFile(file) {
+  await ensureDir(path.dirname(file));
+  const backup = file.replace(/\.json$/i, `.invalid.${settingsBackupTimestamp(new Date())}.json`);
+  await fsp.rename(file, backup).catch(e => {
+    if (e?.code !== 'ENOENT') throw e;
+  });
+  return backup;
+}
+
+function settingsBackupTimestamp(date) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function toProjectRelativeSafe(file) {
+  return path.relative(PROJECT_ROOT, file).replaceAll(path.sep, '/');
 }
 
 export async function saveSecrets(secrets) {
@@ -132,14 +173,15 @@ export async function saveSecrets(secrets) {
   }
 }
 
-export async function loadSettings({ includeSecrets = false } = {}) {
-  const raw = await readJson(SETTINGS_FILE, {}, { strict: true });
+export async function loadSettings({ includeSecrets = false, settingsFile = SETTINGS_FILE } = {}) {
+  const { raw, invalid } = await loadSettingsFile(settingsFile);
   const merged = normalizeSettings(deepMerge(defaultSettings(), raw));
   const secretState = await loadSecrets();
   merged.llm.api_key_set = !!secretState.secrets.api_key;
   merged.llm.api_key_display = maskSecret(secretState.secrets.api_key);
   merged.wechat.manual_key_set = !!secretState.secrets.manual_key;
   merged._secrets_invalid = !!secretState.invalid;
+  if (invalid) merged._settings_invalid = invalid;
   if (includeSecrets) {
     merged.llm.api_key = secretState.secrets.api_key;
     merged.wechat.manual_key = secretState.secrets.manual_key;

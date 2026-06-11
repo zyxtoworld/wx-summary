@@ -3847,7 +3847,14 @@ async function renderSetup() {
             <span>${secretWarningText}</span>
           </div>`
         : '';
+      const settingsWarning = state.settings_invalid
+        ? `<div class="notice-card setup-secret-warning">
+            <strong>设置文件已损坏，已用默认配置继续启动</strong>
+            <span>原文件已备份到 ${escapeHtml(state.settings_invalid.backup_relative_path || state.settings_invalid.backup_path || 'data/settings.invalid.json')}；重新完成配置后会写入新的 settings.json。</span>
+          </div>`
+        : '';
       $body.innerHTML = `
+        ${settingsWarning}
         ${secretWarning}
         <p>本工具帮你把忙不过来的微信群消息一键总结成长图。</p>
         <ul>
