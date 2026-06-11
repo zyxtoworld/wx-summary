@@ -982,6 +982,37 @@ function hasFailedLlmCapability(value, depth = 0) {
   return Object.values(value).some(item => hasFailedLlmCapability(item, depth + 1));
 }
 
+function publicAccount(account = {}) {
+  return {
+    id: String(account.id || account.wxid || '').trim(),
+    wxid: String(account.wxid || '').trim(),
+    name: String(account.name || account.display_name || account.wxid || account.id || '').trim(),
+    display_name: String(account.display_name || account.name || account.wxid || account.id || '').trim(),
+    wechat_version: account.wechat_version || '4.x',
+    source: account.source || 'wxdb-detected',
+    last_write_time: account.last_write_time || '',
+    note: account.note || '',
+  };
+}
+
+function publicWeixinStatus(status = {}) {
+  const accounts = Array.isArray(status.accounts) ? status.accounts.map(account => publicAccount({
+    id: account.id,
+    wxid: account.wxid,
+    name: account.display_name || account.name,
+    display_name: account.display_name || account.name,
+    last_write_time: account.last_write_time,
+    source: 'wxdb-detected',
+  })).filter(account => account.id || account.wxid) : [];
+  return {
+    running: status.running === true,
+    process_count: Number(status.process_count || 0) || 0,
+    account_count: accounts.length,
+    accounts,
+    message: sanitizeText(status.message || ''),
+  };
+}
+
 function settingsPatchNeedsSchedulerRestart(patch = {}) {
   if (patch?.scheduler) return true;
   if (!patch?.groups || typeof patch.groups !== 'object') return false;
@@ -1048,7 +1079,7 @@ async function handleApi(req, res, parsedUrl) {
       default_output_dir: DEFAULT_DIGESTS_DIR,
       session_token: SESSION_TOKEN,
       data_mode: wechat.accounts?.length ? 'wxdb' : 'unavailable',
-      wechat,
+      wechat: publicWeixinStatus(wechat),
       scheduler: getSchedulerStatus(),
       secrets_invalid: settings._secrets_invalid,
       secrets_invalid_info: settings._secrets_invalid_info || null,
@@ -1057,7 +1088,7 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/accounts' && req.method === 'GET') {
-    return sendJson(res, 200, await listAccounts());
+    return sendJson(res, 200, (await listAccounts()).map(publicAccount));
   }
 
   if (pathname === '/api/groups' && req.method === 'GET') {
@@ -1194,7 +1225,13 @@ async function handleApi(req, res, parsedUrl) {
       delete keyStatus._raw_candidates;
       delete keyStatus._raw_image_keys;
       const dbStatus = await probeWxDb({ raw_keys: rawKeys, deep_scan: deepScan });
-      return sendJson(res, 200, { ok: true, process: processStatus, local_key_scan: localKeyStatus, key: keyStatus, db: dbStatus });
+      return sendJson(res, 200, sanitizeDiagnosticsPayload({
+        ok: true,
+        process: publicWeixinStatus(processStatus),
+        local_key_scan: localKeyStatus,
+        key: keyStatus,
+        db: dbStatus,
+      }));
     } finally {
       if (deepScan) ACTIVE_DEEP_KEY_STATUS = null;
     }
