@@ -101,7 +101,7 @@ function missingWeixinDataMessage() {
     : '未检测到 Weixin.exe，请先登录 Windows 微信后重试。';
 }
 
-export async function collectMessages({ account_id = '', group_id, group_name, since, until, filters = {}, min_messages = 5, signal, onProgress = null } = {}) {
+export async function collectMessages({ account_id = '', group_id, group_name, since, until, filters = {}, min_messages = 1, signal, onProgress = null } = {}) {
   throwIfAborted(signal);
   if (!group_id) {
     throw Object.assign(new Error('请先选择一个本机微信会话。'), { status: 400 });
@@ -169,6 +169,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         readable_shard_count: real.readable_shard_count,
         matching_shard_count: real.matching_shard_count,
         query_time_bounds: real.query_time_bounds || null,
+        message_table_time_range: real.message_table_time_range || null,
         truncated: !!real.truncated,
         media_status: mediaStatus,
         filter_active: filterActive,

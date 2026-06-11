@@ -1327,8 +1327,9 @@ async function handleApi(req, res, parsedUrl) {
   if (pathname === '/api/export-preview' && req.method === 'POST') {
     const body = await readBody(req);
     const settings = await loadSettings();
+    const title = redactContent(body.title || '文本预览', settings.privacy || {}) || '文本预览';
     const markdown = redactContent(body.markdown || '', settings.privacy || {});
-    const item = await savePreviewMarkdown({ settings, title: body.title || '文本预览', markdown });
+    const item = await savePreviewMarkdown({ settings, title, markdown });
     logInfo('preview_markdown_exported', { relative_path: item.relative_path });
     return sendJson(res, 200, { ok: true, item: publicOutputItem(item) });
   }
@@ -1726,6 +1727,10 @@ function emptyCollectionDetail(collection = {}) {
     parts.push(`消息分片：扫描 ${searched || 0} 个、可读 ${readable || 0} 个、含该会话表 ${matching || 0} 个`);
   }
   if (collection.table) parts.push(`会话表 ${sanitizeText(collection.table)}`);
+  const tableRange = collection.message_table_time_range;
+  if (tableRange?.last_time) {
+    parts.push(`消息表最近一条 ${sanitizeText(tableRange.last_time)}${tableRange.row_count ? `（表内约 ${Number(tableRange.row_count || 0)} 条）` : ''}`);
+  }
   return parts.join('；');
 }
 

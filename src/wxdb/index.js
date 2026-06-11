@@ -1012,6 +1012,7 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
   const timeBounds = messageTimeBounds(sinceTs, untilTs);
   const out = [];
   const shardErrors = [];
+  const tableTimeStats = [];
   let readableShards = 0;
   let matchingShards = 0;
 
@@ -1039,11 +1040,22 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
         where (
           (create_time >= ? and create_time <= ?)
           or (create_time >= ? and create_time <= ?)
+          or (create_time >= ? and create_time <= ?)
         )
         order by create_time asc
-      `).all([timeBounds.since_s, timeBounds.until_s, timeBounds.since_ms, timeBounds.until_ms]);
+      `).all([
+        timeBounds.since_s,
+        timeBounds.until_s,
+        timeBounds.since_ms,
+        timeBounds.until_ms,
+        timeBounds.since_us,
+        timeBounds.until_us,
+      ]);
       throwIfAborted(signal);
-      if (!rows.length) continue;
+      if (!rows.length) {
+        collectTableTimeStat(opened.db, tableName, file.name, tableTimeStats);
+        continue;
+      }
       notifyProgress(onProgress, {
         phase: 'fetch_rows',
         label: '拉取消息 · 解析消息行',
@@ -1147,7 +1159,38 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
     readable_shard_count: readableShards,
     matching_shard_count: matchingShards,
     query_time_bounds: timeBounds,
+    message_table_time_range: summarizeTableTimeStats(tableTimeStats),
     truncated: false,
+  };
+}
+
+function collectTableTimeStat(db, tableName, shardName, out) {
+  try {
+    const row = db.prepare(`select min(create_time) as min_time, max(create_time) as max_time, count(*) as row_count from ${tableName}`).get();
+    const count = Number(row?.row_count || 0) || 0;
+    if (!count) return;
+    out.push({
+      shard: shardName,
+      row_count: count,
+      min_time: normalizeWxTimestamp(row.min_time),
+      max_time: normalizeWxTimestamp(row.max_time),
+    });
+  } catch {
+    // Empty-result diagnostics must never make message collection fail.
+  }
+}
+
+function summarizeTableTimeStats(stats = []) {
+  const valid = (Array.isArray(stats) ? stats : [])
+    .filter(item => Number(item.min_time || 0) > 0 || Number(item.max_time || 0) > 0);
+  if (!valid.length) return null;
+  const minTime = Math.min(...valid.map(item => Number(item.min_time || item.max_time || 0)).filter(Boolean));
+  const maxTime = Math.max(...valid.map(item => Number(item.max_time || item.min_time || 0)).filter(Boolean));
+  const rowCount = valid.reduce((sum, item) => sum + (Number(item.row_count || 0) || 0), 0);
+  return {
+    row_count: rowCount,
+    first_time: minTime ? formatMessageTime(minTime) : '',
+    last_time: maxTime ? formatMessageTime(maxTime) : '',
   };
 }
 
@@ -2174,6 +2217,8 @@ function normalizeWxTimestamp(value) {
   if (!value) return 0;
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
+  if (n >= 10_000_000_000_000_000) return Math.floor(n / 1_000_000);
+  if (n >= 10_000_000_000_000) return Math.floor(n / 1000);
   return n > 10_000_000_000 ? n : n * 1000;
 }
 
@@ -2207,6 +2252,8 @@ function messageTimeBounds(sinceSeconds, untilSeconds) {
     until_s: until,
     since_ms: since * 1000,
     until_ms: until * 1000 + 999,
+    since_us: since * 1_000_000,
+    until_us: until * 1_000_000 + 999_999,
   };
 }
 

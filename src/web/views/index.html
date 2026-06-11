@@ -61,9 +61,10 @@
           <div class="quick-range" id="quick-range">
             <button data-range="today">今天</button>
             <button data-range="yesterday">昨天</button>
+            <button data-range="yesterdayToday" class="active">昨天+今天</button>
             <button data-range="last4h">最近 4h</button>
             <button data-range="last12h">最近 12h</button>
-            <button data-range="last1d" class="active">最近 1d</button>
+            <button data-range="last1d">最近 24h</button>
             <button data-range="thisweek">本周</button>
             <button data-range="custom">自定义</button>
           </div>
@@ -124,7 +125,7 @@
           </div>
           <div class="filter-row">
             <label>最少消息数</label>
-            <input type="number" id="min-messages" value="5" min="1" max="9999" class="num-input" />
+            <input type="number" id="min-messages" value="1" min="1" max="9999" class="num-input" />
           </div>
         </section>
 

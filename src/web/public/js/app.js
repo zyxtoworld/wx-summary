@@ -322,9 +322,10 @@ function fmtTimeAgo(ts) {
 const QUICK_RANGE_LABELS = {
   today: '今天',
   yesterday: '昨天',
+  yesterdayToday: '昨天+今天',
   last4h: '最近 4h',
   last12h: '最近 12h',
-  last1d: '最近 1d',
+  last1d: '最近 24h',
   thisweek: '本周',
   custom: '自定义',
 };
@@ -339,6 +340,9 @@ function quickRangeToDates(key) {
     since.setHours(0, 0, 0, 0);
     now.setTime(since.getTime());
     now.setHours(23, 59, 59, 0);
+  } else if (key === 'yesterdayToday') {
+    since.setDate(since.getDate() - 1);
+    since.setHours(0, 0, 0, 0);
   } else if (key === 'last4h') since.setHours(now.getHours() - 4);
   else if (key === 'last12h') since.setHours(now.getHours() - 12);
   else if (key === 'last1d') since.setDate(now.getDate() - 1);
@@ -351,7 +355,7 @@ function quickRangeToDates(key) {
 }
 
 function digestRangeLabel(key = _state_digest.rangeKey) {
-  return QUICK_RANGE_LABELS[key] || QUICK_RANGE_LABELS.last1d;
+  return QUICK_RANGE_LABELS[key] || QUICK_RANGE_LABELS.yesterdayToday;
 }
 
 function currentDigestRange() {
@@ -550,7 +554,7 @@ function ensureCustomRangeOutsideClick() {
 
 function ensureCustomRangeDefaults() {
   if (_state_digest.customSince && _state_digest.customUntil) return;
-  const r = quickRangeToDates('last1d');
+  const r = quickRangeToDates('yesterdayToday');
   _state_digest.customSince = _state_digest.customSince || r.since;
   _state_digest.customUntil = _state_digest.customUntil || r.until;
 }
@@ -719,13 +723,13 @@ function commitCustomRangeSide(date) {
 // ---------- Digest 主页 ----------
 let _state_digest = {
   selectedGroups: new Set(),
-  rangeKey: 'last1d',
+  rangeKey: 'yesterdayToday',
   customSince: '',
   customUntil: '',
   customRangeSide: 'since',
   customRangeMonth: '',
   filters: { senders: [], keywords: [], excludeTypes: new Set() },
-  minMessages: 5,
+  minMessages: 1,
   theme: 'auto',
   fontsize: 'normal',
   accent: 'green',
@@ -1174,6 +1178,10 @@ async function renderDigest() {
           : '✓ 已请求系统打开并选中文件';
       }
     } catch (e) {
+      if (e?.status === 404) {
+        markPreviewSavedFileMissing(`打开失败：${e.message || '已保存的 PNG 可能已被移动或删除'}；可下载当前预览。`);
+        return;
+      }
       if (status) {
         status.className = 'status err';
         status.textContent = `打开失败：${e.message || '未知错误'}`;
@@ -1188,12 +1196,13 @@ async function renderDigest() {
 
 function syncDigestControlsFromState() {
   const activeRange = document.querySelector(`#quick-range button[data-range="${_state_digest.rangeKey}"]`)
+    || document.querySelector('#quick-range button[data-range="yesterdayToday"]')
     || document.querySelector('#quick-range button[data-range="last1d"]');
   if (activeRange) {
     document.querySelectorAll('#quick-range button[data-range]').forEach(button => {
       button.classList.toggle('active', button === activeRange);
     });
-    _state_digest.rangeKey = activeRange.dataset.range || 'last1d';
+    _state_digest.rangeKey = activeRange.dataset.range || 'yesterdayToday';
   }
   const customRange = document.getElementById('custom-range');
   if (_state_digest.rangeKey === 'custom') {
@@ -1330,6 +1339,17 @@ function updatePreviewSavedRenderState({ notify = false } = {}) {
   return { hasSavedFile, stale };
 }
 
+function markPreviewSavedFileMissing(message = '已保存的 PNG 不存在，可下载当前预览。') {
+  _state_digest.lastSavedItem = null;
+  _state_digest.lastSavedRenderKey = '';
+  updatePreviewSavedRenderState();
+  const status = document.getElementById('preview-status');
+  if (status) {
+    status.className = 'status warn';
+    status.textContent = message;
+  }
+}
+
 function updateDigestPreviewActionLock() {
   const canvas = document.getElementById('digest-canvas');
   const hasCanvas = !!canvas?.width && !!canvas?.height && !!_state_digest.lastDigest;
@@ -1354,7 +1374,7 @@ function currentDigestBatchSnapshot() {
       keywords: [...(_state_digest.filters.keywords || [])],
       exclude_types: [...(_state_digest.filters.excludeTypes || [])],
     },
-    min_messages: Math.max(1, parseInt(minMessagesInput?.value || String(_state_digest.minMessages || 5), 10) || 5),
+    min_messages: Math.max(1, parseInt(minMessagesInput?.value || String(_state_digest.minMessages || 1), 10) || 1),
     render: currentDigestRenderSelection(),
   };
 }
@@ -3328,6 +3348,10 @@ async function copyCanvas() {
         setTimeout(() => btn.textContent = old, 1500);
         return;
       } catch (fallbackError) {
+        if (fallbackError?.status === 404) {
+          markPreviewSavedFileMissing(`系统复制失败：${fallbackError.message || '已保存的 PNG 可能已被移动或删除'}；可下载当前预览。`);
+          return;
+        }
         systemError = compactErrorSummary(fallbackError?.message || '');
       }
     } else if (digestId && savedState.stale) {
@@ -3521,7 +3545,7 @@ function showHistoryModal(item) {
         <button class="icon-btn" data-close>×</button>
       </div>
       <div class="modal-body ${artifactNote ? 'has-note' : ''}">
-        ${artifactNoteHtml}
+        <div data-artifact-note>${artifactNoteHtml}</div>
         ${fileMissing ? '' : `<img data-zoomable src="${imageUrl}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`}
       </div>
       <div class="preview-actions">
@@ -3538,6 +3562,7 @@ function showHistoryModal(item) {
   const status = modal.querySelector('[data-status]');
   let image = modal.querySelector('[data-zoomable]');
   const modalBody = modal.querySelector('.modal-body');
+  const artifactNoteBox = modal.querySelector('[data-artifact-note]');
   const downloadButton = modal.querySelector('[data-download]');
   const copyButton = modal.querySelector('[data-copy]');
   const revealButton = modal.querySelector('[data-reveal]');
@@ -3571,8 +3596,7 @@ function showHistoryModal(item) {
   const paintModalArtifactNote = () => {
     const noteHtml = modalArtifactNoteHtml();
     modalBody.classList.toggle('has-note', !!noteHtml);
-    if (noteHtml) modalBody.innerHTML = noteHtml;
-    image = null;
+    if (artifactNoteBox) artifactNoteBox.innerHTML = noteHtml;
   };
   const setHistoryRerenderAvailability = () => {
     canRerender = serverRerenderSupported && item.digest_exists !== false;
@@ -3584,6 +3608,8 @@ function showHistoryModal(item) {
   const markHistoryFileMissing = (message = '长图加载失败：文件可能已被移动或删除。') => {
     item.file_exists = false;
     updateHistoryCardItem(item);
+    image?.remove();
+    image = null;
     paintModalArtifactNote();
     disableImageActions(message);
     setHistoryRerenderAvailability();
@@ -3592,26 +3618,42 @@ function showHistoryModal(item) {
     item.digest_exists = false;
     updateHistoryCardItem(item);
     setHistoryRerenderAvailability();
-    if (item.file_exists === false) paintModalArtifactNote();
+    paintModalArtifactNote();
     status.className = 'status err';
     status.textContent = message;
+  };
+  const verifyHistoryImageAfterError = async () => {
+    try {
+      const res = await fetch(historyImageUrl(item.digest_id, Date.now()), { cache: 'no-store' });
+      if (res.status === 404) {
+        markHistoryFileMissing('长图文件已不存在，可能已被移动或删除。');
+        return;
+      }
+      status.className = 'status warn';
+      status.textContent = res.ok
+        ? '图片预览失败，但文件仍可下载或在文件夹中显示。'
+        : `图片预览失败（${res.status}），可尝试下载或在文件夹中显示。`;
+    } catch (e) {
+      status.className = 'status warn';
+      status.textContent = `图片预览失败：${e.message || '未知错误'}。可尝试下载或在文件夹中显示。`;
+    }
   };
   const watchHistoryImage = () => {
     if (!image) return;
     image.addEventListener('load', restoreImageActions, { once: true });
-    image.addEventListener('error', () => markHistoryFileMissing(), { once: true });
+    image.addEventListener('error', () => { void verifyHistoryImageAfterError(); }, { once: true });
   };
   watchHistoryImage();
   setHistoryRerenderAvailability();
   if (fileMissing) disableImageActions(historyArtifactNote(item) || '长图文件已不存在。');
-  if (image?.complete && image.naturalWidth === 0) markHistoryFileMissing();
+  if (image?.complete && image.naturalWidth === 0) void verifyHistoryImageAfterError();
   image?.addEventListener('click', () => {
     if (!image.complete || image.naturalWidth === 0) return;
     showImageZoomModal({ title: item.group, src: historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now()) });
   });
   const ensureHistoryModalImage = src => {
     if (image) return image;
-    modalBody.innerHTML = `<img data-zoomable src="${src}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`;
+    modalBody.insertAdjacentHTML('beforeend', `<img data-zoomable src="${src}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`);
     image = modalBody.querySelector('[data-zoomable]');
     image?.addEventListener('click', () => {
       if (!image.complete || image.naturalWidth === 0) return;
@@ -3619,6 +3661,36 @@ function showHistoryModal(item) {
     });
     return image;
   };
+  downloadButton.addEventListener('click', async e => {
+    e.preventDefault();
+    if (downloadButton.classList.contains('disabled')) return;
+    status.className = 'status';
+    status.textContent = '正在准备下载...';
+    try {
+      const res = await fetch(historyImageUrl(item.digest_id, Date.now()), { cache: 'no-store' });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        const message = parseHttpErrorMessage(text, res.status);
+        if (res.status === 404) {
+          markHistoryFileMissing(`下载失败：${message || '长图文件可能已被移动或删除'}`);
+          return;
+        }
+        throw new Error(message || `请求失败（${res.status}）`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = historyDownloadFilename(item);
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      status.className = 'status ok';
+      status.textContent = '✓ 已开始下载 PNG';
+    } catch (err) {
+      status.className = 'status err';
+      status.textContent = `下载失败：${err.message || '未知错误'}`;
+    }
+  });
   revealButton.addEventListener('click', () => withBusyButtons(revealButton, async () => {
     status.className = 'status';
     status.textContent = '正在打开文件夹...';
@@ -3700,6 +3772,7 @@ function showHistoryModal(item) {
           downloadButton.classList.remove('disabled');
           restoreImageActions();
           modalBody.classList.remove('has-note');
+          if (artifactNoteBox) artifactNoteBox.innerHTML = '';
           setHistoryRerenderAvailability();
           updateHistoryCardItem(item);
           return r;
