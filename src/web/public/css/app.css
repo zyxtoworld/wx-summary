@@ -565,6 +565,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 }
 .progress-stages li.done { color: var(--text); }
 .progress-stages li.running { color: var(--primary); }
+.progress-stages li.cancelled { color: var(--muted); }
 .progress-stages li.error { color: var(--danger); }
 .progress-log-tools {
   display: flex;

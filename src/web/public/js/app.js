@@ -46,7 +46,10 @@ async function api(path, opts = {}) {
       location.reload();
       return await new Promise(() => {});
     }
-    throw new Error(parseHttpErrorMessage(text, r.status));
+    const err = new Error(parseHttpErrorMessage(text, r.status));
+    err.status = r.status;
+    err.responseText = text;
+    throw err;
   }
   return r.json();
 }
@@ -442,7 +445,11 @@ async function withBusyButtons(buttons, action) {
   } finally {
     for (const { button, disabled } of previous) {
       delete button.dataset.busy;
-      if (button.isConnected) button.disabled = disabled;
+      if (!button.isConnected) continue;
+      button.disabled = button.dataset.keepDisabled === '1' ? true : disabled;
+    }
+    if (document.getElementById('digest-canvas') || document.getElementById('preview-card')) {
+      updateDigestPreviewActionLock();
     }
   }
 }
@@ -1066,13 +1073,14 @@ async function renderDigest() {
         applyDigestRenderSelection(selection);
         drawDigestCanvas(_state_digest.lastDigest);
         _state_digest.lastCanvasRenderKey = digestRenderStateKey(selection);
-        updatePreviewSavedRenderState({ notify: true });
+        return updatePreviewSavedRenderState({ notify: true });
       },
       onSave: async selection => {
         const previousSelection = currentDigestRenderSelection();
         applyDigestRenderSelection(selection);
         drawDigestCanvas(_state_digest.lastDigest);
         if (!_state_digest.lastSavedItem?.digest_id) return { previewOnly: true };
+        if (!supportsServerRerender()) return { previewOnly: true };
         try {
           const r = await api('/api/rerender-history', {
             method: 'POST',
@@ -1277,8 +1285,8 @@ function previewSavedRenderState() {
 function updatePreviewSavedRenderState({ notify = false } = {}) {
   const revealButton = document.getElementById('btn-reveal');
   const status = document.getElementById('preview-status');
-  if (!_state_digest.lastDigest || !revealButton) return;
   const { hasSavedFile, stale } = previewSavedRenderState();
+  if (!_state_digest.lastDigest || !revealButton) return { hasSavedFile, stale };
   revealButton.disabled = _state_digest.generating || !hasSavedFile;
   revealButton.title = hasSavedFile
     ? (_state_digest.generating ? '生成完成后可用' : (stale ? '打开的是上次保存的文件，样式可能不是当前预览' : '在文件夹中显示最后一张'))
@@ -1287,6 +1295,7 @@ function updatePreviewSavedRenderState({ notify = false } = {}) {
     status.className = 'status warn';
     status.textContent = '当前预览样式尚未保存；文件夹里仍是上次保存版本。';
   }
+  return { hasSavedFile, stale };
 }
 
 function updateDigestPreviewActionLock() {
@@ -1392,8 +1401,8 @@ function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigest
   const preview = () => {
     syncSwatches();
     const hasLivePreview = typeof onPreview === 'function';
-    if (hasLivePreview) onPreview({ ...selection });
-    if (statusTarget && hasLivePreview) {
+    const previewResult = hasLivePreview ? onPreview({ ...selection }) : null;
+    if (statusTarget && hasLivePreview && !previewResult?.stale) {
       statusTarget.className = 'status';
       statusTarget.textContent = '已更新预览';
     }
@@ -1442,7 +1451,7 @@ function showDigestRerenderPanel({ anchor, statusTarget, initial = currentDigest
       saveButton.disabled = false;
     }
   });
-  preview();
+  syncSwatches();
 }
 
 function ensureKeyboardShortcuts() {
@@ -1502,6 +1511,26 @@ function formatDigestElapsedDetail(baseDetail, startedAt) {
   const seconds = elapsedSeconds % 60;
   const elapsed = minutes ? `已用时 ${minutes}分${String(seconds).padStart(2, '0')}秒` : `已用时 ${seconds}秒`;
   return baseDetail ? `${baseDetail} · ${elapsed}` : elapsed;
+}
+
+function waitForBrowserPaint() {
+  return new Promise(resolve => {
+    if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+      setTimeout(resolve, 0);
+      return;
+    }
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const fallback = setTimeout(done, 120);
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      clearTimeout(fallback);
+      done();
+    }));
+  });
 }
 
 function resetDigestProgressSnapshot({ previewText = false } = {}) {
@@ -1625,12 +1654,26 @@ function updateDigestSelectionLock() {
   updateDigestPreviewActionLock();
 }
 
+function digestStageIcon(status = '') {
+  return status === 'done' ? '✓'
+    : status === 'running' ? '⟳'
+      : status === 'error' ? '✗'
+        : '·';
+}
+
 function digestStageText(stage = {}) {
-  const icon = stage.status === 'done' ? '✓' : stage.status === 'running' ? '⟳' : stage.status === 'error' ? '✗' : '·';
+  const icon = digestStageIcon(stage.status);
   const detail = stage.status === 'running'
     ? formatDigestElapsedDetail(stage.baseDetail || '', stage.startedAt)
     : (stage.detail || '');
   return `${icon} ${stage.label || ''}${detail ? ' (' + detail + ')' : ''}`;
+}
+
+function hideUncommittedDigestPreview() {
+  if (_state_digest.lastDigest) return;
+  const previewCard = document.getElementById('preview-card');
+  if (previewCard) previewCard.classList.add('hidden');
+  updateDigestPreviewActionLock();
 }
 
 function startDigestProgressPaintTimer() {
@@ -1739,8 +1782,8 @@ async function generateDigest({ previewText = false } = {}) {
       setDigestProgressFill('0%');
       const aborted = controller.signal.aborted;
       const message = aborted ? (abortReason || '已取消') : (e.message || '未知错误');
-      $stages.innerHTML = `<li class="${aborted ? 'done' : 'error'}">${aborted ? '✓ 已取消' : `✗ 读取群列表失败：${escapeHtml(message)}`}</li>`;
-      setDigestProgressStages([{ key: 'error', name: 'error', stageName: 'error', label: aborted ? '已取消' : `读取群列表失败：${message}`, status: aborted ? 'done' : 'error' }]);
+      $stages.innerHTML = `<li class="${aborted ? 'cancelled' : 'error'}">${aborted ? '· 已取消' : `✗ 读取群列表失败：${escapeHtml(message)}`}</li>`;
+      setDigestProgressStages([{ key: 'error', name: 'error', stageName: 'error', label: aborted ? '已取消' : `读取群列表失败：${message}`, status: aborted ? 'cancelled' : 'error' }]);
       if (!aborted) showProgressLogPrompt(message || '读取群列表失败');
       scrollDigestWorkIntoView($progress);
     }
@@ -1778,7 +1821,7 @@ async function generateDigest({ previewText = false } = {}) {
     return formatDigestElapsedDetail(baseDetail, startedAt);
   }
   function writeStageText(li, stage, detail = stage.detail || '') {
-    const icon = stage.status === 'done' ? '✓' : stage.status === 'running' ? '⟳' : stage.status === 'error' ? '✗' : '·';
+    const icon = digestStageIcon(stage.status);
     li.textContent = `${icon} ${stage.label}${detail ? ' (' + detail + ')' : ''}`;
   }
   function renderRunningStage(li) {
@@ -1931,6 +1974,7 @@ async function generateDigest({ previewText = false } = {}) {
   // 用 fetch + ReadableStream 解析 SSE（不用 EventSource 是为了带 X-WX-Token）
   try {
     const digests = new Array(targets.length);
+    const renderedDigests = new Array(targets.length);
     const failures = [];
     const prepareConcurrency = digestPrepareConcurrency(targets.length);
     let renderQueue = Promise.resolve();
@@ -1939,6 +1983,14 @@ async function generateDigest({ previewText = false } = {}) {
       renderQueue = run.catch(() => {});
       return run;
     };
+    upsertStage({
+      key: 'prepare',
+      name: 'prepare',
+      stageName: 'prepare',
+      label: '准备生成 · 读取群列表',
+      status: 'done',
+      detail: `${targets.length} 个群`,
+    });
     upsertStage({
       key: 'batch',
       name: 'batch',
@@ -1950,7 +2002,12 @@ async function generateDigest({ previewText = false } = {}) {
 
     await runClientPool(targets, prepareConcurrency, async (target, i) => {
       if (controller.signal.aborted) return;
-      upsertStage(groupStage(i, { name: 'fetching', label: '拉取消息/解析媒体', status: 'running' }));
+      upsertStage(groupStage(i, {
+        name: 'fetching',
+        label: '等待服务端采集进度',
+        status: 'running',
+        detail: '准备读取数据库密钥、消息分片和媒体信息',
+      }));
       try {
         const digest = await runSingleDigestRequest({
           target,
@@ -1969,7 +2026,6 @@ async function generateDigest({ previewText = false } = {}) {
             upsertStage(grouped);
           },
         });
-        digests[i] = digest;
         upsertStage(groupStage(i, {
           name: 'received',
           label: '接收摘要结果',
@@ -1977,13 +2033,18 @@ async function generateDigest({ previewText = false } = {}) {
           detail: [digest.model, `${digest.topics?.length || 0} 条主线`, `${digest.links?.length || 0} 个链接`].filter(Boolean).join(' · '),
         }));
         if (previewText) {
+          const nextDigests = digests.slice();
+          nextDigests[i] = digest;
           upsertStage(groupStage(i, {
             name: 'rendering',
             label: '整理文本预览',
             status: 'running',
-            detail: `合并 ${digests.filter(Boolean).length}/${targets.length} 个群为 Markdown`,
+            detail: `合并 ${nextDigests.filter(Boolean).length}/${targets.length} 个群为 Markdown`,
           }));
-          renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
+          await waitForBrowserPaint();
+          if (controller.signal.aborted) return;
+          renderTextPreviews(nextDigests.filter(Boolean), { complete: false, total: targets.length });
+          digests[i] = digest;
           upsertStage(groupStage(i, {
             name: 'rendering',
             label: '整理文本预览',
@@ -1998,7 +2059,6 @@ async function generateDigest({ previewText = false } = {}) {
             if (controller.signal.aborted) return;
             const livePreviewCard = document.getElementById('preview-card');
             if (livePreviewCard) livePreviewCard.classList.remove('hidden');
-            _state_digest.lastDigest = digest;
             _state_digest.lastSavedItem = null;
             _state_digest.lastCanvasRenderKey = digestRenderStateKey(batchSnapshot.render);
             _state_digest.lastSavedRenderKey = '';
@@ -2011,11 +2071,24 @@ async function generateDigest({ previewText = false } = {}) {
               name: 'rendering',
               label: '绘制长图',
               status: 'running',
-              detail: [digest.topics?.length ? `${digest.topics.length} 条主线` : '', digest.links?.length ? `${digest.links.length} 个链接` : ''].filter(Boolean).join(' · '),
+              detail: [
+                digest.topics?.length ? `${digest.topics.length} 条主线` : '',
+                digest.links?.length ? `${digest.links.length} 个链接` : '',
+                '正在排版并绘制 Canvas',
+              ].filter(Boolean).join(' · '),
             }));
+            await waitForBrowserPaint();
+            if (controller.signal.aborted) {
+              hideUncommittedDigestPreview();
+              return;
+            }
             const canvas = drawDigestCanvas(digest, null, batchSnapshot.render);
             updateDigestPreviewActionLock();
-            if (controller.signal.aborted) return;
+            if (controller.signal.aborted) {
+              hideUncommittedDigestPreview();
+              return;
+            }
+            renderedDigests[i] = digest;
             upsertStage(groupStage(i, {
               name: 'rendering',
               label: '绘制长图',
@@ -2029,37 +2102,53 @@ async function generateDigest({ previewText = false } = {}) {
                 renderSelection: batchSnapshot.render,
                 onProgress: stage => upsertStage(groupStage(i, stage)),
               });
-              if (controller.signal.aborted) return;
+              if (controller.signal.aborted) {
+                hideUncommittedDigestPreview();
+                return;
+              }
+              _state_digest.lastDigest = digest;
               _state_digest.lastSavedItem = saved.item;
               _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
               digest.file_path = saved.item.file_path;
+              digests[i] = digest;
               updatePreviewSavedRenderState();
               updateDigestPreviewActionLock();
               upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'done', detail: saved.item.relative_path }));
               scrollDigestWorkIntoView(document.getElementById('preview-card'));
             } catch (e) {
               if (e?.name === 'AbortError' || controller.signal.aborted) {
-                upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'done', detail: '已取消' }));
+                hideUncommittedDigestPreview();
+                upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'cancelled', detail: '已取消' }));
                 return;
               }
+              _state_digest.lastDigest = digest;
+              _state_digest.lastSavedItem = null;
+              _state_digest.lastSavedRenderKey = '';
+              updateDigestPreviewActionLock();
+              const previewStatus = document.getElementById('preview-status');
+              if (previewStatus) {
+                previewStatus.className = 'status warn';
+                previewStatus.textContent = '预览已生成，但自动保存失败；可下载 PNG，历史记录不会包含这张。';
+              }
               failures.push({ group: target.name, error: e.message });
-              upsertStage(groupStage(i, { name: 'saving', label: `保存失败：${e.message}`, status: 'error' }));
+              upsertStage(groupStage(i, { name: 'saving', label: `保存失败：${e.message}`, status: 'error', detail: '预览仍可下载' }));
               showProgressLogPrompt(e.message);
             }
           });
         }
       } catch (e) {
-        const aborted = e?.name === 'AbortError';
+        const aborted = e?.name === 'AbortError' || controller.signal.aborted;
         const message = aborted ? '已取消' : digestClientErrorMessage(e.message, target, since, until);
         failures.push({ group: target.name, error: message });
-        markGroupRunningStages(i, aborted ? 'done' : 'error', aborted ? '已取消' : '已失败');
-        upsertStage(groupStage(i, { name: 'error', label: aborted ? '已取消' : `失败：${message}`, status: aborted ? 'done' : 'error' }));
+        markGroupRunningStages(i, aborted ? 'cancelled' : 'error', aborted ? '已取消' : '已失败');
+        upsertStage(groupStage(i, { name: 'error', label: aborted ? '已取消' : `失败：${message}`, status: aborted ? 'cancelled' : 'error' }));
         if (!aborted) showProgressLogPrompt(message);
       }
     }, controller.signal);
     await renderQueue;
 
     const doneDigests = digests.filter(Boolean);
+    const renderedOnlyCount = previewText ? 0 : Math.max(0, renderedDigests.filter(Boolean).length - doneDigests.length);
     if (previewText && doneDigests.length) {
       const complete = !controller.signal.aborted && !failures.length && doneDigests.length === targets.length;
       renderTextPreviews(doneDigests, {
@@ -2075,12 +2164,16 @@ async function generateDigest({ previewText = false } = {}) {
         name: 'batch',
         stageName: 'batch',
         label: doneDigests.length ? `已取消，已完成 ${doneDigests.length} 个群` : '已取消',
-        status: 'done',
+        status: 'cancelled',
         detail: reason,
       });
       setDigestProgressFill(doneDigests.length ? Math.max(10, Number.parseFloat($fill.style.width) || 10) + '%' : '0%');
     } else if (failures.length && doneDigests.length) {
-      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个，失败 ${failures.length} 个`, status: 'error', detail: failures.map(f => f.group).join('、') });
+      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已完成 ${doneDigests.length} 个，失败 ${failures.length} 个`, status: 'error', detail: [renderedOnlyCount ? `${renderedOnlyCount} 个预览可下载但未保存` : '', failures.map(f => f.group).join('、')].filter(Boolean).join(' · ') });
+      setDigestProgressFill('100%');
+      showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
+    } else if (failures.length && renderedOnlyCount) {
+      upsertStage({ key: 'batch', name: 'batch', stageName: 'batch', label: `已生成 ${renderedOnlyCount} 个预览，但自动保存失败`, status: 'error', detail: '可手动下载当前预览；历史记录不会包含未保存长图' });
       setDigestProgressFill('100%');
       showProgressLogPrompt(failures.map(f => `${f.group}: ${f.error}`).join('；'));
     } else if (failures.length) {
@@ -2092,8 +2185,8 @@ async function generateDigest({ previewText = false } = {}) {
       setDigestProgressFill('100%');
     }
   } catch (e) {
-    const aborted = e?.name === 'AbortError';
-    upsertStage({ name: 'error', label: aborted ? '已取消' : '失败：' + e.message, status: aborted ? 'done' : 'error' });
+    const aborted = e?.name === 'AbortError' || controller.signal.aborted;
+    upsertStage({ name: 'error', label: aborted ? '已取消' : '失败：' + e.message, status: aborted ? 'cancelled' : 'error' });
     if (!aborted) showProgressLogPrompt(e.message);
   } finally {
     clearAllRunningStages();
@@ -2846,6 +2939,8 @@ async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null
     status: 'running',
     detail: canvasDisplaySizeLabel(canvas),
   });
+  await waitForBrowserPaint();
+  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   const png_data_url = canvasToPngDataUrl(canvas);
   notifyLocalProgress(onProgress, {
     name: 'encoding',
@@ -2860,6 +2955,8 @@ async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null
     status: 'running',
     detail: '写入 outputs/digests',
   });
+  await waitForBrowserPaint();
+  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload(renderSelection) }, png_data_url } });
 }
 
@@ -3119,7 +3216,9 @@ async function copyCanvas() {
     }
     const blob = await canvasToPngBlob(c);
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-    void recordBrowserClipboardCopy({ digestId: _state_digest.lastSavedItem?.digest_id, clipboard: canvasSize });
+    if (!previewSavedRenderState().stale) {
+      void recordBrowserClipboardCopy({ digestId: _state_digest.lastSavedItem?.digest_id, clipboard: canvasSize });
+    }
     btn.textContent = '✓ 已复制';
     if (status) {
       status.className = 'status ok';
@@ -3320,7 +3419,7 @@ function showHistoryModal(item) {
   const imageUrl = historyImageUrl(item.digest_id, historyItemCacheBust(item));
   const serverRerenderSupported = supportsServerRerender();
   const { fileMissing, digestMissing } = historyArtifactState(item);
-  const canRerender = serverRerenderSupported && !digestMissing;
+  let canRerender = serverRerenderSupported && !digestMissing;
   const rerenderTitle = !serverRerenderSupported
       ? '当前系统不支持历史重新渲染；请回到总结页重新生成摘要长图'
       : (digestMissing ? '原摘要 JSON 已不存在，不能重新渲染；现有 PNG 可继续下载、复制或打开' : '');
@@ -3357,30 +3456,70 @@ function showHistoryModal(item) {
   const downloadButton = modal.querySelector('[data-download]');
   const copyButton = modal.querySelector('[data-copy]');
   const revealButton = modal.querySelector('[data-reveal]');
+  const rerenderButton = modal.querySelector('[data-rerender]');
   const restoreImageActions = () => {
+    delete copyButton.dataset.keepDisabled;
+    delete revealButton.dataset.keepDisabled;
     copyButton.disabled = false;
     revealButton.disabled = false;
     downloadButton.classList.remove('disabled');
     downloadButton.href = historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now());
     downloadButton.setAttribute('download', historyDownloadFilename(item));
   };
-  const disableImageActions = () => {
+  const disableImageActions = (message = '长图加载失败：文件可能已被移动或删除。') => {
+    copyButton.dataset.keepDisabled = '1';
+    revealButton.dataset.keepDisabled = '1';
     copyButton.disabled = true;
     revealButton.disabled = true;
     downloadButton.classList.add('disabled');
     downloadButton.removeAttribute('href');
     downloadButton.removeAttribute('download');
     status.className = 'status err';
-    status.textContent = '长图加载失败：文件可能已被移动或删除。';
+    status.textContent = message;
+  };
+  const modalArtifactNoteHtml = () => {
+    const note = historyArtifactNote(item);
+    if (!note) return '';
+    const { fileMissing: nextFileMissing } = historyArtifactState(item);
+    return `<div class="missing-image-note ${nextFileMissing ? '' : 'warning'}">${escapeHtml(note)}</div>`;
+  };
+  const paintModalArtifactNote = () => {
+    const noteHtml = modalArtifactNoteHtml();
+    modalBody.classList.toggle('has-note', !!noteHtml);
+    if (noteHtml) modalBody.innerHTML = noteHtml;
+    image = null;
+  };
+  const setHistoryRerenderAvailability = () => {
+    canRerender = serverRerenderSupported && item.digest_exists !== false;
+    rerenderButton.disabled = !canRerender;
+    rerenderButton.title = !serverRerenderSupported
+      ? '当前系统不支持历史重新渲染；请回到总结页重新生成摘要长图'
+      : (item.digest_exists === false ? '原摘要 JSON 已不存在，不能重新渲染；现有 PNG 可继续下载、复制或打开' : '');
+  };
+  const markHistoryFileMissing = (message = '长图加载失败：文件可能已被移动或删除。') => {
+    item.file_exists = false;
+    updateHistoryCardItem(item);
+    paintModalArtifactNote();
+    disableImageActions(message);
+    setHistoryRerenderAvailability();
+  };
+  const markHistoryDigestMissing = (message = '原摘要 JSON 已不存在，不能重新渲染。') => {
+    item.digest_exists = false;
+    updateHistoryCardItem(item);
+    setHistoryRerenderAvailability();
+    if (item.file_exists === false) paintModalArtifactNote();
+    status.className = 'status err';
+    status.textContent = message;
   };
   const watchHistoryImage = () => {
     if (!image) return;
     image.addEventListener('load', restoreImageActions, { once: true });
-    image.addEventListener('error', disableImageActions, { once: true });
+    image.addEventListener('error', () => markHistoryFileMissing(), { once: true });
   };
   watchHistoryImage();
-  if (fileMissing) disableImageActions();
-  if (image?.complete && image.naturalWidth === 0) disableImageActions();
+  setHistoryRerenderAvailability();
+  if (fileMissing) disableImageActions(historyArtifactNote(item) || '长图文件已不存在。');
+  if (image?.complete && image.naturalWidth === 0) markHistoryFileMissing();
   image?.addEventListener('click', () => {
     if (!image.complete || image.naturalWidth === 0) return;
     showImageZoomModal({ title: item.group, src: historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now()) });
@@ -3403,6 +3542,10 @@ function showHistoryModal(item) {
       status.className = 'status ok';
       status.textContent = '✓ 已请求系统打开并选中文件';
     } catch (e) {
+      if (e?.status === 404) {
+        markHistoryFileMissing(`打开失败：${e.message || '长图文件可能已被移动或删除'}`);
+        return;
+      }
       status.className = 'status err';
       status.textContent = `打开失败：${e.message || '未知错误'}`;
     }
@@ -3423,6 +3566,10 @@ function showHistoryModal(item) {
         const size = imageSizeLabel(copied.clipboard);
         status.textContent = size ? `✓ 已通过系统剪贴板复制（${size}）` : '✓ 已通过系统剪贴板复制';
       } catch (e) {
+        if (e?.status === 404) {
+          markHistoryFileMissing(`复制失败：${e.message || '长图文件可能已被移动或删除'}`);
+          return;
+        }
         status.className = 'status err';
         const details = [
           browserError?.message && `浏览器：${compactErrorSummary(browserError.message)}`,
@@ -3432,7 +3579,6 @@ function showHistoryModal(item) {
       }
     }
   }));
-  const rerenderButton = modal.querySelector('[data-rerender]');
   rerenderButton.addEventListener('click', async e => {
     if (rerenderButton.disabled) return;
     rerenderButton.disabled = true;
@@ -3447,10 +3593,16 @@ function showHistoryModal(item) {
         statusTarget: status,
         initial,
         onSave: async selection => {
-          const r = await api('/api/rerender-history', {
-            method: 'POST',
-            body: { digest_id: item.digest_id, render: digestRenderPayload(selection) },
-          });
+          let r;
+          try {
+            r = await api('/api/rerender-history', {
+              method: 'POST',
+              body: { digest_id: item.digest_id, render: digestRenderPayload(selection) },
+            });
+          } catch (err) {
+            if (err?.status === 404) markHistoryDigestMissing(`重渲染失败：${err.message || '原摘要 JSON 已不存在'}`);
+            throw err;
+          }
           Object.assign(item, r.item || {});
           const freshUrl = historyImageUrl(item.digest_id, Date.now());
           item.file_exists = true;
@@ -3463,11 +3615,16 @@ function showHistoryModal(item) {
           downloadButton.classList.remove('disabled');
           restoreImageActions();
           modalBody.classList.remove('has-note');
+          setHistoryRerenderAvailability();
           updateHistoryCardItem(item);
           return r;
         },
       });
     } catch (err) {
+      if (err?.status === 404) {
+        markHistoryDigestMissing(`读取原渲染设置失败：${err.message || '原摘要 JSON 已不存在'}`);
+        return;
+      }
       status.className = 'status err';
       status.textContent = `读取原渲染设置失败：${err.message || '未知错误'}`;
     } finally {
@@ -3488,7 +3645,13 @@ function historyThumbUrl(digestId, cacheBust = '') {
 
 async function copyImageUrlToClipboard(url) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(parseHttpErrorMessage(await res.text(), res.status));
+  if (!res.ok) {
+    const text = await res.text();
+    const err = new Error(parseHttpErrorMessage(text, res.status));
+    err.status = res.status;
+    err.responseText = text;
+    throw err;
+  }
   const blob = await res.blob();
   await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
   if (typeof createImageBitmap === 'function') {

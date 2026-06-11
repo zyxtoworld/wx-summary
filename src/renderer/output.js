@@ -143,7 +143,8 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
   const buffer = pngBufferFromDataUrl(png_data_url);
   throwIfOutputAborted(signal);
 
-  const createdAt = digest.created_at ? new Date(digest.created_at) : new Date();
+  const parsedCreatedAt = digest.created_at ? new Date(digest.created_at) : null;
+  const createdAt = parsedCreatedAt && Number.isFinite(parsedCreatedAt.getTime()) ? parsedCreatedAt : new Date();
   const day = localDate(createdAt);
   const dir = path.join(base, day);
   let filePath = '';
@@ -158,7 +159,7 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
     await writeDigestJson(digestPath, digest);
     throwIfOutputAborted(signal);
   } catch (e) {
-    if (isOutputAbortError(e)) await cleanupRenderedPair(filePath, digestPath);
+    await cleanupRenderedPair(filePath, digestPath);
     throw e;
   }
 
@@ -180,8 +181,8 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
   } catch (e) {
     if (isOutputAbortError(e)) {
       await removeHistoryItem(settings, item.digest_id).catch(() => {});
-      await cleanupRenderedPair(filePath, digestPath);
     }
+    await cleanupRenderedPair(filePath, digestPath);
     throw e;
   }
   return item;

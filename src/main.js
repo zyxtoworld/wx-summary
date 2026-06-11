@@ -1270,8 +1270,10 @@ async function handleApi(req, res, parsedUrl) {
     let target = body.path || '';
     if (body.digest_id) {
       const item = await findHistoryItem(settings, body.digest_id);
+      if (!item) throw Object.assign(new Error('digest not found'), { status: 404 });
       target = item?.file_path || '';
     }
+    if (!target) throw Object.assign(new Error('digest_id or path is required'), { status: 400 });
     const file = await assertRevealable(settings, target, { extensions: ['.png'] });
     const reveal = await revealInFolder(file);
     recordRevealEvidence(file, reveal);
@@ -1284,8 +1286,10 @@ async function handleApi(req, res, parsedUrl) {
     let target = body.path || '';
     if (body.digest_id) {
       const item = await findHistoryItem(settings, body.digest_id);
+      if (!item) throw Object.assign(new Error('digest not found'), { status: 404 });
       target = item?.file_path || '';
     }
+    if (!target) throw Object.assign(new Error('digest_id or path is required'), { status: 400 });
     const file = await assertRevealable(settings, target, { extensions: ['.png'] });
     const copied = await copyPngToClipboard(file);
     const evidence = recordClipboardCopyEvidence(file, copied);
@@ -1298,8 +1302,10 @@ async function handleApi(req, res, parsedUrl) {
     let target = body.path || '';
     if (body.digest_id) {
       const item = await findHistoryItem(settings, body.digest_id);
+      if (!item) throw Object.assign(new Error('digest not found'), { status: 404 });
       target = item?.file_path || '';
     }
+    if (!target) throw Object.assign(new Error('digest_id or path is required'), { status: 400 });
     const file = await assertRevealable(settings, target, { extensions: ['.png'] });
     const evidence = recordClipboardCopyEvidence(file, {
       clipboard: body.clipboard,
