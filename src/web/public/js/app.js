@@ -11,6 +11,7 @@ let _keyboardShortcutsAttached = false;
 let _routeSeq = 0;
 let _customRangeOutsideClickAttached = false;
 let _setupWizardDraft = null;
+const _trackedObjectUrls = new Set();
 
 function accountOptionValue(account = {}) {
   return String(account.id || account.wxid || '').trim();
@@ -78,6 +79,26 @@ async function api(path, opts = {}) {
   return r.json();
 }
 
+function authFetch(path, opts = {}) {
+  const headers = { 'X-WX-Token': TOKEN, ...(opts.headers || {}) };
+  return fetch(path, { ...opts, headers });
+}
+
+function trackObjectUrl(url) {
+  if (url) _trackedObjectUrls.add(url);
+  return url;
+}
+
+function revokeObjectUrl(url) {
+  if (!url) return;
+  _trackedObjectUrls.delete(url);
+  try { URL.revokeObjectURL(url); } catch {}
+}
+
+function revokeTrackedObjectUrls() {
+  for (const url of [..._trackedObjectUrls]) revokeObjectUrl(url);
+}
+
 // ---------- 主题 ----------
 function effectiveAppTheme() {
   const selected = document.documentElement.dataset.theme;
@@ -134,6 +155,7 @@ window.addEventListener('hashchange', route);
 function closeTransientOverlays() {
   document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
   closeRerenderPanels();
+  revokeTrackedObjectUrls();
 }
 
 function renderRouteError(error) {
@@ -3542,7 +3564,7 @@ function historyMetaStatusHtml(item = {}) {
 function historyThumbHtml(item = {}, version = historyItemCacheBust(item)) {
   const { fileMissing } = historyArtifactState(item);
   if (fileMissing) return '<span class="history-missing-label">长图文件缺失</span>';
-  return `<img loading="lazy" decoding="async" src="${historyThumbUrl(item.digest_id, version)}" alt="${escapeHtml(item.group)}" />`;
+  return `<img loading="lazy" decoding="async" data-digest-id="${escapeHtml(item.digest_id)}" data-cache-bust="${escapeHtml(version)}" alt="${escapeHtml(item.group)}" />`;
 }
 
 function historyCardHtml(item = {}) {
@@ -3563,10 +3585,25 @@ function watchHistoryThumbnailImage(img) {
   if (!img || !thumb) return;
   const markLoaded = () => thumb.classList.add('loaded');
   const markError = () => thumb.classList.add('error');
-  img.addEventListener('load', markLoaded, { once: true });
-  img.addEventListener('error', markError, { once: true });
-  if (img.complete && img.naturalWidth > 0) markLoaded();
-  else if (img.complete) markError();
+  const load = () => {
+    img.addEventListener('load', markLoaded, { once: true });
+    img.addEventListener('error', markError, { once: true });
+    loadHistoryImageElement(img, {
+      digestId: img.dataset.digestId,
+      cacheBust: img.dataset.cacheBust || historyItemCacheBust({ digest_id: img.dataset.digestId }),
+      thumbnail: true,
+    }).catch(markError);
+  };
+  if ('IntersectionObserver' in window) {
+    const observer = new IntersectionObserver(entries => {
+      if (!entries.some(entry => entry.isIntersecting)) return;
+      observer.disconnect();
+      load();
+    }, { rootMargin: '480px 0px' });
+    observer.observe(img);
+    return;
+  }
+  load();
 }
 
 function updateHistoryCardItem(item = {}) {
@@ -3596,7 +3633,6 @@ function historyArtifactNote(item = {}) {
 }
 
 function showHistoryModal(item) {
-  const imageUrl = historyImageUrl(item.digest_id, historyItemCacheBust(item));
   const serverRerenderSupported = supportsServerRerender();
   const { fileMissing, digestMissing } = historyArtifactState(item);
   let canRerender = serverRerenderSupported && !digestMissing;
@@ -3617,10 +3653,10 @@ function showHistoryModal(item) {
       </div>
       <div class="modal-body ${artifactNote ? 'has-note' : ''}">
         <div data-artifact-note>${artifactNoteHtml}</div>
-        ${fileMissing ? '' : `<img data-zoomable src="${imageUrl}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`}
+        ${fileMissing ? '' : `<img data-zoomable data-digest-id="${escapeHtml(item.digest_id)}" data-cache-bust="${escapeHtml(historyItemCacheBust(item))}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`}
       </div>
       <div class="preview-actions">
-        <a class="btn" data-download href="${imageUrl}" download="${escapeHtml(historyDownloadFilename(item))}">⬇ 下载 PNG</a>
+        <a class="btn" data-download href="#" download="${escapeHtml(historyDownloadFilename(item))}">⬇ 下载 PNG</a>
         <button class="btn" data-copy>📋 复制到剪贴板</button>
         <button class="btn" data-reveal>📁 在文件夹中显示</button>
         <button class="btn btn-ghost" data-rerender ${canRerender ? '' : `disabled title="${escapeHtml(rerenderTitle)}"`}>🔄 重新渲染</button>
@@ -3644,7 +3680,7 @@ function showHistoryModal(item) {
     copyButton.disabled = false;
     revealButton.disabled = false;
     downloadButton.classList.remove('disabled');
-    downloadButton.href = historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now());
+    downloadButton.href = '#';
     downloadButton.setAttribute('download', historyDownloadFilename(item));
   };
   const disableImageActions = (message = '长图加载失败：文件可能已被移动或删除。') => {
@@ -3679,6 +3715,7 @@ function showHistoryModal(item) {
   const markHistoryFileMissing = (message = '长图加载失败：文件可能已被移动或删除。') => {
     item.file_exists = false;
     updateHistoryCardItem(item);
+    revokeObjectUrl(image?.dataset?.objectUrl);
     image?.remove();
     image = null;
     paintModalArtifactNote();
@@ -3695,7 +3732,7 @@ function showHistoryModal(item) {
   };
   const verifyHistoryImageAfterError = async () => {
     try {
-      const res = await fetch(historyImageUrl(item.digest_id, Date.now()), { cache: 'no-store' });
+      const res = await fetchHistoryImage(item.digest_id, { cacheBust: Date.now() });
       if (res.status === 404) {
         markHistoryFileMissing('长图文件已不存在，可能已被移动或删除。');
         return;
@@ -3713,22 +3750,25 @@ function showHistoryModal(item) {
     if (!image) return;
     image.addEventListener('load', restoreImageActions, { once: true });
     image.addEventListener('error', () => { void verifyHistoryImageAfterError(); }, { once: true });
+    loadHistoryImageElement(image, {
+      digestId: item.digest_id,
+      cacheBust: image.dataset.cacheBust || historyItemCacheBust(item) || Date.now(),
+    }).catch(() => { void verifyHistoryImageAfterError(); });
   };
   watchHistoryImage();
   setHistoryRerenderAvailability();
   if (fileMissing) disableImageActions(historyArtifactNote(item) || '长图文件已不存在。');
-  if (image?.complete && image.naturalWidth === 0) void verifyHistoryImageAfterError();
   image?.addEventListener('click', () => {
     if (!image.complete || image.naturalWidth === 0) return;
-    showImageZoomModal({ title: item.group, src: historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now()) });
+    showImageZoomModal({ title: item.group, src: image.currentSrc || image.src });
   });
-  const ensureHistoryModalImage = src => {
+  const ensureHistoryModalImage = cacheBust => {
     if (image) return image;
-    modalBody.insertAdjacentHTML('beforeend', `<img data-zoomable src="${src}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`);
+    modalBody.insertAdjacentHTML('beforeend', `<img data-zoomable data-digest-id="${escapeHtml(item.digest_id)}" data-cache-bust="${escapeHtml(cacheBust || historyItemCacheBust(item) || Date.now())}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`);
     image = modalBody.querySelector('[data-zoomable]');
     image?.addEventListener('click', () => {
       if (!image.complete || image.naturalWidth === 0) return;
-      showImageZoomModal({ title: item.group, src: historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now()) });
+      showImageZoomModal({ title: item.group, src: image.currentSrc || image.src });
     });
     return image;
   };
@@ -3738,17 +3778,7 @@ function showHistoryModal(item) {
     status.className = 'status';
     status.textContent = '正在准备下载...';
     try {
-      const res = await fetch(historyImageUrl(item.digest_id, Date.now()), { cache: 'no-store' });
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        const message = parseHttpErrorMessage(text, res.status);
-        if (res.status === 404) {
-          markHistoryFileMissing(`下载失败：${message || '长图文件可能已被移动或删除'}`);
-          return;
-        }
-        throw new Error(message || `请求失败（${res.status}）`);
-      }
-      const blob = await res.blob();
+      const blob = await fetchHistoryImageBlob(item.digest_id, { cacheBust: Date.now() });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -3758,6 +3788,10 @@ function showHistoryModal(item) {
       status.className = 'status ok';
       status.textContent = '✓ 已开始下载 PNG';
     } catch (err) {
+      if (err?.status === 404) {
+        markHistoryFileMissing(`下载失败：${err.message || '长图文件可能已被移动或删除'}`);
+        return;
+      }
       status.className = 'status err';
       status.textContent = `下载失败：${err.message || '未知错误'}`;
     }
@@ -3782,7 +3816,7 @@ function showHistoryModal(item) {
     status.className = 'status';
     status.textContent = '复制中...';
     try {
-      const copied = await copyImageUrlToClipboard(historyImageUrl(item.digest_id, Date.now()));
+      const copied = await copyHistoryImageToClipboard(item.digest_id);
       void recordBrowserClipboardCopy({ digestId: item.digest_id, clipboard: copied });
       status.className = 'status ok';
       const size = imageSizeLabel(copied);
@@ -3832,13 +3866,15 @@ function showHistoryModal(item) {
             throw err;
           }
           Object.assign(item, r.item || {});
-          const freshUrl = historyImageUrl(item.digest_id, Date.now());
+          const freshVersion = Date.now();
           item.file_exists = true;
           item.digest_exists = true;
-          ensureHistoryModalImage(freshUrl);
+          if (image) {
+            image.dataset.cacheBust = String(freshVersion);
+          }
+          ensureHistoryModalImage(freshVersion);
           watchHistoryImage();
-          if (image) image.src = freshUrl;
-          downloadButton.href = freshUrl;
+          downloadButton.href = '#';
           downloadButton.setAttribute('download', historyDownloadFilename(item));
           downloadButton.classList.remove('disabled');
           restoreImageActions();
@@ -3862,26 +3898,47 @@ function showHistoryModal(item) {
   });
 }
 
-function historyImageUrl(digestId, cacheBust = '') {
-  const url = `/api/digest-file/${encodeURIComponent(digestId)}?token=${encodeURIComponent(TOKEN)}`;
-  return cacheBust ? `${url}&t=${encodeURIComponent(cacheBust)}` : url;
+function historyImagePath(digestId, { cacheBust = '', thumbnail = false } = {}) {
+  const base = thumbnail ? '/api/digest-thumb/' : '/api/digest-file/';
+  const url = `${base}${encodeURIComponent(digestId)}`;
+  return cacheBust ? `${url}?t=${encodeURIComponent(cacheBust)}` : url;
 }
 
-function historyThumbUrl(digestId, cacheBust = '') {
-  const url = `/api/digest-thumb/${encodeURIComponent(digestId)}?token=${encodeURIComponent(TOKEN)}`;
-  return cacheBust ? `${url}&t=${encodeURIComponent(cacheBust)}` : url;
+async function fetchHistoryImage(digestId, { cacheBust = '', thumbnail = false, cache = 'no-store' } = {}) {
+  return authFetch(historyImagePath(digestId, { cacheBust, thumbnail }), { cache });
 }
 
-async function copyImageUrlToClipboard(url) {
-  const res = await fetch(url);
+async function fetchHistoryImageBlob(digestId, options = {}) {
+  const res = await fetchHistoryImage(digestId, options);
   if (!res.ok) {
-    const text = await res.text();
+    const text = await res.text().catch(() => '');
     const err = new Error(parseHttpErrorMessage(text, res.status));
     err.status = res.status;
     err.responseText = text;
     throw err;
   }
-  const blob = await res.blob();
+  return await res.blob();
+}
+
+async function loadHistoryImageElement(img, { digestId, cacheBust = '', thumbnail = false } = {}) {
+  if (!img || !digestId) throw new Error('缺少历史图片编号');
+  const seq = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  img.dataset.loadSeq = seq;
+  const blob = await fetchHistoryImageBlob(digestId, { cacheBust, thumbnail });
+  const objectUrl = trackObjectUrl(URL.createObjectURL(blob));
+  if (img.dataset.loadSeq !== seq || !img.isConnected) {
+    revokeObjectUrl(objectUrl);
+    return null;
+  }
+  const previousUrl = img.dataset.objectUrl || '';
+  img.dataset.objectUrl = objectUrl;
+  img.src = objectUrl;
+  if (previousUrl && previousUrl !== objectUrl) revokeObjectUrl(previousUrl);
+  return { blob, objectUrl };
+}
+
+async function copyHistoryImageToClipboard(digestId) {
+  const blob = await fetchHistoryImageBlob(digestId, { cacheBust: Date.now() });
   await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
   if (typeof createImageBitmap === 'function') {
     const bitmap = await createImageBitmap(blob).catch(() => null);
