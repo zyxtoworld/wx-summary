@@ -1812,8 +1812,8 @@ async function generateDigest({ previewText = false } = {}) {
   const stageMap = {};
   const stageSnapshots = new Map();
   const stagesOrder = previewText
-    ? ['fetching', 'summarizing', 'received', 'rendering']
-    : ['fetching', 'summarizing', 'received', 'rendering', 'encoding', 'saving'];
+    ? ['fetching', 'summarizing', 'received', 'text_prepare', 'text_refresh']
+    : ['fetching', 'summarizing', 'received', 'render_queue', 'render_prepare', 'render_draw', 'encoding', 'saving'];
   function stripElapsedDetail(detail = '') {
     return stripDigestElapsedDetail(detail);
   }
@@ -2038,8 +2038,8 @@ async function generateDigest({ previewText = false } = {}) {
           nextDigests[i] = digest;
           const previewCount = nextDigests.filter(Boolean).length;
           upsertStage(groupStage(i, {
-            name: 'rendering',
-            label: '整理文本预览',
+            name: 'text_prepare',
+            label: '合并 Markdown',
             status: 'running',
             detail: `准备合并 ${previewCount}/${targets.length} 个群为 Markdown`,
             resetElapsed: true,
@@ -2047,7 +2047,13 @@ async function generateDigest({ previewText = false } = {}) {
           await waitForBrowserPaint();
           if (controller.signal.aborted) return;
           upsertStage(groupStage(i, {
-            name: 'rendering',
+            name: 'text_prepare',
+            label: '合并 Markdown',
+            status: 'done',
+            detail: `已整理 ${previewCount}/${targets.length} 个群`,
+          }));
+          upsertStage(groupStage(i, {
+            name: 'text_refresh',
             label: '刷新文本预览',
             status: 'running',
             detail: '写入 Markdown 预览区域',
@@ -2060,8 +2066,8 @@ async function generateDigest({ previewText = false } = {}) {
           if (controller.signal.aborted) return;
           digests[i] = digest;
           upsertStage(groupStage(i, {
-            name: 'rendering',
-            label: '整理文本预览',
+            name: 'text_refresh',
+            label: '刷新文本预览',
             status: 'done',
             detail: [
               `已整理 ${digests.filter(Boolean).length}/${targets.length}`,
@@ -2070,7 +2076,7 @@ async function generateDigest({ previewText = false } = {}) {
           }));
         } else {
           upsertStage(groupStage(i, {
-            name: 'rendering',
+            name: 'render_queue',
             label: '等待本地渲染队列',
             status: 'running',
             detail: '长图绘制和 PNG 保存按顺序执行',
@@ -2079,6 +2085,12 @@ async function generateDigest({ previewText = false } = {}) {
           await waitForBrowserPaint();
           await enqueueRender(async () => {
             if (controller.signal.aborted) return;
+            upsertStage(groupStage(i, {
+              name: 'render_queue',
+              label: '等待本地渲染队列',
+              status: 'done',
+              detail: '开始本地绘制',
+            }));
             const livePreviewCard = document.getElementById('preview-card');
             if (livePreviewCard) livePreviewCard.classList.remove('hidden');
             _state_digest.lastSavedItem = null;
@@ -2090,7 +2102,7 @@ async function generateDigest({ previewText = false } = {}) {
               revealButton.title = '保存后可用';
             }
             upsertStage(groupStage(i, {
-              name: 'rendering',
+              name: 'render_prepare',
               label: '准备长图画布',
               status: 'running',
               detail: [
@@ -2106,7 +2118,13 @@ async function generateDigest({ previewText = false } = {}) {
               return;
             }
             upsertStage(groupStage(i, {
-              name: 'rendering',
+              name: 'render_prepare',
+              label: '准备长图画布',
+              status: 'done',
+              detail: '布局和页面高度已测量',
+            }));
+            upsertStage(groupStage(i, {
+              name: 'render_draw',
               label: '绘制 Canvas',
               status: 'running',
               detail: '生成浏览器长图预览',
@@ -2125,8 +2143,8 @@ async function generateDigest({ previewText = false } = {}) {
             }
             renderedDigests[i] = digest;
             upsertStage(groupStage(i, {
-              name: 'rendering',
-              label: '绘制长图',
+              name: 'render_draw',
+              label: '绘制 Canvas',
               status: 'done',
               detail: canvasDisplaySizeLabel(canvas),
             }));
