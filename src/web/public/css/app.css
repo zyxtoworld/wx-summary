@@ -588,9 +588,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 }
 #digest-canvas {
   width: var(--digest-preview-width);       /* 1080 / 2 缩放显示 */
-  max-width: none;
+  max-width: 100%;
   height: auto;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   display: block;
   cursor: zoom-in;
   box-shadow: 0 8px 32px rgba(0,0,0,0.12);
@@ -856,9 +856,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 }
 .modal-body img {
   width: var(--digest-preview-width);
-  max-width: none;
+  max-width: 100%;
   height: auto;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   display: block;
   cursor: zoom-in;
   box-shadow: 0 8px 32px rgba(0,0,0,0.12);
@@ -873,6 +873,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 .zoom-body img {
   width: 1080px;
   max-width: none;
+  flex: 0 0 auto;
   cursor: default;
 }
 .image-modal .preview-actions {

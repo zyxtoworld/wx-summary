@@ -19,6 +19,7 @@ const state = {
 };
 
 let timer = null;
+let activeRunPromise = null;
 
 export async function startScheduler({ immediate = false } = {}) {
   stopScheduler();
@@ -41,12 +42,17 @@ export async function restartScheduler() {
   return startScheduler();
 }
 
-export function stopScheduler() {
+export async function stopScheduler({ wait = false, timeout_ms = 30000 } = {}) {
   if (timer) clearTimeout(timer);
   timer = null;
   state.timer_active = false;
   state.next_run_at = '';
   logInfo('scheduler_stopped');
+  if (wait && activeRunPromise) {
+    await waitForSchedulerRun(activeRunPromise, timeout_ms).catch(e => {
+      logWarn('scheduler_stop_wait_failed', { error: sanitizeText(e?.message || String(e)) });
+    });
+  }
 }
 
 export function getSchedulerStatus() {
@@ -59,33 +65,49 @@ export async function runSchedulerOnce({ reason = 'manual', force = false } = {}
     return { ok: true, skipped: true, reason, detail: 'already_running', at: new Date().toISOString() };
   }
   state.running = true;
-  state.last_started_at = new Date().toISOString();
-  state.last_error = '';
-  logInfo('scheduler_run_started', { reason });
+  const runPromise = (async () => {
+    state.last_started_at = new Date().toISOString();
+    state.last_error = '';
+    logInfo('scheduler_run_started', { reason });
+    try {
+      const result = await executeSchedulerTick({ reason, force });
+      state.last_result = result;
+      logInfo('scheduler_run_finished', {
+        reason,
+        ok: result.ok,
+        accounts: result.accounts || 0,
+        checked: result.checked || 0,
+        generated: result.generated || 0,
+        skipped: result.skipped || 0,
+        failed: result.failed || 0,
+        detail: result.detail || '',
+      });
+      return result;
+    } catch (e) {
+      const message = sanitizeText(e?.message || String(e));
+      state.last_error = message;
+      state.last_result = { ok: false, reason, error: message, at: new Date().toISOString() };
+      logError('scheduler_run_failed', { reason, error: message });
+      throw e;
+    } finally {
+      state.running = false;
+      state.last_finished_at = new Date().toISOString();
+    }
+  })();
+  activeRunPromise = runPromise;
   try {
-    const result = await executeSchedulerTick({ reason, force });
-    state.last_result = result;
-    logInfo('scheduler_run_finished', {
-      reason,
-      ok: result.ok,
-      accounts: result.accounts || 0,
-      checked: result.checked || 0,
-      generated: result.generated || 0,
-      skipped: result.skipped || 0,
-      failed: result.failed || 0,
-      detail: result.detail || '',
-    });
-    return result;
-  } catch (e) {
-    const message = sanitizeText(e?.message || String(e));
-    state.last_error = message;
-    state.last_result = { ok: false, reason, error: message, at: new Date().toISOString() };
-    logError('scheduler_run_failed', { reason, error: message });
-    throw e;
+    return await runPromise;
   } finally {
-    state.running = false;
-    state.last_finished_at = new Date().toISOString();
+    if (activeRunPromise === runPromise) activeRunPromise = null;
   }
+}
+
+function waitForSchedulerRun(runPromise, timeoutMs) {
+  const timeout = Math.max(1000, Number(timeoutMs || 30000));
+  return Promise.race([
+    runPromise.catch(() => {}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`scheduler run did not finish within ${timeout}ms`)), timeout)),
+  ]);
 }
 
 function scheduleNext(settings, delayMs) {

@@ -99,6 +99,7 @@ function stripSensitive(settings) {
   delete clean.wechat.manual_key_set;
   delete clean.wechat.clear_manual_key;
   delete clean._secrets_invalid;
+  delete clean._secrets_invalid_info;
   delete clean._settings_invalid;
   return clean;
 }
@@ -111,9 +112,24 @@ export async function loadSecrets({ file = SECRETS_FILE } = {}) {
     return { secrets: { api_key: parsed.api_key || '', manual_key: parsed.manual_key || '' }, invalid: false };
   } catch (e) {
     if (e?.code === 'ENOENT') return { secrets: { api_key: '', manual_key: '' }, invalid: false };
-    await fsp.rm(file, { force: true }).catch(() => {});
-    return { secrets: { api_key: '', manual_key: '' }, invalid: true, error: e?.message || String(e) };
+    const backup = await backupInvalidSecretsFile(file).catch(() => '');
+    return {
+      secrets: { api_key: '', manual_key: '' },
+      invalid: true,
+      backup_path: backup,
+      backup_relative_path: backup ? toProjectRelativeSafe(backup) : '',
+      error: e?.message || String(e),
+    };
   }
+}
+
+async function backupInvalidSecretsFile(file) {
+  await ensureDir(path.dirname(file));
+  const backup = file.replace(/\.bin$/i, `.invalid.${settingsBackupTimestamp(new Date())}.bin`);
+  await fsp.rename(file, backup).catch(e => {
+    if (e?.code !== 'ENOENT') throw e;
+  });
+  return backup;
 }
 
 async function loadSettingsFile(file = SETTINGS_FILE) {
@@ -191,6 +207,13 @@ export async function loadSettings({ includeSecrets = false, settingsFile = SETT
   merged.llm.api_key_display = maskSecret(secretState.secrets.api_key);
   merged.wechat.manual_key_set = !!secretState.secrets.manual_key;
   merged._secrets_invalid = !!secretState.invalid;
+  if (secretState.invalid) {
+    merged._secrets_invalid_info = {
+      backup_path: secretState.backup_path || '',
+      backup_relative_path: secretState.backup_relative_path || '',
+      error: secretState.error || '',
+    };
+  }
   if (invalid) merged._settings_invalid = invalid;
   if (includeSecrets) {
     merged.llm.api_key = secretState.secrets.api_key;

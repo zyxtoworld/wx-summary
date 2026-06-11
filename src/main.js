@@ -24,6 +24,7 @@ const DEFAULT_PORT = 7788;
 const SESSION_TOKEN = crypto.randomBytes(16).toString('hex');
 const SHUTDOWN_TOKEN = crypto.randomBytes(16).toString('hex');
 const RUNTIME_INFO_FILE = path.join(TMP_DIR, 'server.json');
+const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'wx-summary.lock');
 const EXTERNAL_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'external-weixin-binary-baseline.json');
 const PRELAUNCH_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'prelaunch-weixin-binary.json');
 const LAUNCHER_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'launcher-weixin-binary.json');
@@ -36,6 +37,7 @@ const MAX_CANCELLED_DIGEST_BATCHES = 100;
 const SERVICE_STARTED_AT = new Date();
 let ACTIVE_SERVER = null;
 let ACTIVE_PORT = null;
+let INSTANCE_LOCK_FD = null;
 let SHUTTING_DOWN = false;
 let WEIXIN_BINARY_EXTERNAL_BASELINE = null;
 let WEIXIN_BINARY_PRELAUNCH_BASELINE = null;
@@ -111,6 +113,91 @@ async function writeRuntimeInfo(port) {
 
 function removeRuntimeInfo() {
   try { fs.rmSync(RUNTIME_INFO_FILE, { force: true }); } catch {}
+}
+
+function releaseInstanceLockSync() {
+  const fd = INSTANCE_LOCK_FD;
+  INSTANCE_LOCK_FD = null;
+  if (fd === null) return;
+  try {
+    fs.closeSync(fd);
+  } catch {}
+  try { fs.rmSync(INSTANCE_LOCK_FILE, { force: true }); } catch {}
+}
+
+async function readRuntimeInfo() {
+  try {
+    const raw = JSON.parse(await fsp.readFile(RUNTIME_INFO_FILE, 'utf-8'));
+    const port = Number(raw?.port || 0);
+    const urlValue = String(raw?.url || '').trim();
+    if (!Number.isInteger(port) || port <= 0 || port > 65535 || !urlValue) return null;
+    const parsed = new URL(urlValue);
+    if (parsed.hostname !== HOST) return null;
+    return { ...raw, port, url: `http://${HOST}:${port}` };
+  } catch {
+    return null;
+  }
+}
+
+async function existingRuntimeAlive(info) {
+  if (!info?.port) return false;
+  return new Promise(resolve => {
+    const req = http.get({ host: HOST, port: info.port, path: '/', timeout: 1000 }, res => {
+      let body = '';
+      res.setEncoding('utf-8');
+      res.on('data', chunk => {
+        if (body.length < 4096) body += chunk;
+      });
+      res.on('end', () => resolve(res.statusCode === 200 && body.includes('wx-summary')));
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on('error', () => resolve(false));
+  });
+}
+
+async function acquireInstanceLock(settings) {
+  await fsp.mkdir(DATA_DIR, { recursive: true });
+  const existingInfo = await readRuntimeInfo();
+  if (await existingRuntimeAlive(existingInfo)) {
+    logInfo('existing_instance_detected', { url: existingInfo.url, port: existingInfo.port, source: 'runtime_info' });
+    console.log(`wx-summary 已在运行：${existingInfo.url}`);
+    openInBrowser(existingInfo.url, settings);
+    return false;
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      INSTANCE_LOCK_FD = fs.openSync(INSTANCE_LOCK_FILE, 'wx');
+      fs.writeFileSync(INSTANCE_LOCK_FD, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }, null, 2), 'utf-8');
+      return true;
+    } catch (e) {
+      if (INSTANCE_LOCK_FD !== null) releaseInstanceLockSync();
+      if (e?.code !== 'EEXIST') throw e;
+      const info = await readRuntimeInfo();
+      if (await existingRuntimeAlive(info)) {
+        logInfo('existing_instance_detected', { url: info.url, port: info.port });
+        console.log(`wx-summary 已在运行：${info.url}`);
+        openInBrowser(info.url, settings);
+        return false;
+      }
+      const lockStat = await fsp.stat(INSTANCE_LOCK_FILE).catch(() => null);
+      if (lockStat && Date.now() - lockStat.mtimeMs < 15000) {
+        await new Promise(resolve => setTimeout(resolve, 1200));
+        const retryInfo = await readRuntimeInfo();
+        if (await existingRuntimeAlive(retryInfo)) {
+          logInfo('existing_instance_detected', { url: retryInfo.url, port: retryInfo.port });
+          console.log(`wx-summary 已在运行：${retryInfo.url}`);
+          openInBrowser(retryInfo.url, settings);
+          return false;
+        }
+        throw Object.assign(new Error('另一个 wx-summary 实例正在启动，请稍后再试。'), { status: 423 });
+      }
+      await fsp.rm(INSTANCE_LOCK_FILE, { force: true }).catch(() => {});
+    }
+  }
+  throw Object.assign(new Error('无法获取单实例锁，请稍后重试。'), { status: 423 });
 }
 
 function normalizeDigestBatchId(value) {
@@ -290,12 +377,13 @@ function freshPrelaunchBaseline() {
 async function gracefulShutdown(code = 0) {
   if (SHUTTING_DOWN) return;
   SHUTTING_DOWN = true;
-  stopScheduler();
+  await stopScheduler({ wait: true, timeout_ms: 30000 });
   const server = ACTIVE_SERVER;
   if (server) {
     await new Promise(resolve => server.close(() => resolve())).catch(() => {});
   }
   await clearTmpDir().catch(() => removeRuntimeInfo());
+  releaseInstanceLockSync();
   process.exit(code);
 }
 
@@ -742,6 +830,7 @@ async function handleApi(req, res, parsedUrl) {
       wechat,
       scheduler: getSchedulerStatus(),
       secrets_invalid: settings._secrets_invalid,
+      secrets_invalid_info: settings._secrets_invalid_info || null,
       settings_invalid: settings._settings_invalid || null,
     });
   }
@@ -1478,6 +1567,9 @@ function argValue(name) {
 export async function main() {
   const settings = await loadSettings();
   await ensureRuntimeDirs(settings);
+  const acquiredLock = await acquireInstanceLock(settings);
+  if (!acquiredLock) return null;
+  process.once('exit', releaseInstanceLockSync);
   if (process.env.WX_SUMMARY_SKIP_TMP_CLEAR !== '1') await clearTmpDir();
   configureLogger(settings.logging);
   WEIXIN_BINARY_EXTERNAL_BASELINE = await readExternalWeixinBaseline();

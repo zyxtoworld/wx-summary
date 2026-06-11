@@ -164,120 +164,129 @@ export async function probeWxDb(input = '') {
     let validation = null;
     let deepScanResult = null;
     copy = await copyDbFile(account, sample);
-    if (rawKeys.length) {
-      validation = await validateCopiedDbWithRawKeys(copy.target_path, rawKeys);
-    }
-    if (deepScan && !validation?.ok) {
-      const dbSalt = (await readHeader(copy.target_path)).toString('hex');
-      const moduleAnchors = moduleStringAddressTargets(moduleEvidence, sample);
-      const saltProbe = await probeWxKey({
-        scan_all_processes: true,
-        scan_db_salts: [dbSalt],
-        scan_memory_anchors: dbMemoryAnchors(account, sample),
-        scan_anchor_addresses: moduleAnchors.targets,
-        scan_codec_salts: [dbSalt],
-        include_db_raw: true,
-        include_anchor_raw: true,
-        include_anchor_address_raw: true,
-        include_codec_raw: true,
-        db_scan_max_bytes: 1024 * 1024 * 1024,
-        db_scan_max_region_bytes: 96 * 1024 * 1024,
-        db_scan_max_candidates: 16384,
-        db_reverse_pointer_scan: true,
-        db_reverse_pointer_max_bytes: 512 * 1024 * 1024,
-        db_reverse_pointer_max_hits: 1024,
-        anchor_scan_max_bytes: 1024 * 1024 * 1024,
-        anchor_scan_max_region_bytes: 96 * 1024 * 1024,
-        anchor_scan_max_candidates: 16384,
-        anchor_direct_max_candidates: 512,
-        anchor_follow_local_pointers: false,
-        anchor_reverse_pointer_scan: true,
-        anchor_reverse_pointer_max_bytes: 512 * 1024 * 1024,
-        anchor_reverse_pointer_max_hits: 1024,
-        anchor_address_scan_max_bytes: 512 * 1024 * 1024,
-        anchor_address_scan_max_candidates: 16384,
-        anchor_address_reverse_pointer_max_hits: 1024,
-        anchor_address_target_range_bytes: moduleAnchors.function_target_count > 0 ? 256 : 96,
-        anchor_address_reverse_pointer_direct_max_distance: 64,
-        anchor_address_reverse_pointer_layout_sample: true,
-        anchor_address_reverse_pointer_high_entropy_targets: true,
-        anchor_address_second_hop_reverse_pointers: moduleAnchors.function_target_count > 0,
-        codec_scan_max_bytes: 1024 * 1024 * 1024,
-        codec_scan_max_region_bytes: 96 * 1024 * 1024,
-        codec_scan_max_candidates: 4096,
-      });
-      const saltCandidates = Array.isArray(saltProbe._raw_db_salt_candidates) ? saltProbe._raw_db_salt_candidates : [];
-      const anchorCandidates = Array.isArray(saltProbe._raw_anchor_candidates) ? saltProbe._raw_anchor_candidates : [];
-      const anchorAddressCandidates = Array.isArray(saltProbe._raw_anchor_address_candidates) ? saltProbe._raw_anchor_address_candidates : [];
-      const codecCandidates = Array.isArray(saltProbe._raw_codec_candidates) ? saltProbe._raw_codec_candidates : [];
-      deepScanResult = {
-        source_category: sample.category,
-        source_name: sample.name,
-        salt_hit_count: Number(saltProbe.db_salt_hit_count || 0),
-        unique_candidate_count: Number(saltProbe.db_salt_unique_candidate_count || 0),
-        scanned_bytes: Number(saltProbe.db_salt_scanned_bytes || 0),
-        region_count: Number(saltProbe.db_salt_region_count || 0),
-        reverse_pointer_hit_count: Number(saltProbe.db_salt_reverse_pointer_hit_count || 0),
-        reverse_pointer_scanned_bytes: Number(saltProbe.db_salt_reverse_pointer_scanned_bytes || 0),
-        scan_mode: saltProbe.db_salt_scan_mode || null,
-        scan_processes: Array.isArray(saltProbe.db_salt_scan_processes) ? saltProbe.db_salt_scan_processes : [],
-        anchor_hit_count: Number(saltProbe.anchor_hit_count || 0),
-        anchor_unique_candidate_count: Number(saltProbe.anchor_unique_candidate_count || 0),
-        anchor_direct_candidate_count: Number(saltProbe.anchor_scan_processes?.reduce?.((sum, p) => sum + Number(p.anchor_direct_candidate_count || 0), 0) || 0),
-        anchor_reference_address_count: Number(saltProbe.anchor_scan_processes?.reduce?.((sum, p) => sum + Number(p.anchor_reference_address_count || 0), 0) || 0),
-        anchor_scanned_bytes: Number(saltProbe.anchor_scanned_bytes || 0),
-        anchor_region_count: Number(saltProbe.anchor_region_count || 0),
-        anchor_reverse_pointer_hit_count: Number(saltProbe.anchor_reverse_pointer_hit_count || 0),
-        anchor_reverse_pointer_scanned_bytes: Number(saltProbe.anchor_reverse_pointer_scanned_bytes || 0),
-        anchor_scan_mode: saltProbe.anchor_scan_mode || null,
-        anchor_scan_processes: Array.isArray(saltProbe.anchor_scan_processes) ? saltProbe.anchor_scan_processes : [],
-        module_anchor_address_target_count: Number(saltProbe.anchor_address_target_count || 0),
-        module_anchor_function_target_count: moduleAnchors.function_target_count || 0,
-        module_anchor_address_patterns: moduleAnchors.pattern_counts,
-        module_anchor_address_sections: moduleAnchors.section_counts,
-        module_anchor_address_modules: moduleAnchors.module_counts,
-        module_anchor_address_sources: moduleAnchors.source_counts,
-        module_anchor_address_unique_candidate_count: Number(saltProbe.anchor_address_unique_candidate_count || 0),
-        module_anchor_address_reverse_pointer_hit_count: Number(saltProbe.anchor_address_reverse_pointer_hit_count || 0),
-        module_anchor_address_reverse_pointer_direct_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_direct_candidate_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_deferred_target_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_deferred_target_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_followed_target_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_followed_target_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_high_entropy_target_read_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_target_read_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_high_entropy_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_candidate_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_high_entropy_window_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_window_candidate_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_high_entropy_pointer_table_read_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_pointer_table_read_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_high_entropy_pointer_table_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_pointer_table_candidate_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_crypto_object_sweep_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_crypto_object_sweep_candidate_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_second_hop_target_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_second_hop_target_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_second_hop_hit_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_second_hop_hit_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_second_hop_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_second_hop_candidate_count || 0), 0) || 0),
-        module_anchor_address_reverse_pointer_layout_summary: summarizeReversePointerLayouts(saltProbe.anchor_address_scan_processes),
-        module_anchor_address_scanned_bytes: Number(saltProbe.anchor_address_scanned_bytes || 0),
-        module_anchor_address_region_count: Number(saltProbe.anchor_address_region_count || 0),
-        module_anchor_address_scan_mode: saltProbe.anchor_address_scan_mode || null,
-        module_anchor_address_scan_processes: Array.isArray(saltProbe.anchor_address_scan_processes) ? saltProbe.anchor_address_scan_processes : [],
-        codec_context_hit_count: Number(saltProbe.codec_context_hit_count || 0),
-        codec_context_salt_match_count: Number(saltProbe.codec_context_salt_match_count || 0),
-        codec_context_unique_candidate_count: Number(saltProbe.codec_context_unique_candidate_count || 0),
-        codec_context_pass_candidate_count: Number(saltProbe.codec_context_scan_processes?.reduce?.((sum, p) => sum + Number(p.codec_pass_candidate_count || 0), 0) || 0),
-        codec_context_key_pointer_candidate_count: Number(saltProbe.codec_context_scan_processes?.reduce?.((sum, p) => sum + Number(p.codec_key_pointer_candidate_count || 0), 0) || 0),
-        codec_context_scanned_bytes: Number(saltProbe.codec_context_scanned_bytes || 0),
-        codec_context_region_count: Number(saltProbe.codec_context_region_count || 0),
-        codec_context_scan_mode: saltProbe.codec_context_scan_mode || null,
-        codec_context_scan_processes: Array.isArray(saltProbe.codec_context_scan_processes) ? saltProbe.codec_context_scan_processes : [],
-      };
-      delete saltProbe._raw_db_salt_candidates;
-      delete saltProbe._raw_anchor_candidates;
-      delete saltProbe._raw_anchor_address_candidates;
-      delete saltProbe._raw_codec_candidates;
-      if (saltCandidates.length || anchorCandidates.length || anchorAddressCandidates.length || codecCandidates.length) {
-        validation = await validateCopiedDbWithRawKeys(copy.target_path, [...rawKeys, ...saltCandidates, ...anchorCandidates, ...anchorAddressCandidates, ...codecCandidates]);
+    try {
+      if (rawKeys.length) {
+        validation = await validateCopiedDbWithRawKeys(copy.target_path, rawKeys);
+      }
+      if (deepScan && !validation?.ok) {
+        const dbSalt = (await readHeader(copy.target_path)).toString('hex');
+        const moduleAnchors = moduleStringAddressTargets(moduleEvidence, sample);
+        const saltProbe = await probeWxKey({
+          scan_all_processes: true,
+          scan_db_salts: [dbSalt],
+          scan_memory_anchors: dbMemoryAnchors(account, sample),
+          scan_anchor_addresses: moduleAnchors.targets,
+          scan_codec_salts: [dbSalt],
+          include_db_raw: true,
+          include_anchor_raw: true,
+          include_anchor_address_raw: true,
+          include_codec_raw: true,
+          db_scan_max_bytes: 1024 * 1024 * 1024,
+          db_scan_max_region_bytes: 96 * 1024 * 1024,
+          db_scan_max_candidates: 16384,
+          db_reverse_pointer_scan: true,
+          db_reverse_pointer_max_bytes: 512 * 1024 * 1024,
+          db_reverse_pointer_max_hits: 1024,
+          anchor_scan_max_bytes: 1024 * 1024 * 1024,
+          anchor_scan_max_region_bytes: 96 * 1024 * 1024,
+          anchor_scan_max_candidates: 16384,
+          anchor_direct_max_candidates: 512,
+          anchor_follow_local_pointers: false,
+          anchor_reverse_pointer_scan: true,
+          anchor_reverse_pointer_max_bytes: 512 * 1024 * 1024,
+          anchor_reverse_pointer_max_hits: 1024,
+          anchor_address_scan_max_bytes: 512 * 1024 * 1024,
+          anchor_address_scan_max_candidates: 16384,
+          anchor_address_reverse_pointer_max_hits: 1024,
+          anchor_address_target_range_bytes: moduleAnchors.function_target_count > 0 ? 256 : 96,
+          anchor_address_reverse_pointer_direct_max_distance: 64,
+          anchor_address_reverse_pointer_layout_sample: true,
+          anchor_address_reverse_pointer_high_entropy_targets: true,
+          anchor_address_second_hop_reverse_pointers: moduleAnchors.function_target_count > 0,
+          codec_scan_max_bytes: 1024 * 1024 * 1024,
+          codec_scan_max_region_bytes: 96 * 1024 * 1024,
+          codec_scan_max_candidates: 4096,
+        });
+        const saltCandidates = Array.isArray(saltProbe._raw_db_salt_candidates) ? saltProbe._raw_db_salt_candidates : [];
+        const anchorCandidates = Array.isArray(saltProbe._raw_anchor_candidates) ? saltProbe._raw_anchor_candidates : [];
+        const anchorAddressCandidates = Array.isArray(saltProbe._raw_anchor_address_candidates) ? saltProbe._raw_anchor_address_candidates : [];
+        const codecCandidates = Array.isArray(saltProbe._raw_codec_candidates) ? saltProbe._raw_codec_candidates : [];
+        deepScanResult = {
+          source_category: sample.category,
+          source_name: sample.name,
+          salt_hit_count: Number(saltProbe.db_salt_hit_count || 0),
+          unique_candidate_count: Number(saltProbe.db_salt_unique_candidate_count || 0),
+          scanned_bytes: Number(saltProbe.db_salt_scanned_bytes || 0),
+          region_count: Number(saltProbe.db_salt_region_count || 0),
+          reverse_pointer_hit_count: Number(saltProbe.db_salt_reverse_pointer_hit_count || 0),
+          reverse_pointer_scanned_bytes: Number(saltProbe.db_salt_reverse_pointer_scanned_bytes || 0),
+          scan_mode: saltProbe.db_salt_scan_mode || null,
+          scan_processes: Array.isArray(saltProbe.db_salt_scan_processes) ? saltProbe.db_salt_scan_processes : [],
+          anchor_hit_count: Number(saltProbe.anchor_hit_count || 0),
+          anchor_unique_candidate_count: Number(saltProbe.anchor_unique_candidate_count || 0),
+          anchor_direct_candidate_count: Number(saltProbe.anchor_scan_processes?.reduce?.((sum, p) => sum + Number(p.anchor_direct_candidate_count || 0), 0) || 0),
+          anchor_reference_address_count: Number(saltProbe.anchor_scan_processes?.reduce?.((sum, p) => sum + Number(p.anchor_reference_address_count || 0), 0) || 0),
+          anchor_scanned_bytes: Number(saltProbe.anchor_scanned_bytes || 0),
+          anchor_region_count: Number(saltProbe.anchor_region_count || 0),
+          anchor_reverse_pointer_hit_count: Number(saltProbe.anchor_reverse_pointer_hit_count || 0),
+          anchor_reverse_pointer_scanned_bytes: Number(saltProbe.anchor_reverse_pointer_scanned_bytes || 0),
+          anchor_scan_mode: saltProbe.anchor_scan_mode || null,
+          anchor_scan_processes: Array.isArray(saltProbe.anchor_scan_processes) ? saltProbe.anchor_scan_processes : [],
+          module_anchor_address_target_count: Number(saltProbe.anchor_address_target_count || 0),
+          module_anchor_function_target_count: moduleAnchors.function_target_count || 0,
+          module_anchor_address_patterns: moduleAnchors.pattern_counts,
+          module_anchor_address_sections: moduleAnchors.section_counts,
+          module_anchor_address_modules: moduleAnchors.module_counts,
+          module_anchor_address_sources: moduleAnchors.source_counts,
+          module_anchor_address_unique_candidate_count: Number(saltProbe.anchor_address_unique_candidate_count || 0),
+          module_anchor_address_reverse_pointer_hit_count: Number(saltProbe.anchor_address_reverse_pointer_hit_count || 0),
+          module_anchor_address_reverse_pointer_direct_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_direct_candidate_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_deferred_target_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_deferred_target_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_followed_target_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_followed_target_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_high_entropy_target_read_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_target_read_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_high_entropy_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_candidate_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_high_entropy_window_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_window_candidate_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_high_entropy_pointer_table_read_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_pointer_table_read_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_high_entropy_pointer_table_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_high_entropy_pointer_table_candidate_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_crypto_object_sweep_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_crypto_object_sweep_candidate_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_second_hop_target_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_second_hop_target_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_second_hop_hit_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_second_hop_hit_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_second_hop_candidate_count: Number(saltProbe.anchor_address_scan_processes?.reduce?.((sum, p) => sum + Number(p.reverse_pointer_second_hop_candidate_count || 0), 0) || 0),
+          module_anchor_address_reverse_pointer_layout_summary: summarizeReversePointerLayouts(saltProbe.anchor_address_scan_processes),
+          module_anchor_address_scanned_bytes: Number(saltProbe.anchor_address_scanned_bytes || 0),
+          module_anchor_address_region_count: Number(saltProbe.anchor_address_region_count || 0),
+          module_anchor_address_scan_mode: saltProbe.anchor_address_scan_mode || null,
+          module_anchor_address_scan_processes: Array.isArray(saltProbe.anchor_address_scan_processes) ? saltProbe.anchor_address_scan_processes : [],
+          codec_context_hit_count: Number(saltProbe.codec_context_hit_count || 0),
+          codec_context_salt_match_count: Number(saltProbe.codec_context_salt_match_count || 0),
+          codec_context_unique_candidate_count: Number(saltProbe.codec_context_unique_candidate_count || 0),
+          codec_context_pass_candidate_count: Number(saltProbe.codec_context_scan_processes?.reduce?.((sum, p) => sum + Number(p.codec_pass_candidate_count || 0), 0) || 0),
+          codec_context_key_pointer_candidate_count: Number(saltProbe.codec_context_scan_processes?.reduce?.((sum, p) => sum + Number(p.codec_key_pointer_candidate_count || 0), 0) || 0),
+          codec_context_scanned_bytes: Number(saltProbe.codec_context_scanned_bytes || 0),
+          codec_context_region_count: Number(saltProbe.codec_context_region_count || 0),
+          codec_context_scan_mode: saltProbe.codec_context_scan_mode || null,
+          codec_context_scan_processes: Array.isArray(saltProbe.codec_context_scan_processes) ? saltProbe.codec_context_scan_processes : [],
+        };
+        delete saltProbe._raw_db_salt_candidates;
+        delete saltProbe._raw_anchor_candidates;
+        delete saltProbe._raw_anchor_address_candidates;
+        delete saltProbe._raw_codec_candidates;
+        if (saltCandidates.length || anchorCandidates.length || anchorAddressCandidates.length || codecCandidates.length) {
+          validation = await validateCopiedDbWithRawKeys(copy.target_path, [...rawKeys, ...saltCandidates, ...anchorCandidates, ...anchorAddressCandidates, ...codecCandidates]);
+        }
+      }
+    } finally {
+      const copiedPath = copy?.target_path || '';
+      if (copiedPath) {
+        await removeCopiedDb(copiedPath)
+          .then(() => { copy.temp_removed = true; })
+          .catch(e => {
+            copy.temp_removed = false;
+            copy.temp_remove_error = String(e?.message || e).slice(0, 200);
+          });
+        delete copy.target_path;
       }
     }
-    const tempRoot = path.dirname(path.dirname(copy.target_path));
-    await removeCopiedDb(copy.target_path);
-    copy.temp_removed = true;
-    delete copy.target_path;
     dbChecks.push({
       source_category: sample.category,
       source_name: sample.name,
@@ -2073,6 +2082,7 @@ async function rmWithRetry(target) {
     if (!stillThere) return;
     await new Promise(resolve => setTimeout(resolve, 50 * (i + 1)));
   }
+  throw new Error(`failed to remove temporary database copy: ${path.basename(target)}`);
 }
 
 async function removeEmptyCopiedDbParents(tempRoot) {

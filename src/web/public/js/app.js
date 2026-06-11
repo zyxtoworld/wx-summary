@@ -138,6 +138,14 @@ function handleAccountSwitch() {
   _state_digest.selectedGroups.clear();
   _state_digest.lastDigest = null;
   _state_digest.lastSavedItem = null;
+  _state_digest.lastTextMarkdown = '';
+  _state_digest.lastTextTitle = '';
+  _state_digest.lastTextComplete = false;
+  _state_digest.lastTextDone = 0;
+  _state_digest.lastTextTotal = 0;
+  _state_digest.lastTextPartialReason = '';
+  _state_digest.progress = null;
+  stopDigestProgressPaintTimer();
   route();
 }
 
@@ -1518,6 +1526,7 @@ async function generateDigest({ previewText = false } = {}) {
       _state_digest.activeBatchId = '';
       _state_digest.abortReason = '';
       updateDigestCancelButton();
+      updateDigestSelectionLock();
     }
     if (generateButton) generateButton.disabled = false;
     if (previewButton) previewButton.disabled = false;
@@ -3096,11 +3105,12 @@ async function renderSettings() {
     if (!modelSelect.value && availableModels[0]) modelSelect.value = availableModels[0].id;
     if (!longSelect.value && availableModels[0]) longSelect.value = availableModels[0].id;
   }
-  function syncCustomModel(which) {
+  function syncCustomModel(which, { copyFromSelect = false } = {}) {
     const isLong = which === 'long';
     const cb = document.getElementById(isLong ? 's-model-long-custom' : 's-model-custom');
     const select = document.getElementById(isLong ? 's-model-long-select' : 's-model-select');
     const input = document.getElementById(isLong ? 's-model-long' : 's-model');
+    if (copyFromSelect && cb.checked && select.value) input.value = select.value;
     select.classList.toggle('hidden', cb.checked);
     input.classList.toggle('hidden', !cb.checked);
   }
@@ -3127,8 +3137,8 @@ async function renderSettings() {
   document.getElementById('s-model-long-custom').checked = !!s.llm.custom_long_context_model;
   syncCustomModel('model');
   syncCustomModel('long');
-  document.getElementById('s-model-custom').addEventListener('change', () => { syncCustomModel('model'); clearLlmCapabilitySnapshot(); });
-  document.getElementById('s-model-long-custom').addEventListener('change', () => { syncCustomModel('long'); clearLlmCapabilitySnapshot(); });
+  document.getElementById('s-model-custom').addEventListener('change', () => { syncCustomModel('model', { copyFromSelect: true }); clearLlmCapabilitySnapshot(); });
+  document.getElementById('s-model-long-custom').addEventListener('change', () => { syncCustomModel('long', { copyFromSelect: true }); clearLlmCapabilitySnapshot(); });
   const llmEndpointInputs = [
     ...document.querySelectorAll('input[name="s-provider"]'),
     document.getElementById('s-baseurl'),
@@ -3168,8 +3178,31 @@ async function renderSettings() {
     document.getElementById('s-test-llm'),
     document.getElementById('s-save-llm'),
   ];
+  function requireCurrentLlmEndpoint(statusEl) {
+    const baseUrl = normalizeSettingsBaseUrl(document.getElementById('s-baseurl').value);
+    const apiKey = document.getElementById('s-apikey').value.trim();
+    if (!baseUrl) {
+      statusEl.className = 'status err';
+      statusEl.textContent = '✗ 请填写 Base URL';
+      return false;
+    }
+    if (!apiKey && !s.llm.api_key_set) {
+      statusEl.className = 'status err';
+      statusEl.textContent = '✗ 请填写 API Key';
+      return false;
+    }
+    return true;
+  }
+  function currentLlmFormModels() {
+    const customModel = document.getElementById('s-model-custom').checked;
+    const customLongModel = document.getElementById('s-model-long-custom').checked;
+    const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
+    const longModel = customLongModel ? document.getElementById('s-model-long').value.trim() : document.getElementById('s-model-long-select').value;
+    return { customModel, customLongModel, model, longModel };
+  }
   document.getElementById('s-list-models').addEventListener('click', () => withBusyButtons(llmActionButtons, async () => {
     const $st = document.getElementById('s-model-status');
+    if (!requireCurrentLlmEndpoint($st)) return;
     $st.className = 'status';
     $st.textContent = '获取中...';
     try {
@@ -3195,13 +3228,21 @@ async function renderSettings() {
   }));
   document.getElementById('s-test-llm').addEventListener('click', () => withBusyButtons(llmActionButtons, async () => {
     const $st = document.getElementById('s-llm-status');
+    if (!requireCurrentLlmEndpoint($st)) return;
+    const { customModel, customLongModel, model, longModel } = currentLlmFormModels();
+    if (!model) {
+      $st.className = 'status err';
+      $st.textContent = customModel ? '✗ 请填写自定义模型' : '✗ 请先选择模型';
+      return;
+    }
+    if (customLongModel && !longModel) {
+      $st.className = 'status err';
+      $st.textContent = '✗ 请填写自定义长上下文模型，或关闭自定义';
+      return;
+    }
     $st.className = 'status'; $st.textContent = '测试中...';
     try {
       const key = document.getElementById('s-apikey').value.trim();
-      const customModel = document.getElementById('s-model-custom').checked;
-      const customLongModel = document.getElementById('s-model-long-custom').checked;
-      const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
-      const longModel = customLongModel ? document.getElementById('s-model-long').value.trim() : document.getElementById('s-model-long-select').value;
       const payload = { provider: selectedProvider(), base_url: document.getElementById('s-baseurl').value, model, long_context_model: longModel || model };
       if (key) payload.api_key = key;
       const r = await api('/api/test-llm', {
@@ -3223,11 +3264,8 @@ async function renderSettings() {
   document.getElementById('s-save-llm').addEventListener('click', () => withBusyButtons(llmActionButtons, async () => {
     const $st = document.getElementById('s-llm-status');
     const apiKey = document.getElementById('s-apikey').value.trim();
-    const customModel = document.getElementById('s-model-custom').checked;
-    const customLongModel = document.getElementById('s-model-long-custom').checked;
+    const { customModel, customLongModel, model, longModel } = currentLlmFormModels();
     const baseUrl = document.getElementById('s-baseurl').value.trim();
-    const model = customModel ? document.getElementById('s-model').value.trim() : document.getElementById('s-model-select').value;
-    const longModel = customLongModel ? document.getElementById('s-model-long').value.trim() : document.getElementById('s-model-long-select').value;
     const aiConcurrency = normalizeAiConcurrency(document.getElementById('s-ai-concurrency').value);
     if (!baseUrl) {
       $st.className = 'status err';
@@ -3835,16 +3873,18 @@ async function renderSetup() {
     const paintSeq = ++setupPaintSeq;
     $step.textContent = step;
     $back.disabled = step === 1;
+    $next.disabled = false;
     $next.textContent = step === 4 ? '完成' : '下一步';
     if (step === 1) {
       $title.textContent = '欢迎使用 wx-summary';
       const secretWarningText = state.platform === 'win32'
         ? '当前 Windows 用户不能解开已有的 DPAPI 密钥文件。请重新填写 AI Key 和可选微信手动密钥；旧密文不会展示，也不会上传。'
         : '当前系统用户不能解开已有的本机密钥文件。请重新填写 AI Key 和可选微信手动密钥；旧密文不会展示，也不会上传。';
+      const secretBackupPath = state.secrets_invalid_info?.backup_relative_path || state.secrets_invalid_info?.backup_path || '';
       const secretWarning = state.secrets_invalid
         ? `<div class="notice-card setup-secret-warning">
             <strong>检测到本机密钥无法解密</strong>
-            <span>${secretWarningText}</span>
+            <span>${secretWarningText}${secretBackupPath ? ` 原密文已备份到 ${escapeHtml(secretBackupPath)}。` : ''}</span>
           </div>`
         : '';
       const settingsWarning = state.settings_invalid
@@ -3867,6 +3907,9 @@ async function renderSetup() {
     } else if (step === 2) {
       $title.textContent = '配置 AI 接入';
       const models = wizardData.llm.available_models || [];
+      const customModel = !!wizardData.llm.custom_model;
+      const customLongModel = !!wizardData.llm.custom_long_context_model;
+      const modelOptions = models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('') || '<option value="">请先获取模型，或勾选自定义</option>';
       $body.innerHTML = `
         <div class="form-row"><label>Provider</label>
           <div class="radio-row">
@@ -3877,18 +3920,35 @@ async function renderSetup() {
         <div class="form-row"><label>Base URL</label><input id="w-base" type="text" placeholder="https://your-endpoint/v1" value="${escapeHtml(wizardData.llm.base_url || '')}" /></div>
         <div class="form-row"><label>API Key</label><input id="w-key" type="password" placeholder="sk-..." value="${escapeHtml(wizardData.llm.api_key || '')}" /></div>
         <div class="form-row inline"><button class="btn" id="w-list">获取模型</button><span class="status" id="w-status"></span></div>
-        <div class="form-row"><label>模型</label><select id="w-model">${models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('') || '<option value="">请先获取模型</option>'}</select></div>
-        <div class="form-row"><label>长上下文模型</label><select id="w-model-long">${models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('') || '<option value="">请先获取模型</option>'}</select></div>`;
-      if (wizardData.llm.model) document.getElementById('w-model').value = wizardData.llm.model;
-      if (wizardData.llm.long_context_model) document.getElementById('w-model-long').value = wizardData.llm.long_context_model;
+        <div class="form-row"><label>模型</label>
+          <select id="w-model-select" class="${customModel ? 'hidden' : ''}">${modelOptions}</select>
+          <label class="inline-check"><input id="w-model-custom" type="checkbox" ${customModel ? 'checked' : ''} /> 自定义</label>
+          <input id="w-model" class="${customModel ? '' : 'hidden'}" type="text" placeholder="model-id" value="${escapeHtml(wizardData.llm.model || '')}" />
+        </div>
+        <div class="form-row"><label>长上下文模型</label>
+          <select id="w-model-long-select" class="${customLongModel ? 'hidden' : ''}">${modelOptions}</select>
+          <label class="inline-check"><input id="w-model-long-custom" type="checkbox" ${customLongModel ? 'checked' : ''} /> 自定义</label>
+          <input id="w-model-long" class="${customLongModel ? '' : 'hidden'}" type="text" placeholder="默认同上方模型" value="${escapeHtml(wizardData.llm.long_context_model || '')}" />
+        </div>`;
+      if (!customModel && wizardData.llm.model) document.getElementById('w-model-select').value = wizardData.llm.model;
+      if (!customLongModel && wizardData.llm.long_context_model) document.getElementById('w-model-long-select').value = wizardData.llm.long_context_model;
+      const syncSetupCustomModel = which => {
+        const isLong = which === 'long';
+        const cb = document.getElementById(isLong ? 'w-model-long-custom' : 'w-model-custom');
+        const select = document.getElementById(isLong ? 'w-model-long-select' : 'w-model-select');
+        const input = document.getElementById(isLong ? 'w-model-long' : 'w-model');
+        if (cb.checked && select.value) input.value = select.value;
+        select.classList.toggle('hidden', cb.checked);
+        input.classList.toggle('hidden', !cb.checked);
+      };
+      document.getElementById('w-model-custom')?.addEventListener('change', () => syncSetupCustomModel('model'));
+      document.getElementById('w-model-long-custom')?.addEventListener('change', () => syncSetupCustomModel('long'));
       const markSetupModelsStale = () => {
         const $st = document.getElementById('w-status');
         if (wizardData.llm.available_models?.length && !sameSetupLlmIdentity(wizardData.llm.model_identity, setupLlmIdentityFromDom())) {
           wizardData.llm.available_models = [];
-          wizardData.llm.model = '';
-          wizardData.llm.long_context_model = '';
-          document.getElementById('w-model').innerHTML = '<option value="">请重新获取模型</option>';
-          document.getElementById('w-model-long').innerHTML = '<option value="">请重新获取模型</option>';
+          document.getElementById('w-model-select').innerHTML = '<option value="">请重新获取模型，或勾选自定义</option>';
+          document.getElementById('w-model-long-select').innerHTML = '<option value="">请重新获取模型，或勾选自定义</option>';
           if ($st) {
             $st.className = 'status warn';
             $st.textContent = '端点或密钥已变化，请重新获取模型列表。';
@@ -3925,6 +3985,8 @@ async function renderSetup() {
           wizardData.llm.model_identity = requestIdentity;
           wizardData.llm.model = wizardData.llm.available_models[0]?.id || '';
           wizardData.llm.long_context_model = wizardData.llm.model;
+          wizardData.llm.custom_model = false;
+          wizardData.llm.custom_long_context_model = false;
           $st.className = 'status ok'; $st.textContent = `✓ 获取到 ${wizardData.llm.available_models.length} 个模型`;
           paint();
         } catch (e) { $st.className = 'status err'; $st.textContent = '✗ ' + e.message; }
@@ -4016,8 +4078,16 @@ async function renderSetup() {
       wizardData.llm.base_url = document.getElementById('w-base').value;
       wizardData.llm.api_key = document.getElementById('w-key').value;
       wizardData.llm.provider = provider;
-      wizardData.llm.model = document.getElementById('w-model').value;
-      wizardData.llm.long_context_model = document.getElementById('w-model-long').value;
+      wizardData.llm.custom_model = !!document.getElementById('w-model-custom')?.checked;
+      wizardData.llm.custom_long_context_model = !!document.getElementById('w-model-long-custom')?.checked;
+      const listedModel = document.getElementById('w-model-select')?.value || '';
+      const listedLongModel = document.getElementById('w-model-long-select')?.value || '';
+      wizardData.llm.model = wizardData.llm.custom_model
+        ? document.getElementById('w-model').value.trim()
+        : listedModel;
+      wizardData.llm.long_context_model = wizardData.llm.custom_long_context_model
+        ? document.getElementById('w-model-long').value.trim()
+        : (listedLongModel || wizardData.llm.model);
       const currentIdentity = setupLlmIdentityFromDom();
       if (!wizardData.llm.base_url || !wizardData.llm.api_key) {
         const $st = document.getElementById('w-status');
@@ -4027,15 +4097,32 @@ async function renderSetup() {
         }
         return;
       }
-      if (!wizardData.llm.available_models?.length || !wizardData.llm.model) {
+      if (!wizardData.llm.model) {
         const $st = document.getElementById('w-status');
         if ($st) {
           $st.className = 'status err';
-          $st.textContent = '✗ 请先点击「获取模型」并选择模型';
+          $st.textContent = wizardData.llm.custom_model ? '✗ 请填写自定义模型' : '✗ 请先点击「获取模型」并选择模型，或勾选自定义';
         }
         return;
       }
-      if (!sameSetupLlmIdentity(wizardData.llm.model_identity, currentIdentity)) {
+      if (wizardData.llm.custom_long_context_model && !wizardData.llm.long_context_model) {
+        const $st = document.getElementById('w-status');
+        if ($st) {
+          $st.className = 'status err';
+          $st.textContent = '✗ 请填写自定义长上下文模型，或关闭自定义';
+        }
+        return;
+      }
+      const usesListedModel = !wizardData.llm.custom_model || (!wizardData.llm.custom_long_context_model && listedLongModel);
+      if (usesListedModel && !wizardData.llm.available_models?.length) {
+        const $st = document.getElementById('w-status');
+        if ($st) {
+          $st.className = 'status err';
+          $st.textContent = '✗ 请先点击「获取模型」并选择模型，或勾选自定义';
+        }
+        return;
+      }
+      if (usesListedModel && !sameSetupLlmIdentity(wizardData.llm.model_identity, currentIdentity)) {
         const $st = document.getElementById('w-status');
         if ($st) {
           $st.className = 'status warn';
