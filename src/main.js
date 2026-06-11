@@ -47,9 +47,11 @@ let WEIXIN_BINARY_PRELAUNCH_BASELINE = null;
 let WEIXIN_BINARY_LAUNCHER_BASELINE = null;
 let WEIXIN_BINARY_BASELINE = null;
 let ACTIVE_DIGEST_REQUESTS = new Map();
+let ACTIVE_DIGEST_SAVES = new Map();
 const DIGEST_BATCH_SETTINGS = new Map();
 const CANCELLED_DIGEST_BATCHES = new Map();
 let NEXT_DIGEST_REQUEST_ID = 1;
+let NEXT_DIGEST_SAVE_ID = 1;
 let ACTIVE_DEEP_KEY_STATUS = null;
 let LAST_CLIPBOARD_COPY_EVIDENCE = null;
 let LAST_REVEAL_EVIDENCE = null;
@@ -307,6 +309,34 @@ function markDigestBatchCancelled(batchId, reason = 'cancelled') {
   return true;
 }
 
+function abortControllerQuietly(controller) {
+  if (!controller || controller.signal?.aborted) return false;
+  try {
+    controller.abort();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function abortActiveDigestBatch(batchId, reason = 'cancelled') {
+  const id = normalizeDigestBatchId(batchId);
+  if (!id) return 0;
+  const cleanReason = sanitizeText(reason || 'cancelled').slice(0, 120);
+  let aborted = 0;
+  for (const item of ACTIVE_DIGEST_REQUESTS.values()) {
+    if (item?.batch_id !== id) continue;
+    item.abort_reason = cleanReason;
+    if (abortControllerQuietly(item.controller)) aborted += 1;
+  }
+  for (const item of ACTIVE_DIGEST_SAVES.values()) {
+    if (item?.batch_id !== id) continue;
+    item.abort_reason = cleanReason;
+    if (abortControllerQuietly(item.controller)) aborted += 1;
+  }
+  return aborted;
+}
+
 function cancelledDigestBatch(batchId) {
   const id = normalizeDigestBatchId(batchId);
   if (!id) return null;
@@ -314,10 +344,10 @@ function cancelledDigestBatch(batchId) {
   return CANCELLED_DIGEST_BATCHES.get(id) || null;
 }
 
-function throwIfDigestBatchCancelled(batchId) {
+function throwIfDigestBatchCancelled(batchId, message = '生成已取消。') {
   const item = cancelledDigestBatch(batchId);
   if (!item) return;
-  throw Object.assign(new Error('生成已取消，已阻止保存长图。'), { status: 499 });
+  throw Object.assign(new Error(message), { status: 499 });
 }
 
 async function loadDigestBatchSettings(batchId) {
@@ -1275,24 +1305,30 @@ async function handleApi(req, res, parsedUrl) {
 
   if (pathname === '/api/digest-cancel' && req.method === 'POST') {
     const body = await readBody(req, 16 * 1024);
-    const cancelled = markDigestBatchCancelled(body.batch_id, body.reason || 'client_cancelled');
-    return sendJson(res, 200, { ok: true, cancelled });
+    const reason = body.reason || 'client_cancelled';
+    const cancelled = markDigestBatchCancelled(body.batch_id, reason);
+    const aborted = abortActiveDigestBatch(body.batch_id, reason);
+    return sendJson(res, 200, { ok: true, cancelled, aborted });
   }
 
   if (pathname === '/api/digest' && req.method === 'POST') {
     const body = await readBody(req);
+    throwIfDigestBatchCancelled(body.batch_id);
     if (ACTIVE_DIGEST_REQUESTS.size >= MAX_ACTIVE_DIGEST_REQUESTS) {
       throw Object.assign(new Error('当前摘要准备任务较多，请稍后再试。'), { status: 429 });
     }
     const requestId = NEXT_DIGEST_REQUEST_ID++;
+    const batchId = normalizeDigestBatchId(body.batch_id);
     ACTIVE_DIGEST_REQUESTS.set(requestId, {
       started_at: new Date().toISOString(),
+      batch_id: batchId,
       account_id: body.account_id || '',
       group_id: body.group_id || body.groups?.[0]?.id || body.groups?.[0] || '',
       group: body.group_name || '',
+      controller: null,
     });
     try {
-      return await runDigestSSE(req, res, body);
+      return await runDigestSSE(req, res, body, requestId);
     } finally {
       ACTIVE_DIGEST_REQUESTS.delete(requestId);
     }
@@ -1312,12 +1348,31 @@ async function handleApi(req, res, parsedUrl) {
     try {
       const body = await readBody(req, SAVE_RENDER_BODY_LIMIT);
       saveBatchId = normalizeDigestBatchId(body.batch_id || body.digest?.batch_id);
-      throwIfDigestBatchCancelled(saveBatchId);
-      const settings = await loadSettings();
-      const item = await saveRenderedPng({ settings, digest: body.digest, png_data_url: body.png_data_url, signal: controller.signal });
-      logInfo('digest_render_saved', { digest_id: item.digest_id, group: item.group, relative_path: item.relative_path });
-      completed = true;
-      return sendJson(res, 200, { ok: true, item: publicOutputItem(item) });
+      const saveRequestId = NEXT_DIGEST_SAVE_ID++;
+      ACTIVE_DIGEST_SAVES.set(saveRequestId, {
+        started_at: new Date().toISOString(),
+        batch_id: saveBatchId,
+        digest_id: body.digest?.digest_id || '',
+        group: body.digest?.group || '',
+        controller,
+      });
+      try {
+        throwIfDigestBatchCancelled(saveBatchId, '生成已取消，已阻止保存长图。');
+        const settings = await loadDigestBatchSettings(saveBatchId);
+        const item = await saveRenderedPng({
+          settings,
+          digest: body.digest,
+          png_data_url: body.png_data_url,
+          signal: controller.signal,
+          shouldAbort: () => !!cancelledDigestBatch(saveBatchId),
+        });
+        throwIfDigestBatchCancelled(saveBatchId, '生成已取消，已阻止保存长图。');
+        logInfo('digest_render_saved', { digest_id: item.digest_id, group: item.group, relative_path: item.relative_path });
+        completed = true;
+        return sendJson(res, 200, { ok: true, item: publicOutputItem(item) });
+      } finally {
+        ACTIVE_DIGEST_SAVES.delete(saveRequestId);
+      }
     } finally {
       req.off('aborted', abortForClientClose);
       res.off('close', abortForClientClose);
@@ -1749,13 +1804,19 @@ function bodyValueOrSaved(body = {}, key, savedValue = '') {
   return Object.prototype.hasOwnProperty.call(body, key) ? body[key] : savedValue;
 }
 
-async function runDigestSSE(req, res, body) {
+async function runDigestSSE(req, res, body, requestId = null) {
   const controller = new AbortController();
+  const batchId = normalizeDigestBatchId(body.batch_id);
+  const activeRequest = requestId ? ACTIVE_DIGEST_REQUESTS.get(requestId) : null;
+  if (activeRequest) {
+    activeRequest.batch_id = batchId;
+    activeRequest.controller = controller;
+  }
   let completed = false;
   const abortForClientClose = () => {
     if (completed) return;
     controller.abort();
-    markDigestBatchCancelled(body.batch_id, 'digest_connection_closed');
+    markDigestBatchCancelled(batchId, 'digest_connection_closed');
   };
   req.once('aborted', abortForClientClose);
   res.once('close', abortForClientClose);
@@ -1768,6 +1829,7 @@ async function runDigestSSE(req, res, body) {
     if (controller.signal.aborted) {
       throw Object.assign(new Error('请求已取消'), { status: 499 });
     }
+    throwIfDigestBatchCancelled(batchId);
   };
   const sendEvent = (event, data) => {
     if (controller.signal.aborted || res.destroyed || res.writableEnded) return;

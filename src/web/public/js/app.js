@@ -4,6 +4,7 @@
 const TOKEN = window.__WX_TOKEN__;
 const $app = document.getElementById('app');
 const MAX_SCHEDULER_INTERVAL_MS = 24 * 24 * 60 * 60 * 1000;
+const DIGEST_PROGRESS_STEP_VISIBLE_MS = 180;
 let _appState = null;
 let _appAccounts = [];
 let _keyboardShortcutsAttached = false;
@@ -1585,6 +1586,37 @@ function waitForBrowserPaint() {
   });
 }
 
+function waitForDigestProgressDelay(ms = DIGEST_PROGRESS_STEP_VISIBLE_MS, signal = null) {
+  return new Promise(resolve => {
+    if (signal?.aborted) {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    let timer = null;
+    const finish = ok => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve(ok);
+    };
+    const onAbort = () => finish(false);
+    timer = setTimeout(() => finish(true), Math.max(0, Number(ms || 0)));
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+}
+
+async function waitForVisibleDigestProgress(signal = null, ms = DIGEST_PROGRESS_STEP_VISIBLE_MS) {
+  await waitForBrowserPaint();
+  if (signal?.aborted) return false;
+  return await waitForDigestProgressDelay(ms, signal);
+}
+
+function digestAbortError(message = '已取消') {
+  return Object.assign(new Error(message), { name: 'AbortError' });
+}
+
 function resetDigestProgressSnapshot({ previewText = false } = {}) {
   _state_digest.progress = {
     visible: true,
@@ -1864,8 +1896,8 @@ async function generateDigest({ previewText = false } = {}) {
   const stageMap = {};
   const stageSnapshots = new Map();
   const stagesOrder = previewText
-    ? ['fetching', 'summarizing', 'received', 'text_prepare', 'text_refresh']
-    : ['fetching', 'summarizing', 'received', 'render_queue', 'render_prepare', 'render_draw', 'encoding', 'saving'];
+    ? ['fetching', 'summarizing', 'received', 'text_inspect', 'text_merge', 'text_refresh']
+    : ['fetching', 'summarizing', 'received', 'render_queue', 'render_setup', 'render_measure', 'render_draw', 'encoding', 'saving'];
   function stripElapsedDetail(detail = '') {
     return stripDigestElapsedDetail(detail);
   }
@@ -2089,42 +2121,58 @@ async function generateDigest({ previewText = false } = {}) {
           const nextDigests = digests.slice();
           nextDigests[i] = digest;
           const previewCount = nextDigests.filter(Boolean).length;
+          const textStats = [
+            digest.topics?.length ? `${digest.topics.length} 条主线` : '',
+            digest.links?.length ? `${digest.links.length} 个链接` : '',
+            digestQuotesForRender(digest).length ? `${digestQuotesForRender(digest).length} 条金句` : '',
+            digestTodosForRender(digest).length ? `${digestTodosForRender(digest).length} 个后续关注` : '',
+          ].filter(Boolean).join(' · ');
           upsertStage(groupStage(i, {
-            name: 'text_prepare',
-            label: '合并 Markdown',
+            name: 'text_inspect',
+            label: '整理摘要结构',
             status: 'running',
-            detail: `准备合并 ${previewCount}/${targets.length} 个群为 Markdown`,
+            detail: textStats || '统计摘要栏目',
             resetElapsed: true,
           }));
-          await waitForBrowserPaint();
-          if (controller.signal.aborted) return;
+          if (!(await waitForVisibleDigestProgress(controller.signal))) throw digestAbortError();
           upsertStage(groupStage(i, {
-            name: 'text_prepare',
-            label: '合并 Markdown',
+            name: 'text_inspect',
+            label: '整理摘要结构',
             status: 'done',
-            detail: `已整理 ${previewCount}/${targets.length} 个群`,
+            detail: textStats || '摘要栏目已整理',
           }));
           upsertStage(groupStage(i, {
-            name: 'text_refresh',
-            label: '刷新文本预览',
+            name: 'text_merge',
+            label: '合并 Markdown',
             status: 'running',
-            detail: '写入 Markdown 预览区域',
+            detail: `准备合并 ${previewCount}/${targets.length} 个群`,
             resetElapsed: true,
           }));
-          await waitForBrowserPaint();
-          if (controller.signal.aborted) return;
+          if (!(await waitForVisibleDigestProgress(controller.signal))) throw digestAbortError();
           renderTextPreviews(nextDigests.filter(Boolean), { complete: false, total: targets.length });
-          await waitForBrowserPaint();
-          if (controller.signal.aborted) return;
           digests[i] = digest;
           upsertStage(groupStage(i, {
-            name: 'text_refresh',
-            label: '刷新文本预览',
+            name: 'text_merge',
+            label: '合并 Markdown',
             status: 'done',
             detail: [
               `已整理 ${digests.filter(Boolean).length}/${targets.length}`,
               _state_digest.lastTextMarkdown?.length ? `${_state_digest.lastTextMarkdown.length} 字` : '',
             ].filter(Boolean).join(' · '),
+          }));
+          upsertStage(groupStage(i, {
+            name: 'text_refresh',
+            label: '刷新文本预览',
+            status: 'running',
+            detail: '写入预览区域并更新导出状态',
+            resetElapsed: true,
+          }));
+          if (!(await waitForVisibleDigestProgress(controller.signal))) throw digestAbortError();
+          upsertStage(groupStage(i, {
+            name: 'text_refresh',
+            label: '刷新文本预览',
+            status: 'done',
+            detail: previewCount < targets.length ? `已刷新 ${previewCount}/${targets.length}，继续等待其余群` : '预览已刷新，可导出 Markdown',
           }));
         } else {
           upsertStage(groupStage(i, {
@@ -2134,9 +2182,9 @@ async function generateDigest({ previewText = false } = {}) {
             detail: '长图绘制和 PNG 保存按顺序执行',
             resetElapsed: true,
           }));
-          await waitForBrowserPaint();
+          if (!(await waitForVisibleDigestProgress(controller.signal))) throw digestAbortError();
           await enqueueRender(async () => {
-            if (controller.signal.aborted) return;
+            if (controller.signal.aborted) throw digestAbortError();
             upsertStage(groupStage(i, {
               name: 'render_queue',
               label: '等待本地渲染队列',
@@ -2154,44 +2202,67 @@ async function generateDigest({ previewText = false } = {}) {
               revealButton.title = '保存后可用';
             }
             upsertStage(groupStage(i, {
-              name: 'render_prepare',
-              label: '准备长图画布',
+              name: 'render_setup',
+              label: '准备渲染环境',
+              status: 'running',
+              detail: [
+                `主题 ${batchSnapshot.render?.theme || 'auto'}`,
+                `字号 ${batchSnapshot.render?.fontsize || 'normal'}`,
+                '锁定当前预览状态',
+              ].filter(Boolean).join(' · '),
+              resetElapsed: true,
+            }));
+            if (!(await waitForVisibleDigestProgress(controller.signal))) {
+              hideUncommittedDigestPreview();
+              throw digestAbortError();
+            }
+            upsertStage(groupStage(i, {
+              name: 'render_setup',
+              label: '准备渲染环境',
+              status: 'done',
+              detail: '预览容器已就绪',
+            }));
+            upsertStage(groupStage(i, {
+              name: 'render_measure',
+              label: '测量长图布局',
               status: 'running',
               detail: [
                 digest.topics?.length ? `${digest.topics.length} 条主线` : '',
                 digest.links?.length ? `${digest.links.length} 个链接` : '',
-                '测量布局和页面高度',
+                '计算换行、卡片和页面高度',
               ].filter(Boolean).join(' · '),
               resetElapsed: true,
             }));
-            await waitForBrowserPaint();
-            if (controller.signal.aborted) {
+            if (!(await waitForVisibleDigestProgress(controller.signal))) {
               hideUncommittedDigestPreview();
-              return;
+              throw digestAbortError();
             }
             upsertStage(groupStage(i, {
-              name: 'render_prepare',
-              label: '准备长图画布',
+              name: 'render_measure',
+              label: '测量长图布局',
               status: 'done',
-              detail: '布局和页面高度已测量',
+              detail: '布局测量完成，开始绘制',
             }));
             upsertStage(groupStage(i, {
               name: 'render_draw',
               label: '绘制 Canvas',
               status: 'running',
-              detail: '生成浏览器长图预览',
+              detail: '写入标题、正文、链接、金句和数据概览',
               resetElapsed: true,
             }));
-            await waitForBrowserPaint();
+            if (!(await waitForVisibleDigestProgress(controller.signal))) {
+              hideUncommittedDigestPreview();
+              throw digestAbortError();
+            }
             if (controller.signal.aborted) {
               hideUncommittedDigestPreview();
-              return;
+              throw digestAbortError();
             }
             const canvas = drawDigestCanvas(digest, null, batchSnapshot.render);
             updateDigestPreviewActionLock();
             if (controller.signal.aborted) {
               hideUncommittedDigestPreview();
-              return;
+              throw digestAbortError();
             }
             renderedDigests[i] = digest;
             upsertStage(groupStage(i, {
@@ -2222,6 +2293,7 @@ async function generateDigest({ previewText = false } = {}) {
             } catch (e) {
               if (e?.name === 'AbortError' || controller.signal.aborted) {
                 hideUncommittedDigestPreview();
+                markGroupRunningStages(i, 'cancelled', '已取消');
                 upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'cancelled', detail: '已取消' }));
                 return;
               }
@@ -3035,7 +3107,7 @@ function pngDataUrlByteSize(dataUrl = '') {
 }
 
 async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null, batchId = '', renderSelection = currentDigestRenderSelection(), onProgress = null } = {}) {
-  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+  if (signal?.aborted) throw digestAbortError();
   const canvas = renderedCanvas || document.getElementById('digest-canvas') || drawDigestCanvas(digest);
   notifyLocalProgress(onProgress, {
     name: 'encoding',
@@ -3043,8 +3115,7 @@ async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null
     status: 'running',
     detail: canvasDisplaySizeLabel(canvas),
   });
-  await waitForBrowserPaint();
-  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+  if (!(await waitForVisibleDigestProgress(signal))) throw digestAbortError();
   const png_data_url = canvasToPngDataUrl(canvas);
   const pngSize = formatByteSize(pngDataUrlByteSize(png_data_url));
   notifyLocalProgress(onProgress, {
@@ -3053,15 +3124,14 @@ async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null
     status: 'done',
     detail: pngSize,
   });
-  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+  if (signal?.aborted) throw digestAbortError();
   notifyLocalProgress(onProgress, {
     name: 'saving',
     label: '保存 PNG 文件',
     status: 'running',
-    detail: [pngSize, '写入 outputs/digests'].filter(Boolean).join(' · '),
+    detail: [pngSize, '上传到本地服务', '写入历史记录'].filter(Boolean).join(' · '),
   });
-  await waitForBrowserPaint();
-  if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+  if (!(await waitForVisibleDigestProgress(signal))) throw digestAbortError();
   return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload(renderSelection) }, png_data_url } });
 }
 

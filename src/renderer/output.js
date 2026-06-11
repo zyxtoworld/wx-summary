@@ -137,11 +137,11 @@ async function collectDigestJsonFiles(dir, out, root = dir) {
   }
 }
 
-export async function saveRenderedPng({ settings, digest, png_data_url, signal = null }) {
-  throwIfOutputAborted(signal);
+export async function saveRenderedPng({ settings, digest, png_data_url, signal = null, shouldAbort = null }) {
+  throwIfOutputAborted(signal, shouldAbort);
   const base = await safeOutputBase(settings);
   const buffer = pngBufferFromDataUrl(png_data_url);
-  throwIfOutputAborted(signal);
+  throwIfOutputAborted(signal, shouldAbort);
 
   const parsedCreatedAt = digest.created_at ? new Date(digest.created_at) : null;
   const createdAt = parsedCreatedAt && Number.isFinite(parsedCreatedAt.getTime()) ? parsedCreatedAt : new Date();
@@ -151,13 +151,13 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
   let digestPath = '';
   try {
     await assertSafeOutputParent(base, path.join(dir, 'placeholder.png'));
-    throwIfOutputAborted(signal);
+    throwIfOutputAborted(signal, shouldAbort);
     filePath = await writeBinaryUnique(dir, buildFilename(digest, settings.output?.filename_pattern), buffer);
     digestPath = digestJsonPathForPng(filePath);
-    throwIfOutputAborted(signal);
+    throwIfOutputAborted(signal, shouldAbort);
     await assertSafeOutputParent(base, digestPath);
     await writeDigestJson(digestPath, digest);
-    throwIfOutputAborted(signal);
+    throwIfOutputAborted(signal, shouldAbort);
   } catch (e) {
     await cleanupRenderedPair(filePath, digestPath);
     throw e;
@@ -177,7 +177,8 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
     created_at: digest.created_at || new Date().toISOString(),
   };
   try {
-    await upsertHistory(settings, item, { signal });
+    await upsertHistory(settings, item, { signal, shouldAbort });
+    throwIfOutputAborted(signal, shouldAbort);
   } catch (e) {
     if (isOutputAbortError(e)) {
       await removeHistoryItem(settings, item.digest_id).catch(() => {});
@@ -424,8 +425,8 @@ function digestJsonPathForPng(filePath) {
   return filePath.replace(/\.png$/i, '.digest.json');
 }
 
-function throwIfOutputAborted(signal) {
-  if (!signal?.aborted) return;
+function throwIfOutputAborted(signal, shouldAbort = null) {
+  if (!signal?.aborted && !(typeof shouldAbort === 'function' && shouldAbort())) return;
   throw Object.assign(new Error('请求已取消'), { status: 499, name: 'AbortError' });
 }
 
@@ -706,17 +707,17 @@ function resolveDigestPath(base, item = {}) {
   return inferred && isInside(base, inferred) ? inferred : '';
 }
 
-async function upsertHistory(settings, item, { signal = null } = {}) {
+async function upsertHistory(settings, item, { signal = null, shouldAbort = null } = {}) {
   await withHistoryWriteLock(async () => {
-    throwIfOutputAborted(signal);
+    throwIfOutputAborted(signal, shouldAbort);
     const base = await safeOutputBase(settings);
     const file = path.join(base, 'index.json');
     await assertSafeOutputParent(base, file);
     const list = await readHistoryIndex(settings);
     const next = [item, ...list.filter(x => x.digest_id !== item.digest_id)].slice(0, 200);
-    throwIfOutputAborted(signal);
+    throwIfOutputAborted(signal, shouldAbort);
     await writeJsonAtomic(file, next);
-    throwIfOutputAborted(signal);
+    throwIfOutputAborted(signal, shouldAbort);
   });
 }
 
