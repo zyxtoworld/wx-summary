@@ -4092,7 +4092,19 @@ async function renderSettings() {
       min_messages: Number(item.min_messages || item.min_messages_per_digest || 0) || 0,
     })).filter(item => item.group && (item.keywords.length || item.min_messages)) : [];
   }
-  let schedulerOverrides = normalizeSchedulerOverridesForUi(s.scheduler.per_group);
+  function splitSchedulerOverridesForAccount(perGroup = []) {
+    const visible = [];
+    const preserved = [];
+    for (const item of normalizeSchedulerOverridesForUi(perGroup)) {
+      const accountId = String(item.account_id || '').trim();
+      if (accountId && accountId !== settingsAccountId) preserved.push(item);
+      else visible.push(item);
+    }
+    return { visible, preserved };
+  }
+  const initialSchedulerOverrides = splitSchedulerOverridesForAccount(s.scheduler.per_group);
+  let schedulerOverrides = initialSchedulerOverrides.visible;
+  let preservedSchedulerOverrides = initialSchedulerOverrides.preserved;
   $wl.innerHTML = '<p class="empty">正在后台读取本机微信群列表...</p>';
   function paintWl() {
     if (!groups.length) {
@@ -4122,6 +4134,9 @@ async function renderSettings() {
           ? '<option value="">没有可选群</option>'
           : '<option value="">群列表读取中...</option>';
     document.getElementById('s-add-override').disabled = !groups.length;
+    const hiddenNote = preservedSchedulerOverrides.length
+      ? `<p class="muted small">已隐藏并保留其他账号的 ${preservedSchedulerOverrides.length} 条每群规则。</p>`
+      : '';
     list.innerHTML = schedulerOverrides.length
       ? schedulerOverrides.map((item, index) => `
         <div class="override-item" data-index="${index}">
@@ -4129,8 +4144,8 @@ async function renderSettings() {
           <span class="muted">${escapeHtml(item.keywords?.length ? item.keywords.join('、') : '不过滤关键词')}</span>
           <span>${item.min_messages ? `${item.min_messages} 条` : '用全局'}</span>
           <button class="link-btn" type="button" data-remove-override="${index}">删除</button>
-        </div>`).join('')
-      : '<p class="empty">暂无覆盖规则。</p>';
+        </div>`).join('') + hiddenNote
+      : `<p class="empty">暂无覆盖规则。</p>${hiddenNote}`;
     list.querySelectorAll('[data-remove-override]').forEach(button => {
       button.addEventListener('click', () => {
         const index = Number(button.dataset.removeOverride);
@@ -4196,7 +4211,9 @@ async function renderSettings() {
   function applySavedSchedulerSettings(savedSettings = {}) {
     if (savedSettings.groups) s.groups = savedSettings.groups;
     if (savedSettings.scheduler) s.scheduler = savedSettings.scheduler;
-    schedulerOverrides = normalizeSchedulerOverridesForUi(s.scheduler?.per_group);
+    const split = splitSchedulerOverridesForAccount(s.scheduler?.per_group);
+    schedulerOverrides = split.visible;
+    preservedSchedulerOverrides = split.preserved;
     document.getElementById('s-scheduler').checked = !!s.scheduler?.enabled;
     setDurationControl('s-scheduler-interval', s.scheduler?.default_interval || '30m', '30m');
     setDurationControl('s-scheduler-window', s.scheduler?.digest_window || '4h', '4h');
@@ -4221,6 +4238,13 @@ async function renderSettings() {
       error: '检查失败',
     };
     return map[detail] || detail || '';
+  }
+  function schedulerResultDetailLabel(result = {}) {
+    const label = schedulerDetailLabel(result.detail);
+    if (result.detail === 'ambiguous_group_refs' && Array.isArray(result.ambiguous_refs) && result.ambiguous_refs.length) {
+      return `${label}（${result.ambiguous_refs.length} 条未执行）`;
+    }
+    return label;
   }
   function schedulerItemsSummary(items = []) {
     const counts = new Map();
@@ -4284,12 +4308,12 @@ async function renderSettings() {
           r.checked !== undefined ? `检查 ${r.checked}` : '',
           skippedCount > 0 ? `跳过 ${skippedCount}` : '',
           failedCount > 0 ? `失败 ${failedCount}` : '',
-          r.detail ? schedulerDetailLabel(r.detail) : '',
+          r.detail ? schedulerResultDetailLabel(r) : '',
           itemSummary,
         ].filter(Boolean).join(' / ');
         bits.push(`上次 ${detail}`);
       } else if (r.detail) {
-        bits.push(`上次 ${schedulerDetailLabel(r.detail)}`);
+        bits.push(`上次 ${schedulerResultDetailLabel(r)}`);
       } else if (r.error) {
         bits.push(`上次失败：${r.error}`);
       }
@@ -4353,7 +4377,7 @@ async function renderSettings() {
           }),
         ])
       : existingWhitelist;
-    const perGroup = schedulerOverrides.map(overridePayload);
+    const perGroup = [...preservedSchedulerOverrides, ...schedulerOverrides].map(overridePayload);
     return {
       groups: { whitelist: mergeGroupRefs([...wl, ...perGroup.map(overrideGroupRef)]) },
       scheduler: {

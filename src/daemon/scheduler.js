@@ -191,6 +191,7 @@ async function executeSchedulerTick({ reason, force = false }) {
   ], allGroups);
   if (ambiguousRefs.length) {
     result.ambiguous_refs = ambiguousRefs;
+    result.detail = 'ambiguous_group_refs';
     logWarn('scheduler_ambiguous_group_refs', { refs: ambiguousRefs });
   }
   for (const { account, groups } of accountEntries) {
@@ -425,7 +426,7 @@ function groupRefMatchScore(ref, group = {}, account = {}, { legacyKeys = [], al
   if (typeof ref === 'string') {
     const legacy = ref.trim();
     if (!legacy || (legacy !== groupId && legacy !== groupName)) return 0;
-    return groupRefAmbiguousAcrossAccounts(legacy, group, account, allGroups) ? 0 : 1;
+    return groupRefAmbiguousInScope(legacy, group, account, allGroups) ? 0 : 1;
   }
   if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return 0;
   const refAccountId = String(ref.account_id || ref.account || '').trim();
@@ -439,18 +440,18 @@ function groupRefMatchScore(ref, group = {}, account = {}, { legacyKeys = [], al
   const refGroupName = String(ref.group_name || ref.name || '').trim();
   if (refGroupName) {
     if (refGroupName !== groupName) return 0;
-    if (!refAccountId && groupRefAmbiguousAcrossAccounts(refGroupName, group, account, allGroups)) return 0;
+    if (groupRefAmbiguousInScope(refGroupName, group, account, allGroups, { accountScoped: !!refAccountId })) return 0;
     return refAccountId ? 2 : 1;
   }
   const refLegacyGroup = String(ref.group || '').trim();
   if (refLegacyGroup) {
     if (refLegacyGroup !== groupId && refLegacyGroup !== groupName) return 0;
-    return (!refAccountId && groupRefAmbiguousAcrossAccounts(refLegacyGroup, group, account, allGroups)) ? 0 : 1;
+    return groupRefAmbiguousInScope(refLegacyGroup, group, account, allGroups, { accountScoped: !!refAccountId }) ? 0 : 1;
   }
   const legacy = legacyKeys.map(key => String(key || '').trim()).filter(Boolean);
   const matched = legacy.find(key => key === groupId || key === groupName);
   if (!matched) return 0;
-  return groupRefAmbiguousAcrossAccounts(matched, group, account, allGroups) ? 0 : 1;
+  return groupRefAmbiguousInScope(matched, group, account, allGroups) ? 0 : 1;
 }
 
 function schedulerGroupUniverse(accountEntries = []) {
@@ -461,20 +462,26 @@ function schedulerGroupUniverse(accountEntries = []) {
 }
 
 function groupRefAmbiguousAcrossAccounts(value, group = {}, account = {}, allGroups = []) {
+  return groupRefAmbiguousInScope(value, group, account, allGroups);
+}
+
+function groupRefAmbiguousInScope(value, group = {}, account = {}, allGroups = [], { accountScoped = false } = {}) {
   const needle = String(value || '').trim();
   if (!needle || !Array.isArray(allGroups) || allGroups.length <= 1) return false;
   const matches = new Set();
+  const currentAccountId = accountIdentity(account);
   for (const entry of allGroups) {
     const candidateAccount = entry?.account || {};
     const candidateGroup = entry?.group || entry || {};
     const candidateAccountId = accountIdentity(candidateAccount);
+    if (accountScoped && candidateAccountId !== currentAccountId) continue;
     const candidateGroupId = String(candidateGroup.id || candidateGroup.group_id || '').trim();
     const candidateGroupName = String(candidateGroup.name || candidateGroup.group_name || '').trim();
     if (needle !== candidateGroupId && needle !== candidateGroupName) continue;
     matches.add(`${candidateAccountId}::${candidateGroupId || candidateGroupName}`);
   }
   if (matches.size <= 1) return false;
-  const current = `${accountIdentity(account)}::${String(group.id || group.group_id || group.name || group.group_name || '').trim()}`;
+  const current = `${currentAccountId}::${String(group.id || group.group_id || group.name || group.group_name || '').trim()}`;
   return matches.has(current) || matches.size > 1;
 }
 
@@ -483,43 +490,47 @@ function ambiguousSchedulerRefs(refs = [], allGroups = []) {
   const out = [];
   const seen = new Set();
   for (const ref of refs) {
-    for (const value of accountlessGroupRefValues(ref)) {
-      const matches = matchingSchedulerGroupKeys(value, allGroups);
+    for (const candidate of schedulerRefAmbiguityCandidates(ref)) {
+      const matches = matchingSchedulerGroupKeys(candidate.value, allGroups, { account_id: candidate.account_id });
       if (matches.length <= 1) continue;
-      const key = `${value}:${matches.join('|')}`;
+      const key = `${candidate.account_id || '*'}:${candidate.value}:${matches.join('|')}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ ref: value, matches });
+      out.push({ ref: candidate.value, account_id: candidate.account_id || '', matches });
     }
   }
   return out.slice(0, 50);
 }
 
-function accountlessGroupRefValues(ref) {
-  if (typeof ref === 'string') return ref.trim() ? [ref.trim()] : [];
+function schedulerRefAmbiguityCandidates(ref) {
+  if (typeof ref === 'string') {
+    const value = ref.trim();
+    return value ? [{ value, account_id: '' }] : [];
+  }
   if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return [];
   const accountId = String(ref.account_id || ref.account || '').trim();
-  if (accountId) return [];
-  return [
-    ref.group_id,
-    ref.id,
-    ref.group_name,
-    ref.name,
-    ref.group,
-  ].map(value => String(value || '').trim()).filter(Boolean);
+  const groupId = String(ref.group_id || ref.id || '').trim();
+  if (groupId) return accountId ? [] : [{ value: groupId, account_id: '' }];
+  return [ref.group_name, ref.name, ref.group]
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+    .map(value => ({ value, account_id: accountId }));
 }
 
-function matchingSchedulerGroupKeys(value, allGroups = []) {
+function matchingSchedulerGroupKeys(value, allGroups = [], { account_id = '' } = {}) {
   const needle = String(value || '').trim();
+  const accountScope = String(account_id || '').trim();
   if (!needle) return [];
   const matches = new Set();
   for (const entry of allGroups) {
     const account = entry?.account || {};
     const group = entry?.group || entry || {};
+    const candidateAccountId = accountIdentity(account);
+    if (accountScope && candidateAccountId !== accountScope) continue;
     const groupId = String(group.id || group.group_id || '').trim();
     const groupName = String(group.name || group.group_name || '').trim();
     if (needle !== groupId && needle !== groupName) continue;
-    matches.add(`${accountIdentity(account)}::${groupId || groupName}`);
+    matches.add(`${candidateAccountId}::${groupId || groupName}`);
   }
   return [...matches].sort();
 }
@@ -554,13 +565,20 @@ function messageCursor(message = {}) {
 }
 
 function messagesAfterCursor(messages = [], previousCursor = '') {
-  const cursor = cursorObjectFromValue(previousCursor);
-  if (!cursor) return Array.isArray(messages) ? messages : [];
+  const text = String(previousCursor || '').trim();
+  if (!text) return Array.isArray(messages) ? messages : [];
+  const cursor = cursorObjectFromValue(text);
+  if (!cursor) return [];
   return (Array.isArray(messages) ? messages : []).filter(message => {
     const current = messageCursor(message);
-    if (current && current === previousCursor) return false;
+    if (current && current === text) return false;
+    if (cursorHasOnlyTimestamp(cursor)) return normalizeCursorNumber(message.timestamp) > cursor.timestamp;
     return compareMessageCursor(message, cursor) > 0;
   });
+}
+
+function cursorHasOnlyTimestamp(cursor = {}) {
+  return !!cursor.timestamp && !cursor.sort_seq && !cursor.local_id && !cursor.server_id && !cursor.id;
 }
 
 function messagesNotSeen(messages = [], seen = new Set()) {
@@ -570,11 +588,30 @@ function messagesNotSeen(messages = [], seen = new Set()) {
 function newMessagesForCursorState(messages = [], cursorState = {}) {
   const previousCursor = cursorState.last_seq || '';
   const previousSeen = new Set(Array.isArray(cursorState.seen) ? cursorState.seen : []);
-  if (!previousSeen.size) return messagesAfterCursor(messages, previousCursor);
-  if (previousSeen.size >= MAX_CURSOR_SEEN_MESSAGES && previousCursor) {
-    return messagesNotSeen(messagesAfterCursor(messages, previousCursor), previousSeen);
-  }
-  return messagesNotSeen(messages, previousSeen);
+  const afterCursor = messagesAfterCursor(messages, previousCursor);
+  if (!previousSeen.size) return afterCursor;
+  const fresh = messagesNotSeen(afterCursor, previousSeen);
+  if (previousSeen.size >= MAX_CURSOR_SEEN_MESSAGES && previousCursor) return fresh;
+  const freshKeys = new Set(fresh.map(messageIdentity).filter(Boolean));
+  const late = messagesNotSeen(messagesWithinCursorWindow(messages, cursorState), previousSeen)
+    .filter(message => {
+      const key = messageIdentity(message);
+      return key && !freshKeys.has(key);
+    });
+  return [...late, ...fresh].sort(compareMessageCursor);
+}
+
+function messagesWithinCursorWindow(messages = [], cursorState = {}) {
+  const since = parseCursorWindowTime(cursorState.window_since);
+  const until = parseCursorWindowTime(cursorState.window_until);
+  if (!since && !until) return [];
+  return (Array.isArray(messages) ? messages : []).filter(message => {
+    const time = normalizeCursorNumber(message.timestamp);
+    if (!time) return false;
+    if (since && time < since.getTime()) return false;
+    if (until && time > until.getTime()) return false;
+    return true;
+  });
 }
 
 function schedulerCursorState({ cursor, messages = [], window = {} } = {}) {
@@ -610,6 +647,12 @@ function messageIdentity(message = {}) {
 function cursorObjectFromValue(value) {
   const text = String(value || '').trim();
   if (!text) return null;
+  if (/^\d+$/.test(text)) {
+    const n = normalizeCursorNumber(text);
+    if (n >= 946684800000) return { timestamp: n };
+    if (n >= 946684800) return { timestamp: n * 1000 };
+    return null;
+  }
   const out = {};
   for (const part of text.split(':')) {
     const [key, ...rest] = part.split('.');
@@ -660,12 +703,22 @@ function formatLocalDateTime(date, { includeSeconds = false } = {}) {
   return includeSeconds ? `${base}:${p(date.getSeconds())}` : base;
 }
 
+function parseCursorWindowTime(value = '') {
+  const text = String(value || '').trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) return null;
+  const [, y, mo, d, h, mi, s = '0'] = match;
+  const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), 0);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 export const __schedulerInternals = {
   schedulerWindow,
   selectScheduledGroups,
   latestMessageCursor,
   messagesAfterCursor,
   messagesNotSeen,
+  messagesWithinCursorWindow,
   newMessagesForCursorState,
   messageIdentity,
   schedulerCursorState,
@@ -675,4 +728,5 @@ export const __schedulerInternals = {
   schedulerOverrideForGroup,
   groupRefMatches,
   ambiguousSchedulerRefs,
+  matchingSchedulerGroupKeys,
 };
