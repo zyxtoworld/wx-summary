@@ -19,6 +19,18 @@ function Utf8Label {
   [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Base64))
 }
 
+function Project-MutexName {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($ProjectRoot.ToLowerInvariant())
+    $hash = $sha.ComputeHash($bytes)
+    $short = -join ($hash[0..7] | ForEach-Object { $_.ToString('x2') })
+    return "wx-summary-tray-$short"
+  } finally {
+    $sha.Dispose()
+  }
+}
+
 function Show-StartupError {
   param([string]$Message)
   Add-Type -AssemblyName System.Windows.Forms
@@ -178,7 +190,7 @@ function Stop-Node {
 
 try {
   $createdMutex = $false
-  $script:TrayMutex = [System.Threading.Mutex]::new($true, 'wx-summary-tray', [ref]$createdMutex)
+  $script:TrayMutex = [System.Threading.Mutex]::new($true, (Project-MutexName), [ref]$createdMutex)
   if (-not $createdMutex) {
     Open-Web
     exit 0

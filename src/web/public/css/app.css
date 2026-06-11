@@ -567,8 +567,13 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 .progress-log-tools {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--gap-3);
   margin-top: var(--gap-3);
+}
+.progress-log-tools .status {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .progress-log {
   margin: var(--gap-3) 0 0;
@@ -975,6 +980,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 }
 
 @media (max-width: 640px) {
+  :root {
+    --topbar-h: 104px;
+  }
   .topbar {
     height: auto;
     padding: var(--gap-2) var(--gap-3);

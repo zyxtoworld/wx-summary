@@ -68,7 +68,7 @@ export function getSchedulerStatus() {
 export async function runSchedulerOnce({ reason = 'manual', force = false } = {}) {
   if (state.running) {
     logWarn('scheduler_skipped', { reason, detail: 'already_running' });
-    return { ok: true, skipped: true, reason, detail: 'already_running', at: new Date().toISOString() };
+    return { ok: true, skipped: 0, reason, detail: 'already_running', at: new Date().toISOString() };
   }
   state.running = true;
   const runPromise = (async () => {
@@ -146,10 +146,10 @@ async function executeSchedulerTick({ reason, force = false }) {
   const settings = await loadSettings({ includeSecrets: true });
   state.enabled = !!settings.scheduler.enabled;
   state.interval_ms = durationToMs(settings.scheduler.default_interval);
-  if (!settings.scheduler.enabled && !force) return { ok: true, reason, skipped: true, detail: 'scheduler_disabled', at: new Date().toISOString() };
+  if (!settings.scheduler.enabled && !force) return { ok: true, reason, skipped: 0, detail: 'scheduler_disabled', at: new Date().toISOString() };
   if (!settings.llm.api_key || !settings.llm.base_url || !settings.llm.model) {
     logWarn('scheduler_skipped', { reason, detail: 'llm_not_configured' });
-    return { ok: false, reason, skipped: true, detail: 'llm_not_configured', at: new Date().toISOString() };
+    return { ok: false, reason, skipped: 0, detail: 'llm_not_configured', at: new Date().toISOString() };
   }
 
   const window = schedulerWindow(settings.scheduler.digest_window);

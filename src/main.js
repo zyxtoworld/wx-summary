@@ -23,6 +23,8 @@ const HOST = '127.0.0.1';
 const DEFAULT_PORT = 7788;
 const SESSION_TOKEN = crypto.randomBytes(16).toString('hex');
 const SHUTDOWN_TOKEN = crypto.randomBytes(16).toString('hex');
+const HEALTH_TOKEN = crypto.randomBytes(16).toString('hex');
+const INSTANCE_LOCK_TOKEN = crypto.randomBytes(16).toString('hex');
 const RUNTIME_INFO_FILE = path.join(TMP_DIR, 'server.json');
 const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'wx-summary.lock');
 const EXTERNAL_WEIXIN_BASELINE_FILE = path.join(DATA_DIR, 'external-weixin-binary-baseline.json');
@@ -77,6 +79,14 @@ function sendJson(res, status, obj) {
   send(res, status, JSON.stringify(obj), { 'Content-Type': 'application/json; charset=utf-8' });
 }
 
+function attachmentDisposition(filename = 'wx-summary.png') {
+  const clean = path.basename(String(filename || 'wx-summary.png'))
+    .replace(/[\r\n"]/g, '_')
+    .trim() || 'wx-summary.png';
+  const ascii = clean.replace(/[^\x20-\x7E]/g, '_') || 'wx-summary.png';
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(clean)}`;
+}
+
 function apiError(res, err) {
   if (res.destroyed || res.writableEnded) return;
   const status = err?.status && Number.isInteger(err.status) ? err.status : 500;
@@ -105,6 +115,7 @@ async function writeRuntimeInfo(port) {
     port,
     url: `http://${HOST}:${port}`,
     shutdown_token: SHUTDOWN_TOKEN,
+    health_token: HEALTH_TOKEN,
     started_at: new Date().toISOString(),
     project_root: PROJECT_ROOT,
   };
@@ -126,12 +137,43 @@ function sameProjectRoot(rootText) {
 
 function releaseInstanceLockSync() {
   const fd = INSTANCE_LOCK_FD;
+  const lockInfo = readInstanceLockInfoSync();
   INSTANCE_LOCK_FD = null;
   if (fd === null) return;
   try {
     fs.closeSync(fd);
   } catch {}
-  try { fs.rmSync(INSTANCE_LOCK_FILE, { force: true }); } catch {}
+  const lockIsOurs = lockInfo
+    ? lockInfo.pid === process.pid && lockInfo.lock_token === INSTANCE_LOCK_TOKEN
+    : true;
+  if (lockIsOurs) {
+    try { fs.rmSync(INSTANCE_LOCK_FILE, { force: true }); } catch {}
+  }
+}
+
+function readInstanceLockInfoSync() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf-8'));
+    return {
+      pid: Number(raw?.pid || 0) || 0,
+      lock_token: String(raw?.lock_token || '').trim(),
+      project_root: String(raw?.project_root || '').trim(),
+      started_at: String(raw?.started_at || '').trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function processIsAlive(pid) {
+  const n = Number(pid || 0);
+  if (!Number.isInteger(n) || n <= 0 || n === process.pid) return n === process.pid;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    return e?.code === 'EPERM';
+  }
 }
 
 async function readRuntimeInfo() {
@@ -151,15 +193,25 @@ async function readRuntimeInfo() {
 }
 
 async function existingRuntimeAlive(info) {
-  if (!info?.port) return false;
+  if (!info?.port || !info?.health_token) return false;
+  const requestPath = `/api/health?health_token=${encodeURIComponent(info.health_token)}`;
   return new Promise(resolve => {
-    const req = http.get({ host: HOST, port: info.port, path: '/', timeout: 1000 }, res => {
+    const req = http.get({ host: HOST, port: info.port, path: requestPath, timeout: 1000 }, res => {
       let body = '';
       res.setEncoding('utf-8');
       res.on('data', chunk => {
         if (body.length < 4096) body += chunk;
       });
-      res.on('end', () => resolve(res.statusCode === 200 && body.includes('wx-summary')));
+      res.on('end', () => {
+        if (res.statusCode !== 200) return resolve(false);
+        try {
+          const health = JSON.parse(body);
+          const samePid = Number(health?.pid || 0) === Number(info.pid || 0);
+          resolve(!!health?.ok && samePid && sameProjectRoot(health.project_root));
+        } catch {
+          resolve(false);
+        }
+      });
     });
     req.on('timeout', () => {
       req.destroy();
@@ -181,7 +233,12 @@ async function acquireInstanceLock(settings) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       INSTANCE_LOCK_FD = fs.openSync(INSTANCE_LOCK_FILE, 'wx');
-      fs.writeFileSync(INSTANCE_LOCK_FD, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }, null, 2), 'utf-8');
+      fs.writeFileSync(INSTANCE_LOCK_FD, JSON.stringify({
+        pid: process.pid,
+        lock_token: INSTANCE_LOCK_TOKEN,
+        started_at: new Date().toISOString(),
+        project_root: PROJECT_ROOT,
+      }, null, 2), 'utf-8');
       return true;
     } catch (e) {
       if (INSTANCE_LOCK_FD !== null) releaseInstanceLockSync();
@@ -193,6 +250,7 @@ async function acquireInstanceLock(settings) {
         openInBrowser(info.url, settings);
         return false;
       }
+      const lockInfo = readInstanceLockInfoSync();
       const lockStat = await fsp.stat(INSTANCE_LOCK_FILE).catch(() => null);
       if (lockStat && Date.now() - lockStat.mtimeMs < 15000) {
         await new Promise(resolve => setTimeout(resolve, 1200));
@@ -204,6 +262,9 @@ async function acquireInstanceLock(settings) {
           return false;
         }
         throw Object.assign(new Error('另一个 wx-summary 实例正在启动，请稍后再试。'), { status: 423 });
+      }
+      if (lockInfo?.pid && processIsAlive(lockInfo.pid)) {
+        throw Object.assign(new Error('另一个 wx-summary 实例仍在启动或运行；如果确认没有在运行，请关闭对应 node 进程后重试。'), { status: 423 });
       }
       await fsp.rm(INSTANCE_LOCK_FILE, { force: true }).catch(() => {});
     }
@@ -766,7 +827,9 @@ async function sanitizedLogTail(limit = 200, loadedSettings = null) {
 function sanitizeLogLine(line = '') {
   return sanitizeText(line)
     .replace(/"group"\s*:\s*"([^"\\]|\\.)*"/g, '"group":"[redacted-group]"')
-    .replace(/"group_name"\s*:\s*"([^"\\]|\\.)*"/g, '"group_name":"[redacted-group]"');
+    .replace(/"group_name"\s*:\s*"([^"\\]|\\.)*"/g, '"group_name":"[redacted-group]"')
+    .replace(/"(account_id|group_id|cursor_key)"\s*:\s*"([^"\\]|\\.)*"/g, '"$1":"[redacted-id]"')
+    .replace(/"(file_path|relative_path|digest_path|digest_relative_path)"\s*:\s*"([^"\\]|\\.)*"/g, '"$1":"[redacted-path]"');
 }
 
 async function postSaveSettingsWarnings(patch) {
@@ -829,6 +892,20 @@ async function digestAccountIdFromRequest(body = {}) {
 
 async function handleApi(req, res, parsedUrl) {
   const pathname = parsedUrl.pathname;
+
+  if (pathname === '/api/health' && req.method === 'GET') {
+    const healthToken = parsedUrl.searchParams.get('health_token') || req.headers['x-wx-health'];
+    if (healthToken !== HEALTH_TOKEN) {
+      throw Object.assign(new Error('invalid health token'), { status: 403 });
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      pid: process.pid,
+      port: ACTIVE_PORT,
+      project_root: PROJECT_ROOT,
+      started_at: SERVICE_STARTED_AT.toISOString(),
+    });
+  }
 
   if (pathname === '/api/shutdown' && req.method === 'POST') {
     assertJsonMutationRequest(req);
@@ -1087,7 +1164,10 @@ async function handleApi(req, res, parsedUrl) {
     if (!item) return sendJson(res, 404, { error: 'digest not found' });
     const file = await assertRevealable(settings, item.file_path, { extensions: ['.png'] });
     const data = await fsp.readFile(file);
-    return send(res, 200, data, { 'Content-Type': 'image/png' });
+    return send(res, 200, data, {
+      'Content-Type': 'image/png',
+      'Content-Disposition': attachmentDisposition(path.basename(file)),
+    });
   }
 
   if (pathname.startsWith('/api/digest-thumb/') && req.method === 'GET') {

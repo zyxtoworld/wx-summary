@@ -1125,8 +1125,11 @@ async function renderDigest() {
     try {
       await api('/api/reveal', { method: 'POST', body: { digest_id: item.digest_id } });
       if (status) {
-        status.className = 'status ok';
-        status.textContent = '✓ 已请求系统打开并选中文件';
+        const savedState = previewSavedRenderState();
+        status.className = savedState.stale ? 'status warn' : 'status ok';
+        status.textContent = savedState.stale
+          ? '已打开上次保存的 PNG；当前预览样式尚未保存。'
+          : '✓ 已请求系统打开并选中文件';
       }
     } catch (e) {
       if (status) {
@@ -1257,22 +1260,47 @@ function digestRenderStateKey(selection = currentDigestRenderSelection()) {
   return JSON.stringify(digestRenderPayload(selection));
 }
 
+function previewSavedRenderState() {
+  const hasSavedFile = !!_state_digest.lastSavedItem;
+  const currentKey = _state_digest.lastCanvasRenderKey || digestRenderStateKey();
+  const savedKey = _state_digest.lastSavedRenderKey || '';
+  return {
+    hasSavedFile,
+    currentKey,
+    savedKey,
+    stale: hasSavedFile && savedKey && currentKey !== savedKey,
+  };
+}
+
 function updatePreviewSavedRenderState({ notify = false } = {}) {
   const revealButton = document.getElementById('btn-reveal');
   const status = document.getElementById('preview-status');
   if (!_state_digest.lastDigest || !revealButton) return;
-  const hasSavedFile = !!_state_digest.lastSavedItem;
-  const currentKey = _state_digest.lastCanvasRenderKey || digestRenderStateKey();
-  const savedKey = _state_digest.lastSavedRenderKey || '';
-  const stale = hasSavedFile && savedKey && currentKey !== savedKey;
-  revealButton.disabled = !hasSavedFile;
+  const { hasSavedFile, stale } = previewSavedRenderState();
+  revealButton.disabled = _state_digest.generating || !hasSavedFile;
   revealButton.title = hasSavedFile
-    ? (stale ? '打开的是上次保存的文件，样式可能不是当前预览' : '在文件夹中显示最后一张')
+    ? (_state_digest.generating ? '生成完成后可用' : (stale ? '打开的是上次保存的文件，样式可能不是当前预览' : '在文件夹中显示最后一张'))
     : '保存后可用';
   if (notify && status && stale) {
     status.className = 'status warn';
     status.textContent = '当前预览样式尚未保存；文件夹里仍是上次保存版本。';
   }
+}
+
+function updateDigestPreviewActionLock() {
+  const canvas = document.getElementById('digest-canvas');
+  const hasCanvas = !!canvas?.width && !!canvas?.height && !!_state_digest.lastDigest;
+  const locked = !!_state_digest.generating;
+  const downloadButton = document.getElementById('btn-download');
+  const copyButton = document.getElementById('btn-copy');
+  const rerenderButton = document.getElementById('btn-rerender');
+  if (downloadButton) downloadButton.disabled = locked || !hasCanvas;
+  if (copyButton) copyButton.disabled = locked || !hasCanvas;
+  if (rerenderButton) {
+    rerenderButton.disabled = locked || !hasCanvas;
+    rerenderButton.title = locked ? '生成完成后可重新渲染' : '';
+  }
+  updatePreviewSavedRenderState();
 }
 
 function currentDigestBatchSnapshot() {
@@ -1592,6 +1620,7 @@ function updateDigestSelectionLock() {
       ? '生成中不能修改群选择'
       : (hasWhitelist ? '选择设置页白名单里的群' : '当前账号尚未配置白名单');
   }
+  updateDigestPreviewActionLock();
 }
 
 function digestStageText(stage = {}) {
@@ -1930,6 +1959,7 @@ async function generateDigest({ previewText = false } = {}) {
               detail: [digest.topics?.length ? `${digest.topics.length} 条主线` : '', digest.links?.length ? `${digest.links.length} 个链接` : ''].filter(Boolean).join(' · '),
             }));
             const canvas = drawDigestCanvas(digest, null, batchSnapshot.render);
+            updateDigestPreviewActionLock();
             if (controller.signal.aborted) return;
             upsertStage(groupStage(i, {
               name: 'rendering',
@@ -1945,6 +1975,7 @@ async function generateDigest({ previewText = false } = {}) {
               _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
               digest.file_path = saved.item.file_path;
               updatePreviewSavedRenderState();
+              updateDigestPreviewActionLock();
               upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'done', detail: saved.item.relative_path }));
               scrollDigestWorkIntoView(document.getElementById('preview-card'));
             } catch (e) {
@@ -2809,11 +2840,8 @@ function restoreDigestOutputs() {
     if (previewCard && canvas) {
       previewCard.classList.remove('hidden');
       drawDigestCanvas(_state_digest.lastDigest, canvas);
-      _state_digest.lastCanvasRenderKey = _state_digest.lastCanvasRenderKey || digestRenderStateKey();
-      document.getElementById('btn-download')?.removeAttribute('disabled');
-      document.getElementById('btn-copy')?.removeAttribute('disabled');
-      document.getElementById('btn-rerender')?.removeAttribute('disabled');
-      updatePreviewSavedRenderState();
+      _state_digest.lastCanvasRenderKey = digestRenderStateKey();
+      updateDigestPreviewActionLock();
     }
   }
   if (_state_digest.lastTextMarkdown?.trim()) {
@@ -3006,7 +3034,8 @@ async function copyCanvas() {
     const digestId = _state_digest.lastSavedItem?.digest_id;
     const browserError = compactErrorSummary(e?.message || '');
     let systemError = '';
-    if (digestId) {
+    const savedState = previewSavedRenderState();
+    if (digestId && !savedState.stale) {
       try {
         const copied = await api('/api/copy-image', { method: 'POST', body: { digest_id: digestId } });
         btn.textContent = '✓ 已复制';
@@ -3020,6 +3049,8 @@ async function copyCanvas() {
       } catch (fallbackError) {
         systemError = compactErrorSummary(fallbackError?.message || '');
       }
+    } else if (digestId && savedState.stale) {
+      systemError = '当前预览样式尚未保存，系统剪贴板不能改用旧 PNG。请先保存重渲染，或直接下载当前预览。';
     }
     if (status) {
       status.className = 'status err';

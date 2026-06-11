@@ -163,7 +163,7 @@ function normalizeSeenList(values) {
   const out = [];
   const seen = new Set();
   for (const value of Array.isArray(values) ? values : []) {
-    const item = normalizeCursorText(value, 80);
+    const item = normalizeCursorValue(value);
     if (!item || seen.has(item)) continue;
     seen.add(item);
     out.push(item);
@@ -175,7 +175,7 @@ function normalizeSeenList(values) {
 function normalizeCursorValue(value) {
   const raw = String(value ?? '').trim();
   if (!raw) return '';
-  return raw.replace(/[^\w:.-]/g, '').slice(0, 256);
+  return raw.replace(/[^\w:%.\-~!'()*]/g, '').slice(0, 256);
 }
 
 function normalizeCursorText(value, maxLength) {
