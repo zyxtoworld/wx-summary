@@ -3635,6 +3635,7 @@ async function renderSettings() {
       scheduler_disabled: '定时任务未启用',
       llm_not_configured: 'AI 设置未配置完整',
       no_whitelisted_groups: '没有可自动检查的白名单群',
+      ambiguous_group_refs: '白名单或每群规则里有重名群，请重新保存为当前账号的群',
       already_running: '已有检查正在运行',
       below_minimum: '消息数低于阈值',
       no_new_messages: '没有新消息',
@@ -3669,6 +3670,7 @@ async function renderSettings() {
     const warningDetails = new Set([
       'llm_not_configured',
       'no_whitelisted_groups',
+      'ambiguous_group_refs',
       'already_running',
       'scheduler_disabled',
       'below_minimum',
@@ -3691,21 +3693,23 @@ async function renderSettings() {
   function paintSchedulerStatus(status = {}, { immediateResult = null } = {}) {
     const view = schedulerStatusWithImmediateResult(status, immediateResult);
     const bits = [];
-    bits.push(view.enabled ? '已启用' : '未启用');
+    bits.push(view.enabled ? '定时已启用' : '定时未启用');
     if (view.running) bits.push('运行中');
     if (view.next_run_at) bits.push(`下次 ${new Date(view.next_run_at).toLocaleString()}`);
     if (view.last_result) {
       const r = view.last_result;
       if (r.generated !== undefined) {
-        const itemSummary = schedulerItemsSummary(r.items);
-        const detail = [
-          `生成 ${r.generated || 0}`,
-          r.checked !== undefined ? `检查 ${r.checked}` : '',
-          r.skipped ? `跳过 ${r.skipped}` : '',
-          r.failed ? `失败 ${r.failed}` : '',
-          r.detail ? schedulerDetailLabel(r.detail) : '',
-          itemSummary,
-        ].filter(Boolean).join(' / ');
+          const itemSummary = schedulerItemsSummary(r.items);
+          const skippedCount = Number(r.skipped || 0);
+          const failedCount = Number(r.failed || 0);
+          const detail = [
+            `生成 ${r.generated || 0}`,
+            r.checked !== undefined ? `检查 ${r.checked}` : '',
+            skippedCount > 0 ? `跳过 ${skippedCount}` : '',
+            failedCount > 0 ? `失败 ${failedCount}` : '',
+            r.detail ? schedulerDetailLabel(r.detail) : '',
+            itemSummary,
+          ].filter(Boolean).join(' / ');
         bits.push(`上次 ${detail}`);
       } else if (r.detail) {
         bits.push(`上次 ${schedulerDetailLabel(r.detail)}`);
@@ -3810,10 +3814,10 @@ async function renderSettings() {
   runSchedulerButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
     setSchedulerActionBusy(true);
     schedulerStatus.className = 'status';
-    schedulerStatus.textContent = groupsLoaded ? '先保存当前设置，再检查...' : '先保存当前设置（保留原白名单），再检查...';
+    schedulerStatus.textContent = groupsLoaded ? '先保存当前设置，再手动检查...' : '先保存当前设置（保留原白名单），再手动检查...';
     try {
       await saveSchedulerSettings();
-      schedulerStatus.textContent = '检查中...';
+      schedulerStatus.textContent = '手动检查中...';
       const r = await api('/api/scheduler/run-once', { method: 'POST', body: {} });
       paintSchedulerStatus(r.scheduler, { immediateResult: r.result });
     } catch (e) {

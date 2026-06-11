@@ -160,6 +160,7 @@ async function executeSchedulerTick({ reason, force = false }) {
   };
 
   const accounts = await listAccounts();
+  const accountEntries = [];
   for (const account of accounts) {
     result.accounts++;
     const accountId = accountIdentity(account);
@@ -173,10 +174,23 @@ async function executeSchedulerTick({ reason, force = false }) {
       logError('scheduler_account_failed', { account_id: accountId, error: message });
       continue;
     }
-    const targets = selectScheduledGroups(groups, settings.groups?.whitelist || [], account);
+    accountEntries.push({ account, groups });
+  }
+  const allGroups = schedulerGroupUniverse(accountEntries);
+  const ambiguousRefs = ambiguousSchedulerRefs([
+    ...(Array.isArray(settings.groups?.whitelist) ? settings.groups.whitelist : []),
+    ...(Array.isArray(settings.scheduler?.per_group) ? settings.scheduler.per_group : []),
+  ], allGroups);
+  if (ambiguousRefs.length) {
+    result.ambiguous_refs = ambiguousRefs;
+    logWarn('scheduler_ambiguous_group_refs', { refs: ambiguousRefs });
+  }
+  for (const { account, groups } of accountEntries) {
+    const accountId = accountIdentity(account);
+    const targets = selectScheduledGroups(groups, settings.groups?.whitelist || [], account, { allGroups });
     for (const group of targets) {
       result.checked++;
-      const item = await runGroupDigestWithRetry({ settings, account, group, window, attempts: 2 });
+      const item = await runGroupDigestWithRetry({ settings, account, group, window, attempts: 2, allGroups });
       result.items.push(item);
       if (item.generated) result.generated++;
       else if (item.error) result.failed++;
@@ -186,7 +200,9 @@ async function executeSchedulerTick({ reason, force = false }) {
       else logInfo('scheduler_group_skipped', { account_id: accountId, group_id: group.id, group: group.name, detail: item.detail, message_count: item.message_count });
     }
   }
-  if (!result.checked && !result.failed) return { ...result, skipped: true, detail: 'no_whitelisted_groups' };
+  if (!result.checked && !result.failed) {
+    return { ...result, skipped: true, detail: ambiguousRefs.length ? 'ambiguous_group_refs' : 'no_whitelisted_groups' };
+  }
   return result;
 }
 
@@ -217,8 +233,8 @@ async function runGroupDigestWithRetry({ attempts = 2, ...args }) {
   };
 }
 
-async function runGroupDigest({ settings, account, group, window }) {
-  const override = schedulerOverrideForGroup(settings.scheduler?.per_group, group, account);
+async function runGroupDigest({ settings, account, group, window, allGroups = [] }) {
+  const override = schedulerOverrideForGroup(settings.scheduler?.per_group, group, account, { allGroups });
   const minMessages = override?.min_messages || settings.scheduler.min_messages_per_digest;
   let collection = await collectMessages({
     account_id: accountIdentity(account),
@@ -232,6 +248,7 @@ async function runGroupDigest({ settings, account, group, window }) {
   const cursorKey = groupCursorKey(account, group);
   const cursorState = await getGroupCursorState(cursorKey);
   const previousCursor = cursorState.last_seq;
+  const previousSeen = new Set(Array.isArray(cursorState.seen) ? cursorState.seen : []);
   const windowMessageCount = collection.message_count || 0;
   const windowMessages = Array.isArray(collection.messages) ? collection.messages : [];
   const latestWindowCursor = latestMessageCursor(windowMessages);
@@ -367,18 +384,19 @@ function shouldSkipUnchangedCursor(previousCursor, latestCursor) {
   return !!previousCursor && !!latestCursor && previousCursor === latestCursor;
 }
 
-function selectScheduledGroups(groups, whitelist, account = {}) {
+function selectScheduledGroups(groups, whitelist, account = {}, { allGroups = [] } = {}) {
   const refs = Array.isArray(whitelist) ? whitelist : [];
   if (!refs.length) return [];
-  return (groups || []).filter(group => refs.some(ref => groupRefMatches(ref, group, account)));
+  return (groups || []).filter(group => refs.some(ref => groupRefMatches(ref, group, account, { allGroups })));
 }
 
-function schedulerOverrideForGroup(overrides = [], group = {}, account = {}) {
+function schedulerOverrideForGroup(overrides = [], group = {}, account = {}, { allGroups = [] } = {}) {
   let best = null;
   let bestScore = 0;
   for (const item of Array.isArray(overrides) ? overrides : []) {
     const score = groupRefMatchScore(item, group, account, {
       legacyKeys: [item?.group, item?.group_id, item?.group_name, item?.name],
+      allGroups,
     });
     if (score > bestScore) {
       best = item;
@@ -388,29 +406,114 @@ function schedulerOverrideForGroup(overrides = [], group = {}, account = {}) {
   return best;
 }
 
-function groupRefMatches(ref, group = {}, account = {}, { legacyKeys = [] } = {}) {
-  return groupRefMatchScore(ref, group, account, { legacyKeys }) > 0;
+function groupRefMatches(ref, group = {}, account = {}, { legacyKeys = [], allGroups = [] } = {}) {
+  return groupRefMatchScore(ref, group, account, { legacyKeys, allGroups }) > 0;
 }
 
-function groupRefMatchScore(ref, group = {}, account = {}, { legacyKeys = [] } = {}) {
+function groupRefMatchScore(ref, group = {}, account = {}, { legacyKeys = [], allGroups = [] } = {}) {
   const accountId = accountIdentity(account);
   const groupId = String(group.id || group.group_id || '').trim();
   const groupName = String(group.name || group.group_name || '').trim();
   if (typeof ref === 'string') {
     const legacy = ref.trim();
-    return legacy && (legacy === groupId || legacy === groupName) ? 1 : 0;
+    if (!legacy || (legacy !== groupId && legacy !== groupName)) return 0;
+    return groupRefAmbiguousAcrossAccounts(legacy, group, account, allGroups) ? 0 : 1;
   }
   if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return 0;
   const refAccountId = String(ref.account_id || ref.account || '').trim();
   if (refAccountId && refAccountId !== accountId) return 0;
   const refGroupId = String(ref.group_id || ref.id || '').trim();
-  if (refGroupId) return refGroupId === groupId ? (refAccountId ? 4 : 3) : 0;
+  if (refGroupId) {
+    if (refGroupId !== groupId) return 0;
+    if (!refAccountId && groupRefAmbiguousAcrossAccounts(refGroupId, group, account, allGroups)) return 0;
+    return refAccountId ? 4 : 3;
+  }
   const refGroupName = String(ref.group_name || ref.name || '').trim();
-  if (refGroupName) return refGroupName === groupName ? (refAccountId ? 2 : 1) : 0;
+  if (refGroupName) {
+    if (refGroupName !== groupName) return 0;
+    if (!refAccountId && groupRefAmbiguousAcrossAccounts(refGroupName, group, account, allGroups)) return 0;
+    return refAccountId ? 2 : 1;
+  }
   const refLegacyGroup = String(ref.group || '').trim();
-  if (refLegacyGroup) return refLegacyGroup === groupId || refLegacyGroup === groupName ? 1 : 0;
+  if (refLegacyGroup) {
+    if (refLegacyGroup !== groupId && refLegacyGroup !== groupName) return 0;
+    return (!refAccountId && groupRefAmbiguousAcrossAccounts(refLegacyGroup, group, account, allGroups)) ? 0 : 1;
+  }
   const legacy = legacyKeys.map(key => String(key || '').trim()).filter(Boolean);
-  return legacy.some(key => key === groupId || key === groupName) ? 1 : 0;
+  const matched = legacy.find(key => key === groupId || key === groupName);
+  if (!matched) return 0;
+  return groupRefAmbiguousAcrossAccounts(matched, group, account, allGroups) ? 0 : 1;
+}
+
+function schedulerGroupUniverse(accountEntries = []) {
+  return (Array.isArray(accountEntries) ? accountEntries : []).flatMap(entry => {
+    const account = entry?.account || {};
+    return (Array.isArray(entry?.groups) ? entry.groups : []).map(group => ({ account, group }));
+  });
+}
+
+function groupRefAmbiguousAcrossAccounts(value, group = {}, account = {}, allGroups = []) {
+  const needle = String(value || '').trim();
+  if (!needle || !Array.isArray(allGroups) || allGroups.length <= 1) return false;
+  const matches = new Set();
+  for (const entry of allGroups) {
+    const candidateAccount = entry?.account || {};
+    const candidateGroup = entry?.group || entry || {};
+    const candidateAccountId = accountIdentity(candidateAccount);
+    const candidateGroupId = String(candidateGroup.id || candidateGroup.group_id || '').trim();
+    const candidateGroupName = String(candidateGroup.name || candidateGroup.group_name || '').trim();
+    if (needle !== candidateGroupId && needle !== candidateGroupName) continue;
+    matches.add(`${candidateAccountId}::${candidateGroupId || candidateGroupName}`);
+  }
+  if (matches.size <= 1) return false;
+  const current = `${accountIdentity(account)}::${String(group.id || group.group_id || group.name || group.group_name || '').trim()}`;
+  return matches.has(current) || matches.size > 1;
+}
+
+function ambiguousSchedulerRefs(refs = [], allGroups = []) {
+  if (!Array.isArray(refs) || !Array.isArray(allGroups) || allGroups.length <= 1) return [];
+  const out = [];
+  const seen = new Set();
+  for (const ref of refs) {
+    for (const value of accountlessGroupRefValues(ref)) {
+      const matches = matchingSchedulerGroupKeys(value, allGroups);
+      if (matches.length <= 1) continue;
+      const key = `${value}:${matches.join('|')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ ref: value, matches });
+    }
+  }
+  return out.slice(0, 50);
+}
+
+function accountlessGroupRefValues(ref) {
+  if (typeof ref === 'string') return ref.trim() ? [ref.trim()] : [];
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return [];
+  const accountId = String(ref.account_id || ref.account || '').trim();
+  if (accountId) return [];
+  return [
+    ref.group_id,
+    ref.id,
+    ref.group_name,
+    ref.name,
+    ref.group,
+  ].map(value => String(value || '').trim()).filter(Boolean);
+}
+
+function matchingSchedulerGroupKeys(value, allGroups = []) {
+  const needle = String(value || '').trim();
+  if (!needle) return [];
+  const matches = new Set();
+  for (const entry of allGroups) {
+    const account = entry?.account || {};
+    const group = entry?.group || entry || {};
+    const groupId = String(group.id || group.group_id || '').trim();
+    const groupName = String(group.name || group.group_name || '').trim();
+    if (needle !== groupId && needle !== groupName) continue;
+    matches.add(`${accountIdentity(account)}::${groupId || groupName}`);
+  }
+  return [...matches].sort();
 }
 
 function schedulerWindow(value, now = new Date()) {
@@ -553,4 +656,5 @@ export const __schedulerInternals = {
   shouldSkipUnchangedCursor,
   schedulerOverrideForGroup,
   groupRefMatches,
+  ambiguousSchedulerRefs,
 };
