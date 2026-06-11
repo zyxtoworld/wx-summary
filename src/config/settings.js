@@ -156,27 +156,37 @@ function toProjectRelativeSafe(file) {
   return path.relative(PROJECT_ROOT, file).replaceAll(path.sep, '/');
 }
 
-export async function saveSecrets(secrets) {
-  await ensureDir(DATA_DIR);
-  const filtered = {
-    api_key: secrets.api_key || '',
-    manual_key: secrets.manual_key || '',
-  };
-  const encrypted = await protectText(JSON.stringify(filtered));
-  const tmp = path.join(DATA_DIR, `secrets.${process.pid}.${Date.now()}.tmp`);
+export async function saveSecrets(secrets, { file = SECRETS_FILE } = {}) {
+  const tmp = await stageSecretsFile(secrets, file);
   try {
-    await fsp.writeFile(tmp, encrypted);
-    await fsp.rename(tmp, SECRETS_FILE);
+    await fsp.rename(tmp, file);
   } catch (e) {
     await fsp.rm(tmp, { force: true }).catch(() => {});
     throw e;
   }
 }
 
-export async function loadSettings({ includeSecrets = false, settingsFile = SETTINGS_FILE } = {}) {
+async function stageSecretsFile(secrets, file = SECRETS_FILE) {
+  await ensureDir(path.dirname(file));
+  const filtered = {
+    api_key: secrets.api_key || '',
+    manual_key: secrets.manual_key || '',
+  };
+  const encrypted = await protectText(JSON.stringify(filtered));
+  const tmp = path.join(path.dirname(file), `secrets.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
+  try {
+    await fsp.writeFile(tmp, encrypted);
+    return tmp;
+  } catch (e) {
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+    throw e;
+  }
+}
+
+export async function loadSettings({ includeSecrets = false, settingsFile = SETTINGS_FILE, secretsFile = SECRETS_FILE } = {}) {
   const { raw, invalid } = await loadSettingsFile(settingsFile);
   const merged = normalizeSettings(deepMerge(defaultSettings(), raw));
-  const secretState = await loadSecrets();
+  const secretState = await loadSecrets({ file: secretsFile });
   merged.llm.api_key_set = !!secretState.secrets.api_key;
   merged.llm.api_key_display = maskSecret(secretState.secrets.api_key);
   merged.wechat.manual_key_set = !!secretState.secrets.manual_key;
@@ -189,8 +199,8 @@ export async function loadSettings({ includeSecrets = false, settingsFile = SETT
   return merged;
 }
 
-export async function publicSettings() {
-  return stripRuntime(await loadSettings());
+export async function publicSettings(options = {}) {
+  return stripRuntime(await loadSettings(options));
 }
 
 export function stripRuntime(settings) {
@@ -461,8 +471,8 @@ export function validateSettingsObject(settings, { requireBaseUrl = false } = {}
   return errors;
 }
 
-export async function saveSettingsPatch(patch) {
-  return withSettingsSaveLock(() => saveSettingsPatchUnlocked(patch));
+export async function saveSettingsPatch(patch, options = {}) {
+  return withSettingsSaveLock(() => saveSettingsPatchUnlocked(patch, options));
 }
 
 async function withSettingsSaveLock(action) {
@@ -471,8 +481,15 @@ async function withSettingsSaveLock(action) {
   return run;
 }
 
-async function saveSettingsPatchUnlocked(patch) {
-  const current = await loadSettings({ includeSecrets: true });
+async function saveSettingsPatchUnlocked(patch, { settingsFile = SETTINGS_FILE, secretsFile = SECRETS_FILE } = {}) {
+  const settingsExisted = await fsp.stat(settingsFile).then(
+    stat => stat.isFile(),
+    e => {
+      if (e?.code === 'ENOENT') return false;
+      throw e;
+    },
+  );
+  const current = await loadSettings({ includeSecrets: true, settingsFile, secretsFile });
   const nextPatch = cloneJson(patch || {});
   const nextSecrets = {
     api_key: current.llm.api_key || '',
@@ -521,9 +538,30 @@ async function saveSettingsPatchUnlocked(patch) {
   }
 
   await ensureRuntimeDirs(merged);
-  await writeJsonAtomic(SETTINGS_FILE, stripSensitive(merged));
-  if (secretsChanged) await saveSecrets(nextSecrets);
-  return publicSettings();
+  let stagedSecrets = '';
+  let settingsWritten = false;
+  try {
+    if (secretsChanged) stagedSecrets = await stageSecretsFile(nextSecrets, secretsFile);
+    await writeJsonAtomic(settingsFile, stripSensitive(merged));
+    settingsWritten = true;
+    if (stagedSecrets) {
+      await fsp.rename(stagedSecrets, secretsFile);
+      stagedSecrets = '';
+    }
+  } catch (e) {
+    if (stagedSecrets) await fsp.rm(stagedSecrets, { force: true }).catch(() => {});
+    if (settingsWritten) await rollbackSettingsFile(settingsFile, current, settingsExisted).catch(() => {});
+    throw e;
+  }
+  return publicSettings({ settingsFile, secretsFile });
+}
+
+async function rollbackSettingsFile(settingsFile, previousSettings, existed) {
+  if (!existed) {
+    await fsp.rm(settingsFile, { force: true }).catch(() => {});
+    return;
+  }
+  await writeJsonAtomic(settingsFile, stripSensitive(previousSettings));
 }
 
 export async function rememberModels({ provider, base_url, models }) {
