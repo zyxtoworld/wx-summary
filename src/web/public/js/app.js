@@ -2767,13 +2767,14 @@ async function renderHistory() {
   $grid.innerHTML = list
     .map(it => {
       const version = historyItemCacheBust(it);
+      const fileMissing = it.file_exists === false;
       return `
-        <div class="history-item" data-id="${escapeHtml(it.digest_id)}">
-          <div class="history-thumb"><img loading="lazy" decoding="async" src="${historyThumbUrl(it.digest_id, version)}" alt="${escapeHtml(it.group)}" /></div>
+        <div class="history-item ${fileMissing ? 'file-missing' : ''}" data-id="${escapeHtml(it.digest_id)}">
+          <div class="history-thumb">${fileMissing ? '<span class="history-missing-label">长图文件缺失</span>' : `<img loading="lazy" decoding="async" src="${historyThumbUrl(it.digest_id, version)}" alt="${escapeHtml(it.group)}" />`}</div>
           <div class="history-meta">
             <div class="gname">${escapeHtml(it.group)}</div>
             <div class="time">${escapeHtml(it.since)} ~ ${escapeHtml(it.until)}</div>
-            <div class="time muted">${escapeHtml(it.model)} · ${it.message_count || 0} 条</div>
+            <div class="time muted">${escapeHtml(it.model)} · ${it.message_count || 0} 条${fileMissing ? ' · 长图缺失' : ''}</div>
           </div>
         </div>`;
     }).join('');
@@ -2826,6 +2827,7 @@ function showHistoryModal(item) {
   const imageUrl = historyImageUrl(item.digest_id, historyItemCacheBust(item));
   const serverRerenderSupported = supportsServerRerender();
   const canRerender = serverRerenderSupported;
+  const fileMissing = item.file_exists === false;
   const rerenderTitle = serverRerenderSupported
       ? ''
       : '当前系统不支持历史重新渲染；请回到总结页重新生成摘要长图';
@@ -2838,7 +2840,7 @@ function showHistoryModal(item) {
         <button class="icon-btn" data-close>×</button>
       </div>
       <div class="modal-body">
-        <img data-zoomable src="${imageUrl}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />
+        ${fileMissing ? '<div class="missing-image-note">长图文件已不存在，可以重新渲染或回到总结页重新生成。</div>' : `<img data-zoomable src="${imageUrl}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`}
       </div>
       <div class="preview-actions">
         <a class="btn" data-download href="${imageUrl}" download>⬇ 下载 PNG</a>
@@ -2852,7 +2854,8 @@ function showHistoryModal(item) {
   modal.querySelector('[data-close]').addEventListener('click', () => modal.remove());
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
   const status = modal.querySelector('[data-status]');
-  const image = modal.querySelector('[data-zoomable]');
+  let image = modal.querySelector('[data-zoomable]');
+  const modalBody = modal.querySelector('.modal-body');
   const downloadButton = modal.querySelector('[data-download]');
   const copyButton = modal.querySelector('[data-copy]');
   const revealButton = modal.querySelector('[data-reveal]');
@@ -2873,15 +2876,27 @@ function showHistoryModal(item) {
     status.textContent = '长图加载失败：文件可能已被移动或删除。';
   };
   const watchHistoryImage = () => {
+    if (!image) return;
     image.addEventListener('load', restoreImageActions, { once: true });
     image.addEventListener('error', disableImageActions, { once: true });
   };
   watchHistoryImage();
-  if (image.complete && image.naturalWidth === 0) disableImageActions();
-  image.addEventListener('click', () => {
+  if (fileMissing) disableImageActions();
+  if (image?.complete && image.naturalWidth === 0) disableImageActions();
+  image?.addEventListener('click', () => {
     if (!image.complete || image.naturalWidth === 0) return;
     showImageZoomModal({ title: item.group, src: historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now()) });
   });
+  const ensureHistoryModalImage = src => {
+    if (image) return image;
+    modalBody.innerHTML = `<img data-zoomable src="${src}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`;
+    image = modalBody.querySelector('[data-zoomable]');
+    image?.addEventListener('click', () => {
+      if (!image.complete || image.naturalWidth === 0) return;
+      showImageZoomModal({ title: item.group, src: historyImageUrl(item.digest_id, historyItemCacheBust(item) || Date.now()) });
+    });
+    return image;
+  };
   revealButton.addEventListener('click', async () => {
     status.className = 'status';
     status.textContent = '正在打开文件夹...';
@@ -2940,11 +2955,14 @@ function showHistoryModal(item) {
           });
           Object.assign(item, r.item || {});
           const freshUrl = historyImageUrl(item.digest_id, Date.now());
+          item.file_exists = true;
+          ensureHistoryModalImage(freshUrl);
           watchHistoryImage();
-          image.src = freshUrl;
+          if (image) image.src = freshUrl;
           downloadButton.href = freshUrl;
           downloadButton.setAttribute('download', '');
           downloadButton.classList.remove('disabled');
+          restoreImageActions();
           return r;
         },
       });

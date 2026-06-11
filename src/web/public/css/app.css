@@ -710,6 +710,24 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
   content: "缩略图加载失败";
   color: var(--danger);
 }
+.history-item.file-missing {
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
+}
+.history-item.file-missing .history-thumb::before {
+  content: "";
+}
+.history-missing-label,
+.missing-image-note {
+  color: var(--danger);
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: center;
+  padding: var(--gap-4);
+}
+.missing-image-note {
+  align-self: center;
+  max-width: 360px;
+}
 .history-meta {
   padding: 22px 20px 24px;
   display: grid;

@@ -171,7 +171,26 @@ export async function discardRenderedHistoryItem(settings, item) {
 }
 
 export async function listHistory(settings) {
-  return (await readHistoryIndex(settings)).slice(0, 50);
+  const base = outputDirFromSettings(settings);
+  const items = (await readHistoryIndex(settings)).slice(0, 50);
+  return Promise.all(items.map(item => historyItemWithFileStatus(base, item)));
+}
+
+async function historyItemWithFileStatus(base, item = {}) {
+  const filePath = item.file_path ? path.resolve(item.file_path) : '';
+  const digestPath = resolveDigestPath(base, item);
+  return {
+    ...item,
+    file_exists: await regularFileExistsInside(base, filePath, '.png'),
+    digest_exists: await regularFileExistsInside(base, digestPath, '.digest.json'),
+  };
+}
+
+async function regularFileExistsInside(base, targetPath, extension = '') {
+  if (!targetPath || !isInside(base, targetPath)) return false;
+  if (extension && !targetPath.toLowerCase().endsWith(extension)) return false;
+  const stat = await fsp.stat(targetPath).catch(() => null);
+  return !!stat?.isFile?.();
 }
 
 export async function cleanupOldDigests(settings) {
