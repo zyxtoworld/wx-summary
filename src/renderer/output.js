@@ -141,6 +141,35 @@ export async function saveRenderedPng({ settings, digest, png_data_url, signal =
   return item;
 }
 
+export async function discardRenderedHistoryItem(settings, item) {
+  const base = outputDirFromSettings(settings);
+  const errors = [];
+  const digestId = String(item?.digest_id || '');
+  let canRemoveFiles = true;
+  if (digestId) {
+    await removeHistoryItem(settings, digestId).catch(e => {
+      canRemoveFiles = false;
+      errors.push(e);
+    });
+  }
+  const filePath = item?.file_path ? path.resolve(item.file_path) : '';
+  const digestPath = resolveDigestPath(base, item);
+  const targets = [...new Set([
+    filePath && path.extname(filePath).toLowerCase() === '.png' ? filePath : '',
+    digestPath,
+  ].filter(Boolean))].filter(target => isInside(base, target));
+  if (canRemoveFiles) {
+    for (const target of targets) {
+      await fsp.rm(target, { force: true }).catch(e => errors.push(e));
+    }
+  }
+  if (errors.length) {
+    const err = new Error(`failed to discard rendered history item: ${errors.map(e => e?.message || String(e)).join('; ')}`);
+    err.cause = errors[0];
+    throw err;
+  }
+}
+
 export async function listHistory(settings) {
   return (await readHistoryIndex(settings)).slice(0, 50);
 }
@@ -193,8 +222,6 @@ export async function overwriteRenderedPng({ settings, item, digest, png_data_ur
   const target = await writableHistoryPngTarget(settings, item?.file_path || '');
   const buffer = pngBufferFromDataUrl(png_data_url);
   const digestPath = resolveDigestPath(base, item) || digestJsonPathForPng(target);
-  await writeBinaryAtomic(target, buffer);
-  await writeDigestJson(digestPath, digest);
   const next = {
     ...item,
     file_path: target,
@@ -203,8 +230,20 @@ export async function overwriteRenderedPng({ settings, item, digest, png_data_ur
     digest_relative_path: toProjectRelative(digestPath),
     rerendered_at: new Date().toISOString(),
   };
-  await upsertHistory(settings, next);
-  return next;
+  const rollback = await snapshotFilesForRollback([target, digestPath]);
+  try {
+    await writeBinaryAtomic(target, buffer);
+    await writeDigestJson(digestPath, digest);
+    await upsertHistory(settings, next);
+    return next;
+  } catch (e) {
+    try {
+      await restoreFileSnapshots(rollback);
+    } catch (restoreError) {
+      e.rollback_error = restoreError?.message || String(restoreError);
+    }
+    throw e;
+  }
 }
 
 export async function savePreviewMarkdown({ settings, title = '文本预览', markdown }) {
@@ -325,6 +364,37 @@ function isOutputAbortError(error) {
 async function cleanupRenderedPair(filePath, digestPath) {
   if (filePath) await fsp.rm(filePath, { force: true }).catch(() => {});
   if (digestPath) await fsp.rm(digestPath, { force: true }).catch(() => {});
+}
+
+async function snapshotFilesForRollback(paths) {
+  const seen = new Set();
+  const snapshots = [];
+  for (const filePath of paths) {
+    if (!filePath) continue;
+    const resolved = path.resolve(filePath);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    const stat = await fsp.stat(resolved).catch(e => {
+      if (e?.code === 'ENOENT') return null;
+      throw e;
+    });
+    if (!stat) {
+      snapshots.push({ filePath: resolved, existed: false });
+    } else if (stat.isFile()) {
+      snapshots.push({ filePath: resolved, existed: true, data: await fsp.readFile(resolved) });
+    } else {
+      snapshots.push({ filePath: resolved, existed: true, nonFile: true });
+    }
+  }
+  return snapshots;
+}
+
+async function restoreFileSnapshots(snapshots) {
+  for (const snapshot of [...snapshots].reverse()) {
+    if (snapshot.nonFile) continue;
+    if (snapshot.existed) await writeBinaryAtomic(snapshot.filePath, snapshot.data);
+    else await fsp.rm(snapshot.filePath, { force: true }).catch(() => {});
+  }
 }
 
 async function writeDigestJson(filePath, digest) {
@@ -480,7 +550,7 @@ async function writeBinaryAtomic(filePath, buffer) {
 
 function resolveDigestPath(base, item = {}) {
   const explicit = item.digest_path ? path.resolve(item.digest_path) : '';
-  if (explicit && isInside(base, explicit)) return explicit;
+  if (explicit && isInside(base, explicit) && /\.digest\.json$/i.test(explicit)) return explicit;
   const pngPath = item.file_path ? path.resolve(item.file_path) : '';
   const inferred = pngPath && isInside(base, pngPath) ? digestJsonPathForPng(pngPath) : '';
   return inferred && isInside(base, inferred) ? inferred : '';

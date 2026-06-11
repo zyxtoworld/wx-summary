@@ -1,6 +1,6 @@
 import { collectMessages, listAccounts, listGroups } from '../collector/index.js';
 import { durationToMs, loadSettings } from '../config/settings.js';
-import { saveRenderedPng } from '../renderer/output.js';
+import { discardRenderedHistoryItem, saveRenderedPng } from '../renderer/output.js';
 import { renderDigestPngDataUrl } from '../renderer/server-png.js';
 import { summarizeDigest, sanitizeText } from '../summarizer/llm.js';
 import { getGroupCursor, setGroupCursor } from '../store/cursors.js';
@@ -168,12 +168,15 @@ async function executeSchedulerTick({ reason, force = false }) {
 
 async function runGroupDigestWithRetry({ attempts = 2, ...args }) {
   let lastError;
+  let usedAttempts = 0;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    usedAttempts = attempt;
     try {
       const item = await runGroupDigest(args);
       return { ...item, attempts: attempt };
     } catch (e) {
       lastError = e;
+      if (e?.scheduler_no_retry) break;
       if (attempt < attempts) await sleep(1000 * attempt);
     }
   }
@@ -185,7 +188,7 @@ async function runGroupDigestWithRetry({ attempts = 2, ...args }) {
     group: args.group?.name || args.group?.id || '',
     generated: false,
     detail: 'error',
-    attempts,
+    attempts: usedAttempts || attempts,
     error: sanitizeText(lastError?.message || String(lastError)),
   };
 }
@@ -244,7 +247,31 @@ async function runGroupDigest({ settings, account, group, window }) {
   const pngDataUrl = await renderDigestPngDataUrl(digest, settings.render);
   const saved = await saveRenderedPng({ settings, digest, png_data_url: pngDataUrl });
   const cursor = latestCursor || String(Date.now());
-  await setGroupCursor(cursorKey, cursor);
+  try {
+    await setGroupCursor(cursorKey, cursor);
+  } catch (e) {
+    const message = sanitizeText(e?.message || String(e));
+    await discardRenderedHistoryItem(settings, saved).catch(cleanupError => {
+      e.cleanup_error = sanitizeText(cleanupError?.message || String(cleanupError));
+      logWarn('scheduler_saved_digest_cleanup_failed', {
+        account_id: accountIdentity(account),
+        group_id: group.id,
+        group: group.name,
+        digest_id: digest.digest_id,
+        error: e.cleanup_error,
+      });
+    });
+    e.scheduler_no_retry = true;
+    logError('scheduler_cursor_save_failed', {
+      account_id: accountIdentity(account),
+      group_id: group.id,
+      group: group.name,
+      digest_id: digest.digest_id,
+      cursor_key: cursorKey,
+      error: message,
+    });
+    throw e;
+  }
   return {
     account_id: accountIdentity(account),
     account: account.name || accountIdentity(account),
