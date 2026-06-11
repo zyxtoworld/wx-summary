@@ -23,6 +23,11 @@ function throwIfAborted(signal) {
   if (signal?.aborted) throw abortError();
 }
 
+function notifyProgress(onProgress, data) {
+  if (typeof onProgress !== 'function') return;
+  try { onProgress(data); } catch {}
+}
+
 export async function detectWeixin({ force = false } = {}) {
   if (!force && WEIXIN_ENV_CACHE.result && Date.now() - WEIXIN_ENV_CACHE.at < WEIXIN_ENV_CACHE_MS) {
     return WEIXIN_ENV_CACHE.result;
@@ -96,7 +101,7 @@ function missingWeixinDataMessage() {
     : '未检测到 Weixin.exe，请先登录 Windows 微信后重试。';
 }
 
-export async function collectMessages({ account_id = '', group_id, group_name, since, until, filters = {}, min_messages = 5, signal } = {}) {
+export async function collectMessages({ account_id = '', group_id, group_name, since, until, filters = {}, min_messages = 5, signal, onProgress = null } = {}) {
   throwIfAborted(signal);
   if (!group_id) {
     throw Object.assign(new Error('请先选择一个本机微信会话。'), { status: 400 });
@@ -108,8 +113,14 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
 
   try {
     throwIfAborted(signal);
+    notifyProgress(onProgress, {
+      phase: 'fetch_key',
+      label: '拉取消息 · 准备数据库密钥',
+      detail: '优先使用缓存/手动密钥，必要时只读扫描',
+    });
     const real = await runWithDbKeys({
       dbName: '微信消息库',
+      onProgress,
       action: bundle => collectMessagesFromWxDb({
         account_id,
         group_id,
@@ -117,13 +128,29 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         until,
         raw_keys: bundle.rawKeys,
         signal,
+        onProgress,
       }),
     });
     throwIfAborted(signal);
     if (real) {
       const rawMessages = Array.isArray(real.messages) ? real.messages : [];
-      const filtered = applyFilters(rawMessages, filters).map(redactMessageSecrets);
       const filterActive = filtersAreActive(filters);
+      notifyProgress(onProgress, {
+        phase: 'fetch_filter',
+        label: filterActive ? '拉取消息 · 应用筛选' : '拉取消息 · 整理消息',
+        detail: filterActive ? `筛选前 ${rawMessages.length} 条` : `读取到 ${rawMessages.length} 条`,
+      });
+      const filtered = applyFilters(rawMessages, filters).map(redactMessageSecrets);
+      const mediaStatus = summarizeMediaStatus(filtered);
+      notifyProgress(onProgress, {
+        phase: 'fetch_ready',
+        label: '拉取消息 · 准备送入 AI',
+        detail: [
+          `${filtered.length} 条可总结消息`,
+          filterActive ? `筛选前 ${rawMessages.length} 条` : '',
+          mediaStatus ? `${mediaStatus.attached}/${mediaStatus.media_messages} 条媒体已附加` : '',
+        ].filter(Boolean).join(' · '),
+      });
       throwIfAborted(signal);
       return {
         source: 'wxdb',
@@ -141,7 +168,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
         matching_shard_count: real.matching_shard_count,
         query_time_bounds: real.query_time_bounds || null,
         truncated: !!real.truncated,
-        media_status: summarizeMediaStatus(filtered),
+        media_status: mediaStatus,
         filter_active: filterActive,
         no_matching_filters: filterActive && rawMessages.length > 0 && filtered.length === 0,
         below_minimum: Number(min_messages || 0) > 0 && filtered.length < Number(min_messages || 0),
@@ -332,7 +359,12 @@ function isDbKeyFailure(error) {
   return /no raw key matched|no candidate key opened|SQLCipher/i.test(String(error?.message || ''));
 }
 
-async function runWithDbKeys({ dbName, action, initialKeyBundle = null } = {}) {
+async function runWithDbKeys({ dbName, action, initialKeyBundle = null, onProgress = null } = {}) {
+  notifyProgress(onProgress, {
+    phase: 'fetch_key_quick',
+    label: '拉取消息 · 校验数据库密钥',
+    detail: `${dbName || '数据库'}：先试缓存和手动密钥`,
+  });
   const quick = initialKeyBundle || await dbRawKeyCandidateBundle({ memoryScan: false });
   try {
     return await action(quick);
@@ -340,6 +372,11 @@ async function runWithDbKeys({ dbName, action, initialKeyBundle = null } = {}) {
     if (!isDbKeyFailure(e) || quick.diagnostics?.memory_scan_attempted) {
       throw enrichDbKeyFailure(e, quick.diagnostics, dbName);
     }
+    notifyProgress(onProgress, {
+      phase: 'fetch_key_scan',
+      label: '拉取消息 · 扫描数据库密钥',
+      detail: `${dbName || '数据库'}：缓存未命中，开始只读扫描候选密钥`,
+    });
     const full = await dbRawKeyCandidateBundle({ memoryScan: true });
     try {
       return await action(full);

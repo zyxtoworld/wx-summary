@@ -1768,7 +1768,7 @@ async function generateDigest({ previewText = false } = {}) {
   const stageSnapshots = new Map();
   const stagesOrder = previewText
     ? ['fetching', 'summarizing', 'received', 'rendering']
-    : ['fetching', 'summarizing', 'received', 'rendering', 'saving'];
+    : ['fetching', 'summarizing', 'received', 'rendering', 'encoding', 'saving'];
   function stripElapsedDetail(detail = '') {
     return stripDigestElapsedDetail(detail);
   }
@@ -1811,6 +1811,27 @@ async function generateDigest({ previewText = false } = {}) {
     });
     setDigestProgressStages([...stageSnapshots.values()]);
   }
+  function finishMajorRunningStages(index, stageName, exceptKey = '') {
+    if (!stageName) return;
+    const prefix = `group-${index}:`;
+    Object.entries(stageMap).forEach(([key, li]) => {
+      if (!key.startsWith(prefix) || key === exceptKey || !li._runningStage) return;
+      if ((li.dataset.stageName || '') !== stageName) return;
+      const runningStage = li._runningStage;
+      const detail = stripElapsedDetail(runningStage.baseDetail || runningStage.detail || '');
+      clearRunningStage(li);
+      li.className = 'done';
+      writeStageText(li, { ...runningStage, status: 'done', detail });
+      stageSnapshots.set(key, {
+        ...runningStage,
+        key,
+        status: 'done',
+        detail,
+        startedAt: runningStage.startedAt,
+        baseDetail: runningStage.baseDetail || '',
+      });
+    });
+  }
   function upsertStage(s) {
     const key = s.key || s.name;
     let li = stageMap[key];
@@ -1852,7 +1873,12 @@ async function generateDigest({ previewText = false } = {}) {
         detail: s.detail || '',
       });
     }
-    const doneStageCount = Object.values(stageMap).filter(item => stagesOrder.includes(item.dataset.stageName) && item.classList.contains('done')).length;
+    let doneStageCount = 0;
+    targets.forEach((_, index) => {
+      stagesOrder.forEach(stageName => {
+        if (stageMap[`group-${index}:${stageName}`]?.classList.contains('done')) doneStageCount += 1;
+      });
+    });
     const totalSteps = Math.max(1, targets.length * stagesOrder.length);
     const fillWidth = Math.min(100, (doneStageCount / totalSteps * 100)) + '%';
     $fill.style.width = fillWidth;
@@ -1860,12 +1886,18 @@ async function generateDigest({ previewText = false } = {}) {
     setDigestProgressFill(fillWidth);
   }
   function groupStage(index, stage) {
+    const name = stage.name || '';
+    const stageName = stage.stageName || name;
     return {
       ...stage,
-      key: `group-${index}:${stage.name}`,
-      stageName: stage.name,
+      key: stage.key || `group-${index}:${name}`,
+      stageName,
       label: `[${index + 1}/${targets.length}] ${targets[index].name} · ${stage.label}`,
     };
+  }
+  function serverStageSubstepName(stage = {}) {
+    const phase = String(stage.phase || '').replace(/[^\w-]/g, '_').slice(0, 48);
+    return phase ? `${stage.name}:${phase}` : stage.name;
   }
   function serverStageForClient(stage = {}) {
     if (stage.name !== 'rendering') return stage;
@@ -1876,6 +1908,21 @@ async function generateDigest({ previewText = false } = {}) {
       detail: stage.status === 'done'
         ? (previewText ? '准备整理文本预览' : '准备绘制长图')
         : '等待摘要数据到达浏览器',
+    };
+  }
+  function normalizeServerStageForClient(stage = {}) {
+    const mapped = serverStageForClient(stage);
+    if (!mapped) return null;
+    if ((mapped.name === 'fetching' || mapped.name === 'summarizing') && mapped.status === 'running') {
+      return {
+        ...mapped,
+        name: serverStageSubstepName(mapped),
+        stageName: mapped.name,
+      };
+    }
+    return {
+      ...mapped,
+      stageName: mapped.stageName || mapped.name,
     };
   }
 
@@ -1913,8 +1960,11 @@ async function generateDigest({ previewText = false } = {}) {
           batchSnapshot,
           signal: controller.signal,
           onStage: stage => {
-            const clientStage = serverStageForClient(stage);
-            if (clientStage) upsertStage(groupStage(i, clientStage));
+            const clientStage = normalizeServerStageForClient(stage);
+            if (!clientStage) return;
+            const grouped = groupStage(i, clientStage);
+            finishMajorRunningStages(i, grouped.stageName, grouped.key);
+            upsertStage(grouped);
           },
         });
         digests[i] = digest;
@@ -1929,14 +1979,17 @@ async function generateDigest({ previewText = false } = {}) {
             name: 'rendering',
             label: '整理文本预览',
             status: 'running',
-            detail: `已收到 ${digests.filter(Boolean).length}/${targets.length} 个群`,
+            detail: `合并 ${digests.filter(Boolean).length}/${targets.length} 个群为 Markdown`,
           }));
           renderTextPreviews(digests.filter(Boolean), { complete: false, total: targets.length });
           upsertStage(groupStage(i, {
             name: 'rendering',
             label: '整理文本预览',
             status: 'done',
-            detail: `已整理 ${digests.filter(Boolean).length}/${targets.length}`,
+            detail: [
+              `已整理 ${digests.filter(Boolean).length}/${targets.length}`,
+              _state_digest.lastTextMarkdown?.length ? `${_state_digest.lastTextMarkdown.length} 字` : '',
+            ].filter(Boolean).join(' · '),
           }));
         } else {
           await enqueueRender(async () => {
@@ -1967,9 +2020,13 @@ async function generateDigest({ previewText = false } = {}) {
               status: 'done',
               detail: canvasDisplaySizeLabel(canvas),
             }));
-            upsertStage(groupStage(i, { name: 'saving', label: '保存 PNG 文件', status: 'running', detail: '写入 outputs/digests' }));
             try {
-              const saved = await saveRenderedCanvas(digest, canvas, { signal: controller.signal, batchId, renderSelection: batchSnapshot.render });
+              const saved = await saveRenderedCanvas(digest, canvas, {
+                signal: controller.signal,
+                batchId,
+                renderSelection: batchSnapshot.render,
+                onProgress: stage => upsertStage(groupStage(i, stage)),
+              });
               if (controller.signal.aborted) return;
               _state_digest.lastSavedItem = saved.item;
               _state_digest.lastSavedRenderKey = _state_digest.lastCanvasRenderKey;
@@ -2758,11 +2815,49 @@ function canvasToPngBlob(canvas) {
   });
 }
 
-async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null, batchId = '', renderSelection = currentDigestRenderSelection() } = {}) {
+function notifyLocalProgress(onProgress, data) {
+  if (typeof onProgress !== 'function') return;
+  try { onProgress(data); } catch {}
+}
+
+function formatByteSize(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(value >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(value >= 100 * 1024 ? 0 : 1)} KB`;
+  return `${Math.round(value)} B`;
+}
+
+function pngDataUrlByteSize(dataUrl = '') {
+  const payload = String(dataUrl || '').split(',')[1] || '';
+  if (!payload) return 0;
+  const padding = payload.endsWith('==') ? 2 : payload.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor(payload.length * 3 / 4) - padding);
+}
+
+async function saveRenderedCanvas(digest, renderedCanvas = null, { signal = null, batchId = '', renderSelection = currentDigestRenderSelection(), onProgress = null } = {}) {
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
   const canvas = renderedCanvas || document.getElementById('digest-canvas') || drawDigestCanvas(digest);
+  notifyLocalProgress(onProgress, {
+    name: 'encoding',
+    label: '编码 PNG',
+    status: 'running',
+    detail: canvasDisplaySizeLabel(canvas),
+  });
   const png_data_url = canvasToPngDataUrl(canvas);
+  notifyLocalProgress(onProgress, {
+    name: 'encoding',
+    label: '编码 PNG',
+    status: 'done',
+    detail: formatByteSize(pngDataUrlByteSize(png_data_url)),
+  });
   if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+  notifyLocalProgress(onProgress, {
+    name: 'saving',
+    label: '保存 PNG 文件',
+    status: 'running',
+    detail: '写入 outputs/digests',
+  });
   return api('/api/save-render', { method: 'POST', signal, body: { batch_id: batchId, digest: { ...digest, __render: digestRenderPayload(renderSelection) }, png_data_url } });
 }
 

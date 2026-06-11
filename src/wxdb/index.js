@@ -122,6 +122,11 @@ function throwIfAborted(signal) {
   if (signal?.aborted) throw abortError();
 }
 
+function notifyProgress(onProgress, data) {
+  if (typeof onProgress !== 'function') return;
+  try { onProgress(data); } catch {}
+}
+
 function markMediaEnrichmentFailure(msg, error, fallbackReason = '媒体解析失败') {
   if (!msg?.media) return;
   if (msg.media.payload_omitted_reason) return;
@@ -970,12 +975,17 @@ export async function listChatroomsFromWxDb({ account_id = '', raw_keys = [] } =
   }
 }
 
-export async function collectMessagesFromWxDb({ account_id = '', group_id, since, until, raw_keys = [], signal } = {}) {
+export async function collectMessagesFromWxDb({ account_id = '', group_id, since, until, raw_keys = [], signal, onProgress = null } = {}) {
   throwIfAborted(signal);
   if (!group_id) return null;
   if (!since) {
     throw Object.assign(new Error('请提供起始时间，避免误读全部历史消息。'), { status: 400 });
   }
+  notifyProgress(onProgress, {
+    phase: 'fetch_account',
+    label: '拉取消息 · 定位微信账号',
+    detail: account_id ? '使用当前选择的账号' : '使用默认可读账号',
+  });
   const accounts = await discoverWxAccounts();
   throwIfAborted(signal);
   const account = pickAccount(accounts, account_id);
@@ -989,6 +999,11 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
     throw Object.assign(new Error(`未找到微信消息分片 message_*.db，无法读取该会话消息。账号目录：${path.basename(account.account_root || account.db_storage || '') || '未知'}`), { status: 502 });
   }
   throwIfAborted(signal);
+  notifyProgress(onProgress, {
+    phase: 'fetch_shards',
+    label: '拉取消息 · 扫描消息分片',
+    detail: `发现 ${dbFiles.length} 个 message_*.db`,
+  });
   const sinceTs = toUnixSeconds(since, 0, '起始时间');
   const untilTs = toUnixSeconds(until, Math.floor(Date.now() / 1000), '结束时间');
   if (sinceTs > untilTs) {
@@ -1000,8 +1015,15 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
   let readableShards = 0;
   let matchingShards = 0;
 
+  let shardIndex = 0;
   for (const file of dbFiles) {
     throwIfAborted(signal);
+    shardIndex += 1;
+    notifyProgress(onProgress, {
+      phase: 'fetch_shard',
+      label: '拉取消息 · 读取消息分片',
+      detail: `${shardIndex}/${dbFiles.length} ${file.name}`,
+    });
     let opened = null;
     try {
       opened = await openCopiedSqlCipherDb(account, file.path, raw_keys);
@@ -1022,6 +1044,11 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
       `).all([timeBounds.since_s, timeBounds.until_s, timeBounds.since_ms, timeBounds.until_ms]);
       throwIfAborted(signal);
       if (!rows.length) continue;
+      notifyProgress(onProgress, {
+        phase: 'fetch_rows',
+        label: '拉取消息 · 解析消息行',
+        detail: `${file.name} 命中 ${rows.length} 条；累计 ${out.length + rows.length} 条`,
+      });
 
       const senderIds = [...new Set(rows.map(r => Number(r.real_sender_id || 0)).filter(Boolean))];
       const senderMap = new Map();
@@ -1082,8 +1109,18 @@ export async function collectMessagesFromWxDb({ account_id = '', group_id, since
 
   out.sort((a, b) => a.timestamp - b.timestamp || a.sort_seq - b.sort_seq || a.local_id - b.local_id || String(a.id || '').localeCompare(String(b.id || '')));
   throwIfAborted(signal);
+  notifyProgress(onProgress, {
+    phase: 'fetch_senders',
+    label: '拉取消息 · 补全发送人',
+    detail: `${out.length} 条消息 · ${readableShards}/${dbFiles.length} 个分片可读`,
+  });
   await hydrateSenderNames(account, raw_keys, out, group_id, signal);
   throwIfAborted(signal);
+  notifyProgress(onProgress, {
+    phase: 'fetch_media',
+    label: '拉取消息 · 解析媒体',
+    detail: '定位本地图片、视频关键帧和语音元信息',
+  });
   await enrichMessageMedia(account, raw_keys, out, signal);
   throwIfAborted(signal);
   const scannedCount = out.length;

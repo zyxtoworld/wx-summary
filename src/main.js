@@ -1578,18 +1578,22 @@ async function runDigestSSE(req, res, body) {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
   let currentStage = '';
+  let currentStagePhase = '';
   let currentStageLabel = '';
   let currentStageDetail = '';
   let stageStartedAt = 0;
   const sendStage = (data) => {
     if (data?.status === 'running') {
       const nextStage = data?.name || currentStage;
-      if (currentStage !== nextStage || !stageStartedAt) stageStartedAt = Date.now();
+      const nextPhase = data?.phase || '';
+      if (currentStage !== nextStage || currentStagePhase !== nextPhase || !stageStartedAt) stageStartedAt = Date.now();
       currentStage = nextStage;
+      currentStagePhase = nextPhase;
       currentStageLabel = data?.label || currentStageLabel;
       currentStageDetail = data?.detail || '';
     } else if (currentStage === data?.name) {
       currentStage = '';
+      currentStagePhase = '';
       currentStageLabel = '';
       currentStageDetail = '';
       stageStartedAt = 0;
@@ -1610,6 +1614,7 @@ async function runDigestSSE(req, res, body) {
     if (currentStage) {
       sendEvent('stage', {
         name: currentStage,
+        phase: currentStagePhase,
         label: currentStageLabel || (currentStage === 'summarizing' ? 'AI 总结' : (currentStage === 'fetching' ? '拉取消息' : '处理中')),
         status: 'running',
         detail: progressDetail(),
@@ -1637,6 +1642,15 @@ async function runDigestSSE(req, res, body) {
       filters: body.filters || {},
       min_messages: body.min_messages,
       signal: controller.signal,
+      onProgress: progress => {
+        sendStage({
+          name: 'fetching',
+          phase: progress?.phase || '',
+          label: progress?.label || '拉取消息',
+          status: 'running',
+          detail: progress?.detail || '',
+        });
+      },
     });
     ensureActive();
     sendStage({
@@ -1697,6 +1711,7 @@ async function runDigestSSE(req, res, body) {
       onProgress: progress => {
         sendStage({
           name: 'summarizing',
+          phase: progress?.phase || '',
           label: progress?.label || 'AI 总结',
           status: 'running',
           detail: progress?.detail || '',

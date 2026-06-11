@@ -58,6 +58,13 @@ function notifyProgress(onProgress, data) {
 async function withAiRequestSlot({ signal = null, onProgress = null, label = 'AI 总结 · 等待 AI', detail = '等待 AI 队列空闲', limit = CONFIGURED_AI_REQUEST_CONCURRENCY } = {}, action) {
   const release = await acquireAiRequestSlot({ signal, onProgress, label, detail, limit });
   try {
+    notifyProgress(onProgress, {
+      phase: 'ai_request',
+      label: label.includes('等待') ? label.replace('等待', '请求') : label,
+      detail: detail
+        .replace('等待模型请求', '正在请求模型')
+        .replace('等待 AI 队列空闲', '已获得 AI 队列名额'),
+    });
     return await action();
   } finally {
     release();
