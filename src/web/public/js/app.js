@@ -2764,29 +2764,8 @@ async function renderHistory() {
   $empty.classList.add('hidden');
   const itemById = new Map(list.map(item => [String(item.digest_id || ''), item]));
   const searchById = new Map(list.map(item => [String(item.digest_id || ''), historySearchText(item)]));
-  $grid.innerHTML = list
-    .map(it => {
-      const version = historyItemCacheBust(it);
-      const fileMissing = it.file_exists === false;
-      return `
-        <div class="history-item ${fileMissing ? 'file-missing' : ''}" data-id="${escapeHtml(it.digest_id)}">
-          <div class="history-thumb">${fileMissing ? '<span class="history-missing-label">长图文件缺失</span>' : `<img loading="lazy" decoding="async" src="${historyThumbUrl(it.digest_id, version)}" alt="${escapeHtml(it.group)}" />`}</div>
-          <div class="history-meta">
-            <div class="gname">${escapeHtml(it.group)}</div>
-            <div class="time">${escapeHtml(it.since)} ~ ${escapeHtml(it.until)}</div>
-            <div class="time muted">${escapeHtml(it.model)} · ${it.message_count || 0} 条${fileMissing ? ' · 长图缺失' : ''}</div>
-          </div>
-        </div>`;
-    }).join('');
-  document.querySelectorAll('.history-thumb img').forEach(img => {
-    const thumb = img.closest('.history-thumb');
-    const markLoaded = () => thumb?.classList.add('loaded');
-    const markError = () => thumb?.classList.add('error');
-    img.addEventListener('load', markLoaded, { once: true });
-    img.addEventListener('error', markError, { once: true });
-    if (img.complete && img.naturalWidth > 0) markLoaded();
-    else if (img.complete) markError();
-  });
+  $grid.innerHTML = list.map(it => historyCardHtml(it)).join('');
+  document.querySelectorAll('.history-thumb img').forEach(watchHistoryThumbnailImage);
   const historyCards = [...document.querySelectorAll('.history-item')];
   historyCards.forEach(el => {
     el.addEventListener('click', () => {
@@ -2823,14 +2802,90 @@ function historyItemCacheBust(item = {}) {
   return item.rerendered_at || item.created_at || item.file_path || item.digest_id || '';
 }
 
+function historyArtifactState(item = {}) {
+  return {
+    fileMissing: item.file_exists === false,
+    digestMissing: item.digest_exists === false,
+  };
+}
+
+function historyMetaStatusHtml(item = {}) {
+  const { fileMissing, digestMissing } = historyArtifactState(item);
+  const bits = [`${Number(item.message_count || 0) || 0} 条`];
+  if (fileMissing) bits.push('长图缺失');
+  if (digestMissing) bits.push('原摘要缺失');
+  const model = String(item.model || '').trim();
+  return `${model ? `${escapeHtml(model)} · ` : ''}${bits.map(escapeHtml).join(' · ')}`;
+}
+
+function historyThumbHtml(item = {}, version = historyItemCacheBust(item)) {
+  const { fileMissing } = historyArtifactState(item);
+  if (fileMissing) return '<span class="history-missing-label">长图文件缺失</span>';
+  return `<img loading="lazy" decoding="async" src="${historyThumbUrl(item.digest_id, version)}" alt="${escapeHtml(item.group)}" />`;
+}
+
+function historyCardHtml(item = {}) {
+  const { fileMissing, digestMissing } = historyArtifactState(item);
+  return `
+        <div class="history-item ${fileMissing ? 'file-missing' : ''} ${digestMissing ? 'digest-missing' : ''}" data-id="${escapeHtml(item.digest_id)}">
+          <div class="history-thumb">${historyThumbHtml(item)}</div>
+          <div class="history-meta">
+            <div class="gname">${escapeHtml(item.group)}</div>
+            <div class="time">${escapeHtml(item.since)} ~ ${escapeHtml(item.until)}</div>
+            <div class="time muted" data-history-status>${historyMetaStatusHtml(item)}</div>
+          </div>
+        </div>`;
+}
+
+function watchHistoryThumbnailImage(img) {
+  const thumb = img?.closest?.('.history-thumb');
+  if (!img || !thumb) return;
+  const markLoaded = () => thumb.classList.add('loaded');
+  const markError = () => thumb.classList.add('error');
+  img.addEventListener('load', markLoaded, { once: true });
+  img.addEventListener('error', markError, { once: true });
+  if (img.complete && img.naturalWidth > 0) markLoaded();
+  else if (img.complete) markError();
+}
+
+function updateHistoryCardItem(item = {}) {
+  const card = [...document.querySelectorAll('.history-item')]
+    .find(el => String(el.dataset.id || '') === String(item.digest_id || ''));
+  if (!card) return;
+  const { fileMissing, digestMissing } = historyArtifactState(item);
+  card.classList.toggle('file-missing', fileMissing);
+  card.classList.toggle('digest-missing', digestMissing);
+  const thumb = card.querySelector('.history-thumb');
+  if (thumb) {
+    thumb.classList.remove('loaded', 'error');
+    thumb.innerHTML = historyThumbHtml(item, Date.now());
+    const img = thumb.querySelector('img');
+    if (img) watchHistoryThumbnailImage(img);
+  }
+  const meta = card.querySelector('[data-history-status]');
+  if (meta) meta.innerHTML = historyMetaStatusHtml(item);
+}
+
+function historyArtifactNote(item = {}) {
+  const { fileMissing, digestMissing } = historyArtifactState(item);
+  if (fileMissing && digestMissing) return '长图文件和原摘要 JSON 均已不存在，无法重新渲染；请回到总结页重新生成。';
+  if (fileMissing) return '长图文件已不存在，可以重新渲染或回到总结页重新生成。';
+  if (digestMissing) return '原摘要 JSON 已不存在，不能重新渲染；现有 PNG 仍可下载、复制或打开。';
+  return '';
+}
+
 function showHistoryModal(item) {
   const imageUrl = historyImageUrl(item.digest_id, historyItemCacheBust(item));
   const serverRerenderSupported = supportsServerRerender();
-  const canRerender = serverRerenderSupported;
-  const fileMissing = item.file_exists === false;
-  const rerenderTitle = serverRerenderSupported
-      ? ''
-      : '当前系统不支持历史重新渲染；请回到总结页重新生成摘要长图';
+  const { fileMissing, digestMissing } = historyArtifactState(item);
+  const canRerender = serverRerenderSupported && !digestMissing;
+  const rerenderTitle = !serverRerenderSupported
+      ? '当前系统不支持历史重新渲染；请回到总结页重新生成摘要长图'
+      : (digestMissing ? '原摘要 JSON 已不存在，不能重新渲染；现有 PNG 可继续下载、复制或打开' : '');
+  const artifactNote = historyArtifactNote(item);
+  const artifactNoteHtml = artifactNote
+    ? `<div class="missing-image-note ${fileMissing ? '' : 'warning'}">${escapeHtml(artifactNote)}</div>`
+    : '';
   const modal = document.createElement('div');
   modal.className = 'modal-backdrop';
   modal.innerHTML = `
@@ -2839,8 +2894,9 @@ function showHistoryModal(item) {
         <strong>${escapeHtml(item.group)}</strong>
         <button class="icon-btn" data-close>×</button>
       </div>
-      <div class="modal-body">
-        ${fileMissing ? '<div class="missing-image-note">长图文件已不存在，可以重新渲染或回到总结页重新生成。</div>' : `<img data-zoomable src="${imageUrl}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`}
+      <div class="modal-body ${artifactNote ? 'has-note' : ''}">
+        ${artifactNoteHtml}
+        ${fileMissing ? '' : `<img data-zoomable src="${imageUrl}" alt="${escapeHtml(item.group)}" title="点击查看 100%" />`}
       </div>
       <div class="preview-actions">
         <a class="btn" data-download href="${imageUrl}" download>⬇ 下载 PNG</a>
@@ -2956,6 +3012,7 @@ function showHistoryModal(item) {
           Object.assign(item, r.item || {});
           const freshUrl = historyImageUrl(item.digest_id, Date.now());
           item.file_exists = true;
+          item.digest_exists = true;
           ensureHistoryModalImage(freshUrl);
           watchHistoryImage();
           if (image) image.src = freshUrl;
@@ -2963,6 +3020,8 @@ function showHistoryModal(item) {
           downloadButton.setAttribute('download', '');
           downloadButton.classList.remove('disabled');
           restoreImageActions();
+          modalBody.classList.remove('has-note');
+          updateHistoryCardItem(item);
           return r;
         },
       });
@@ -3479,6 +3538,8 @@ async function renderSettings() {
   setDurationControl('s-scheduler-window', s.scheduler.digest_window || '4h', '4h');
   document.getElementById('s-scheduler-min').value = s.scheduler.min_messages_per_digest ?? 30;
   const schedulerStatus = document.getElementById('s-scheduler-status');
+  let schedulerStatusSeq = 0;
+  let schedulerBusy = false;
   function schedulerDetailLabel(detail) {
     const map = {
       scheduler_disabled: '定时任务未启用',
@@ -3487,41 +3548,104 @@ async function renderSettings() {
       already_running: '已有检查正在运行',
       below_minimum: '消息数低于阈值',
       no_new_messages: '没有新消息',
+      no_matching_filters: '筛选条件无匹配消息',
+      account_groups_failed: '读取群列表失败',
+      error: '检查失败',
     };
     return map[detail] || detail || '';
   }
-  function paintSchedulerStatus(status = {}) {
+  function schedulerItemsSummary(items = []) {
+    const counts = new Map();
+    const examples = new Map();
+    for (const item of Array.isArray(items) ? items : []) {
+      if (item?.generated) continue;
+      const detail = item?.error ? 'error' : item?.detail;
+      if (!detail) continue;
+      counts.set(detail, (counts.get(detail) || 0) + 1);
+      if (!examples.has(detail)) examples.set(detail, []);
+      const list = examples.get(detail);
+      const name = item.group || item.account || item.group_id || item.account_id || '';
+      if (name && list.length < 2) list.push(String(name));
+    }
+    return [...counts.entries()].map(([detail, count]) => {
+      const names = examples.get(detail) || [];
+      const sample = names.length ? `：${names.join('、')}${count > names.length ? ' 等' : ''}` : '';
+      return `${schedulerDetailLabel(detail)} ${count}${sample}`;
+    }).join('；');
+  }
+  function schedulerStatusClass(status = {}) {
+    const r = status.last_result || {};
+    if (status.last_error || r.error || Number(r.failed || 0) > 0) return 'status err';
+    const warningDetails = new Set([
+      'llm_not_configured',
+      'no_whitelisted_groups',
+      'already_running',
+      'scheduler_disabled',
+      'below_minimum',
+      'no_matching_filters',
+    ]);
+    const details = [
+      r.detail,
+      ...(Array.isArray(r.items) ? r.items.map(item => item?.detail) : []),
+    ].filter(Boolean);
+    if (r.ok === false || details.some(detail => warningDetails.has(detail))) return 'status warn';
+    return 'status';
+  }
+  function schedulerStatusWithImmediateResult(status = {}, result = null) {
+    if (!result) return status || {};
+    const lastResult = result.detail || result.generated !== undefined || result.skipped || result.error
+      ? result
+      : status?.last_result;
+    return { ...(status || {}), last_result: lastResult || status?.last_result };
+  }
+  function paintSchedulerStatus(status = {}, { immediateResult = null } = {}) {
+    const view = schedulerStatusWithImmediateResult(status, immediateResult);
     const bits = [];
-    bits.push(status.enabled ? '已启用' : '未启用');
-    if (status.running) bits.push('运行中');
-    if (status.next_run_at) bits.push(`下次 ${new Date(status.next_run_at).toLocaleString()}`);
-    if (status.last_result) {
-      const r = status.last_result;
+    bits.push(view.enabled ? '已启用' : '未启用');
+    if (view.running) bits.push('运行中');
+    if (view.next_run_at) bits.push(`下次 ${new Date(view.next_run_at).toLocaleString()}`);
+    if (view.last_result) {
+      const r = view.last_result;
       if (r.generated !== undefined) {
+        const itemSummary = schedulerItemsSummary(r.items);
         const detail = [
           `生成 ${r.generated || 0}`,
           r.checked !== undefined ? `检查 ${r.checked}` : '',
           r.skipped ? `跳过 ${r.skipped}` : '',
           r.failed ? `失败 ${r.failed}` : '',
           r.detail ? schedulerDetailLabel(r.detail) : '',
+          itemSummary,
         ].filter(Boolean).join(' / ');
         bits.push(`上次 ${detail}`);
       } else if (r.detail) {
         bits.push(`上次 ${schedulerDetailLabel(r.detail)}`);
+      } else if (r.error) {
+        bits.push(`上次失败：${r.error}`);
       }
     }
-    if (status.last_error) bits.push(`错误：${status.last_error}`);
-    schedulerStatus.className = status.last_error ? 'status err' : 'status';
+    if (view.last_error) bits.push(`错误：${view.last_error}`);
+    schedulerStatus.className = schedulerStatusClass(view);
     schedulerStatus.textContent = bits.join(' · ');
   }
+  function setSchedulerActionBusy(value) {
+    schedulerBusy = !!value;
+    schedulerStatusSeq++;
+  }
+  function setSchedulerStatusFromBackground(status) {
+    if (schedulerBusy) return;
+    paintSchedulerStatus(status);
+  }
+  const schedulerInitialSeq = schedulerStatusSeq;
   api('/api/scheduler/status')
     .then(r => {
       if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-scheduler-status')) return;
-      paintSchedulerStatus(r.scheduler);
+      if (schedulerStatusSeq !== schedulerInitialSeq) return;
+      setSchedulerStatusFromBackground(r.scheduler);
     })
     .catch(() => {
       if (settingsRouteSeq !== _routeSeq || !document.getElementById('s-scheduler-status')) return;
-      paintSchedulerStatus({ enabled: !!s.scheduler.enabled });
+      if (schedulerStatusSeq !== schedulerInitialSeq) return;
+      setSchedulerStatusFromBackground({ enabled: !!s.scheduler.enabled });
     });
   const saveGroupsButton = document.getElementById('s-save-groups');
   const runSchedulerButton = document.getElementById('s-run-scheduler');
@@ -3577,6 +3701,7 @@ async function renderSettings() {
     });
   }
   saveGroupsButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
+    setSchedulerActionBusy(true);
     schedulerStatus.className = 'status';
     schedulerStatus.textContent = groupsLoaded ? '保存中...' : '保存中（保留原白名单）...';
     try {
@@ -3588,19 +3713,24 @@ async function renderSettings() {
     } catch (e) {
       schedulerStatus.className = 'status err';
       schedulerStatus.textContent = '✗ 保存失败：' + e.message;
+    } finally {
+      setSchedulerActionBusy(false);
     }
   }));
   runSchedulerButton.addEventListener('click', () => withBusyButtons([saveGroupsButton, runSchedulerButton], async () => {
+    setSchedulerActionBusy(true);
     schedulerStatus.className = 'status';
     schedulerStatus.textContent = groupsLoaded ? '先保存当前设置，再检查...' : '先保存当前设置（保留原白名单），再检查...';
     try {
       await saveSchedulerSettings();
       schedulerStatus.textContent = '检查中...';
       const r = await api('/api/scheduler/run-once', { method: 'POST', body: {} });
-      paintSchedulerStatus(r.scheduler);
+      paintSchedulerStatus(r.scheduler, { immediateResult: r.result });
     } catch (e) {
       schedulerStatus.className = 'status err';
       schedulerStatus.textContent = '✗ ' + e.message;
+    } finally {
+      setSchedulerActionBusy(false);
     }
   }));
   saveGroupsButton.disabled = false;
@@ -3764,6 +3894,36 @@ async function renderSettings() {
   savePrivacyButton.disabled = false;
   exportDiagButton.disabled = false;
 
+  function acceptanceStatusLabel(status) {
+    const map = {
+      needs_user_confirmation: '待人工确认',
+      passed: '已通过',
+      failed: '未通过',
+    };
+    return map[status] || status || '';
+  }
+  function softwareEvidenceLabel(status) {
+    const map = {
+      external_baseline_matched: '外部基线已匹配',
+      external_baseline_after_service_start: '外部基线晚于本轮启动',
+      ready_for_external_baseline_check: '工具内证据就绪，仍需外部基线',
+      software_evidence_incomplete: '软件证据不完整',
+      ready_for_user_confirmation: '证据已就绪，待人工确认',
+      waiting_for_24h_uptime: '等待服务连续运行满 24 小时',
+      ready_for_user_paste_confirmation: '复制证据已就绪，待人工粘贴确认',
+      needs_local_copy_action: '需要先执行复制 PNG',
+      explorer_selection_matched: '文件管理器选中证据已匹配',
+      reveal_requested_needs_visual_confirmation: '已请求打开文件夹，待目测确认',
+      needs_local_reveal_action: '需要先执行在文件夹中显示',
+      bad_secret_detected_external_user_needed: '坏密钥证据已出现，仍需跨用户确认',
+      needs_bad_secret_or_external_user_test: '需要坏密钥或跨用户测试',
+    };
+    return map[status] || status || '';
+  }
+  function acceptanceStateLabel(item = {}) {
+    return item.ready_for_user_confirmation ? '证据已就绪，待人工确认' : '等待软件证据';
+  }
+
   async function refreshAcceptanceChecks() {
     const $list = document.getElementById('s-acceptance-checks');
     const $st = document.getElementById('s-acceptance-status');
@@ -3782,8 +3942,9 @@ async function renderSettings() {
       }
       $list.innerHTML = checks.map(item => {
         const ready = !!item.ready_for_user_confirmation;
-        const stateLabel = ready ? '软件证据就绪' : '等待软件证据';
-        const summary = item.software_evidence_summary || item.software_evidence_status || '';
+        const stateLabel = acceptanceStateLabel(item);
+        const evidenceLabel = softwareEvidenceLabel(item.software_evidence_status);
+        const summary = item.software_evidence_summary || evidenceLabel || '';
         const next = item.next_step || '';
         return `
           <article class="acceptance-check ${ready ? 'ready' : 'pending'}">
@@ -3798,7 +3959,7 @@ async function renderSettings() {
       }).join('');
       const readyCount = checks.filter(item => item.ready_for_user_confirmation).length;
       $st.className = readyCount === checks.length ? 'status ok' : 'status warn';
-      $st.textContent = `已读取 ${checks.length} 项，${readyCount} 项软件证据就绪`;
+      $st.textContent = `已读取 ${checks.length} 项，${readyCount} 项证据已就绪，仍需逐项人工确认`;
     } catch (e) {
       $list.innerHTML = '<p class="empty">诊断状态读取失败。</p>';
       $st.className = 'status err';
@@ -3819,8 +3980,8 @@ async function renderSettings() {
     ];
     for (const item of checks) {
       lines.push(`### ${item.id || ''} ${item.title || ''}`.trim());
-      lines.push(`- 状态：${item.status || ''}`);
-      lines.push(`- 软件证据：${item.software_evidence_status || ''}`);
+      lines.push(`- 状态：${acceptanceStatusLabel(item.status)}${item.status ? ` (${item.status})` : ''}`);
+      lines.push(`- 软件证据：${softwareEvidenceLabel(item.software_evidence_status)}${item.software_evidence_status ? ` (${item.software_evidence_status})` : ''}`);
       lines.push(`- 是否可人工确认：${item.ready_for_user_confirmation ? '是' : '否'}`);
       if (item.software_evidence_summary) lines.push(`- 证据摘要：${item.software_evidence_summary}`);
       if (item.next_step) lines.push(`- 下一步：${item.next_step}`);
