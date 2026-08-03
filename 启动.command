@@ -4,10 +4,14 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
-# Terminal 双击 .command 时 PATH 可能没有 Homebrew / nvm。
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# Terminal 双击 .command 时 PATH 可能没有 Homebrew / nvm；
+# Homebrew 的版本化 Node LTS 公式可能是 keg-only，所以也补 opt 路径。
+export PATH="/opt/homebrew/opt/node@24/bin:/usr/local/opt/node@24/bin:/opt/homebrew/opt/node@22/bin:/usr/local/opt/node@22/bin:/opt/homebrew/opt/node@20/bin:/usr/local/opt/node@20/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# nvm/asdf 启动脚本可能读取未设置变量；source 时暂时关闭 nounset，避免双击启动中断。
+set +u
 [ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
 [ -s "$HOME/.asdf/asdf.sh" ] && . "$HOME/.asdf/asdf.sh"
+set -u
 
 pause_exit() {
   echo
@@ -30,8 +34,8 @@ if [ "${NODE_MAJOR:-0}" -lt 20 ]; then
   exit 1
 fi
 
-if [ ! -d "node_modules" ]; then
-  echo "首次启动：正在安装依赖，请稍候..."
+if ! node scripts/check-dependencies.mjs >/dev/null 2>&1; then
+  echo "依赖缺失、过期或与当前 Node.js 不兼容，正在自动安装..."
   if command -v npm >/dev/null 2>&1; then
     npm ci
   elif command -v corepack >/dev/null 2>&1; then
@@ -43,6 +47,11 @@ if [ ! -d "node_modules" ]; then
   fi
   if [ $? -ne 0 ]; then
     echo "依赖安装失败，请检查网络后重试。"
+    pause_exit
+    exit 1
+  fi
+  if ! node scripts/check-dependencies.mjs --write-stamp; then
+    echo "依赖安装后验证失败，请检查 Node.js 版本后重试。"
     pause_exit
     exit 1
   fi

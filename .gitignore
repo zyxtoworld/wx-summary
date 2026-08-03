@@ -18,22 +18,20 @@ pnpm-debug.log*
 /temp/
 /.cache/
 
-# wx-summary local-only audit material and generated screenshots.
+# Internal work material and generated screenshots.
 /微信群消息总结-需求文档.md
-/验收-记录微信哈希.cmd
-/tests/
-/docs/
-/scripts/capture-weixin-binary-evidence.mjs
+/superpowers/
+/docs/**
+!/docs/
+!/docs/用户手册.md
+!/docs/macOS使用指南.md
+/scripts/collect-macos-acceptance-evidence.mjs
 /scripts/generate-doc-screenshots.ps1
-/scripts/install-githooks.mjs
 /scripts/open-existing-server.ps1
-/.githooks/
-/docs/验收记录.md
-/docs/完成度审计.md
-/docs/开发者笔记.md
 /docs/assets/
 
 # Local environment and credentials
+/.claude/
 .env
 .env.*
 !.env.example

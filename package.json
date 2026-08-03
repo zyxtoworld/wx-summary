@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@signalapp/sqlcipher": "^3.3.5",
-    "koffi": "^3.0.2"
+    "koffi": "^3.0.2",
+    "pngjs": "^7.0.0"
   }
 }

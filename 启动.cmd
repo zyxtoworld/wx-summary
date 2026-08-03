@@ -21,32 +21,23 @@ if %NODE_MAJOR% LSS 20 (
   exit /b 1
 )
 
+set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%POWERSHELL_EXE%" (
+  echo Trusted Windows PowerShell was not found.
+  pause > nul
+  exit /b 1
+)
+"%POWERSHELL_EXE%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\ensure-dependencies.ps1"
+if errorlevel 1 (
+  echo Dependency setup failed. Check the message above and retry.
+  pause > nul
+  exit /b 1
+)
+
 if /i "%~1"=="--console" (
   node src\main.js
   exit /b %errorlevel%
 )
 
-if not exist "node_modules\" (
-  title wx-summary setup
-  echo First start: installing dependencies...
-  where npm > nul 2> nul
-  if not errorlevel 1 (
-    call npm ci
-  ) else (
-    where corepack > nul 2> nul
-    if errorlevel 1 (
-      echo npm/corepack not found. Please install Node.js 20+.
-      pause > nul
-      exit /b 1
-    )
-    call corepack npm ci
-  )
-  if errorlevel 1 (
-    echo Dependency install failed. Check network and retry.
-    pause > nul
-    exit /b 1
-  )
-)
-
-start "" "%SystemRoot%\System32\wscript.exe" //B "%~dp0scripts\start-tray-hidden.vbs"
+start "" "%SystemRoot%\System32\wscript.exe" "%~dp0scripts\start-tray-hidden.vbs"
 exit /b 0

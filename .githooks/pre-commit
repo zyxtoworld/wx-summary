@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+
+changed_files="$(mktemp)"
+impl_files="$(mktemp)"
+secret_scan_files="$(mktemp)"
+trap 'rm -f "$changed_files" "$impl_files" "$secret_scan_files"' EXIT
+
+git diff --cached --name-only -z --diff-filter=ACMR > "$changed_files"
+tr '\0' '\n' < "$changed_files" | grep -E '^(src/|scripts/|启动\.cmd$|启动\.command$|package(-lock)?\.json$)' | tr '\n' '\0' > "$impl_files" || true
+tr '\0' '\n' < "$changed_files" | grep -Ev '^(tests/|outputs/|node_modules/|data/(settings\.json|secrets\.bin)$)' | tr '\n' '\0' > "$secret_scan_files" || true
+
+blocked_paths="$(tr '\0' '\n' < "$changed_files" \
+  | grep -Ev '^data/settings\.example\.json$' \
+  | grep -E '(^data/|^outputs/|^node_modules/|^logs/|^tmp/|^temp/|^\.cache/|^docs/assets/|(^|/)secrets?([./_-]|$)|\.app(/|$)|\.(key|pem|p12|pfx|db|sqlite|sqlite3|db-journal|db-shm|db-wal|sqlite-journal|sqlite-shm|sqlite-wal|dump|log|tmp|bak|old|png|jpe?g|webp|gif|bmp|tiff?|heic|heif|svgz|mp4|mov|m4v|avi|mkv|webm|mp3|wav|m4a|aac|flac|ogg|amr|silk|dat|wxgf|zip|7z|rar|tar|tgz|gz|dmg|pkg|msi|exe)$)' || true)"
+if [ -n "$blocked_paths" ]; then
+  echo "pre-commit: runtime, media, package or secret path staged:" >&2
+  echo "$blocked_paths" >&2
+  exit 1
+fi
+
+large_files="$(tr '\0' '\n' < "$changed_files" | while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  case "$file" in
+    assets/fonts/*) continue ;;
+  esac
+  size="$(git cat-file -s ":$file" 2>/dev/null || echo 0)"
+  if [ "$size" -gt 5242880 ]; then
+    echo "$file ($size bytes)"
+  fi
+done)"
+if [ -n "$large_files" ]; then
+  echo "pre-commit: staged binary/file exceeds 5 MB:" >&2
+  echo "$large_files" >&2
+  exit 1
+fi
+
+if [ -s "$impl_files" ] && xargs -0 grep -I -nE 'WriteProcessMemory|CreateRemoteThread|SetWindowsHookEx|VirtualAllocEx|PROCESS_VM_WRITE|PROCESS_VM_OPERATION|PROCESS_CREATE_THREAD' < "$impl_files" 2>/dev/null; then
+  echo "pre-commit: forbidden WeChat process mutation API detected" >&2
+  exit 1
+fi
+
+if [ -s "$secret_scan_files" ] && xargs -0 grep -I -nE 'sk-[A-Za-z0-9_-]{20,}|[a-fA-F0-9]{64}|[a-fA-F0-9]{96}' < "$secret_scan_files" 2>/dev/null; then
+  echo "pre-commit: possible secret detected" >&2
+  exit 1
+fi

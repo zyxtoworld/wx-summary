@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const PROTECT_SCRIPT = `
 Add-Type -AssemblyName System.Security
@@ -23,6 +25,7 @@ const MAC_ENVELOPE_VERSION = 1;
 const COMMAND_TIMEOUT_MS = 15000;
 const COMMAND_OUTPUT_LIMIT = 1024 * 1024;
 let winDpapi = null;
+let macKeychainNative = null;
 
 async function loadWinDpapi() {
   if (winDpapi) return winDpapi;
@@ -59,9 +62,23 @@ function appendLimited(current, chunk) {
   return next;
 }
 
-function runPowerShell(script, stdin, preferPwsh = true, timeoutMs = COMMAND_TIMEOUT_MS) {
+function windowsPowerShellExecutablePath() {
+  const root = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+  return [
+    path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    path.join(root, 'SysWOW64', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+  ].find(file => {
+    try { return fs.existsSync(file); } catch { return false; }
+  }) || '';
+}
+
+function runPowerShell(script, stdin, timeoutMs = COMMAND_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const exe = preferPwsh ? 'pwsh' : 'powershell';
+    const exe = windowsPowerShellExecutablePath();
+    if (!exe) {
+      reject(new Error('trusted Windows PowerShell is unavailable'));
+      return;
+    }
     const args = ['-NoProfile', '-NonInteractive', '-Command', script];
     const child = spawn(exe, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     let settled = false;
@@ -81,11 +98,7 @@ function runPowerShell(script, stdin, preferPwsh = true, timeoutMs = COMMAND_TIM
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (preferPwsh && error?.code === 'ENOENT') {
-        runPowerShell(script, stdin, false, timeoutMs).then(resolve, reject);
-      } else {
-        reject(error);
-      }
+      reject(error);
     });
     child.on('close', code => {
       if (settled) return;
@@ -93,8 +106,6 @@ function runPowerShell(script, stdin, preferPwsh = true, timeoutMs = COMMAND_TIM
       clearTimeout(timer);
       if (code === 0) {
         resolve(out);
-      } else if (preferPwsh) {
-        runPowerShell(script, stdin, false, timeoutMs).then(resolve, reject);
       } else {
         reject(new Error((err || `PowerShell exited with ${code}`).trim()));
       }
@@ -103,63 +114,115 @@ function runPowerShell(script, stdin, preferPwsh = true, timeoutMs = COMMAND_TIM
   });
 }
 
-function runCommand(file, args, stdin = '', timeoutMs = COMMAND_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(new Error(`${file} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    child.stdout.setEncoding('utf-8');
-    child.stderr.setEncoding('utf-8');
-    child.stdout.on('data', chunk => { out = appendLimited(out, chunk); });
-    child.stderr.on('data', chunk => { err = appendLimited(err, chunk); });
-    child.on('error', error => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on('close', code => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) resolve(out);
-      else reject(new Error((err || out || `${file} exited with ${code}`).trim()));
-    });
-    child.stdin.end(stdin, 'utf-8');
-  });
+function macKeychainStatusError(action = 'Keychain operation', status = 0) {
+  const error = new Error(`${action} failed with OSStatus ${Number(status) || 0}`);
+  error.mac_keychain_status = Number(status) || 0;
+  return error;
 }
 
-async function getMacKeychainKey() {
-  try {
-    const existing = (await runCommand('security', [
-      'find-generic-password',
-      '-a', MAC_KEYCHAIN_ACCOUNT,
-      '-s', MAC_KEYCHAIN_SERVICE,
-      '-w',
-    ])).trim();
-    if (existing) return crypto.createHash('sha256').update(existing, 'utf-8').digest();
-  } catch {}
+function macKeychainItemMissing(error = null) {
+  return Number(error?.mac_keychain_status) === -25300;
+}
 
-  const secret = crypto.randomBytes(32).toString('base64url');
-  await runCommand('security', [
-    'add-generic-password',
-    '-a', MAC_KEYCHAIN_ACCOUNT,
-    '-s', MAC_KEYCHAIN_SERVICE,
-    '-w', secret,
-    '-U',
-  ]);
-  return crypto.createHash('sha256').update(secret, 'utf-8').digest();
+function macKeychainItemDuplicate(error = null) {
+  return Number(error?.mac_keychain_status) === -25299;
+}
+
+function markSecretProtectionUnavailable(error, code = 'SECRET_PROTECTION_UNAVAILABLE') {
+  const out = error instanceof Error ? error : new Error(String(error || 'secret protection provider unavailable'));
+  out.secret_protection_code = code;
+  out.secret_protection_unavailable = true;
+  out.preserve_encrypted_file = true;
+  return out;
+}
+
+function markMacKeychainUnavailable(error, code = 'MAC_KEYCHAIN_UNAVAILABLE') {
+  return markSecretProtectionUnavailable(error, code);
+}
+
+async function loadMacKeychainNative() {
+  if (macKeychainNative) return macKeychainNative;
+  const koffi = (await import('koffi')).default;
+  const security = koffi.load('/System/Library/Frameworks/Security.framework/Security');
+  macKeychainNative = {
+    koffi,
+    SecKeychainFindGenericPassword: security.func('int SecKeychainFindGenericPassword(void *keychainOrArray, uint32_t serviceNameLength, const char *serviceName, uint32_t accountNameLength, const char *accountName, _Out_ uint32_t *passwordLength, _Out_ void **passwordData, void **itemRef)'),
+    SecKeychainAddGenericPassword: security.func('int SecKeychainAddGenericPassword(void *keychain, uint32_t serviceNameLength, const char *serviceName, uint32_t accountNameLength, const char *accountName, uint32_t passwordLength, const void *passwordData, void **itemRef)'),
+    SecKeychainItemFreeContent: security.func('int SecKeychainItemFreeContent(void *attrList, void *data)'),
+  };
+  return macKeychainNative;
+}
+
+async function findMacKeychainSecret() {
+  const service = Buffer.from(MAC_KEYCHAIN_SERVICE, 'utf-8');
+  const account = Buffer.from(MAC_KEYCHAIN_ACCOUNT, 'utf-8');
+  try {
+    const api = await loadMacKeychainNative();
+    const passwordLength = [0];
+    const passwordData = [null];
+    const status = api.SecKeychainFindGenericPassword(
+      null,
+      service.length,
+      service,
+      account.length,
+      account,
+      passwordLength,
+      passwordData,
+      null,
+    );
+    if (status !== 0) throw macKeychainStatusError('macOS Keychain read', status);
+    let existing = '';
+    try {
+      const byteLength = Math.max(0, Number(passwordLength[0] || 0) || 0);
+      if (passwordData[0] && byteLength) {
+        existing = Buffer.from(api.koffi.decode(passwordData[0], 'uint8_t', byteLength)).toString('utf-8');
+      }
+    } finally {
+      if (passwordData[0]) api.SecKeychainItemFreeContent(null, passwordData[0]);
+    }
+    if (!existing) throw markMacKeychainUnavailable(new Error('macOS Keychain wrapping key is empty'), 'MAC_KEYCHAIN_KEY_EMPTY');
+    return existing;
+  } catch (error) {
+    if (macKeychainItemMissing(error)) return '';
+    throw markMacKeychainUnavailable(error);
+  }
+}
+
+async function getMacKeychainKey({ createIfMissing = false } = {}) {
+  const existing = await findMacKeychainSecret();
+  if (existing) return crypto.createHash('sha256').update(existing, 'utf-8').digest();
+  if (!createIfMissing) {
+    throw markMacKeychainUnavailable(new Error('macOS Keychain wrapping key is missing'), 'MAC_KEYCHAIN_KEY_MISSING');
+  }
+
+  const secret = crypto.randomBytes(32);
+  const service = Buffer.from(MAC_KEYCHAIN_SERVICE, 'utf-8');
+  const account = Buffer.from(MAC_KEYCHAIN_ACCOUNT, 'utf-8');
+  try {
+    const api = await loadMacKeychainNative();
+    const status = api.SecKeychainAddGenericPassword(
+      null,
+      service.length,
+      service,
+      account.length,
+      account,
+      secret.length,
+      secret,
+      null,
+    );
+    if (status !== 0) throw macKeychainStatusError('macOS Keychain write', status);
+  } catch (error) {
+    if (macKeychainItemDuplicate(error)) {
+      const raced = await findMacKeychainSecret();
+      if (raced) return crypto.createHash('sha256').update(raced, 'utf-8').digest();
+    }
+    throw markMacKeychainUnavailable(error);
+  }
+  return crypto.createHash('sha256').update(secret).digest();
 }
 
 async function protectTextMac(text) {
-  const key = await getMacKeychainKey();
+  const key = await getMacKeychainKey({ createIfMissing: true });
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const data = Buffer.concat([cipher.update(String(text), 'utf-8'), cipher.final()]);
@@ -179,7 +242,7 @@ async function unprotectTextMac(buffer) {
   if (envelope?.version !== MAC_ENVELOPE_VERSION || envelope?.platform !== 'darwin-keychain' || envelope?.alg !== 'aes-256-gcm') {
     throw new Error('unsupported macOS secret envelope');
   }
-  const key = await getMacKeychainKey();
+  const key = await getMacKeychainKey({ createIfMissing: false });
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv || '', 'base64'));
   decipher.setAuthTag(Buffer.from(envelope.tag || '', 'base64'));
   return Buffer.concat([
@@ -231,16 +294,33 @@ export async function protectText(text) {
   }
 }
 
+export function secretProtectionUnavailable(error = null) {
+  return error?.secret_protection_unavailable === true || error?.preserve_encrypted_file === true;
+}
+
 export async function unprotectToText(buffer) {
   if (process.platform === 'darwin') {
     return unprotectTextMac(buffer);
   }
   if (process.platform !== 'win32') {
-    throw new Error('DPAPI is only available on Windows');
+    throw markSecretProtectionUnavailable(new Error('DPAPI is only available on Windows'), 'SECRET_PROTECTION_PLATFORM_UNAVAILABLE');
   }
+  let nativeError = null;
   try {
     return await unprotectTextWin(buffer);
-  } catch {
-    return runPowerShell(UNPROTECT_SCRIPT, Buffer.from(buffer).toString('base64'));
+  } catch (error) {
+    nativeError = error;
+  }
+  try {
+    return await runPowerShell(UNPROTECT_SCRIPT, Buffer.from(buffer).toString('base64'));
+  } catch (fallbackError) {
+    const error = markSecretProtectionUnavailable(
+      new Error('Windows DPAPI is temporarily unavailable or could not decrypt the preserved secret file.'),
+      'WINDOWS_DPAPI_UNAVAILABLE',
+    );
+    error.native_error = nativeError?.message || String(nativeError || '');
+    error.fallback_error = fallbackError?.message || String(fallbackError || '');
+    error.cause = fallbackError;
+    throw error;
   }
 }

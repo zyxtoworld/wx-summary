@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { DATA_DIR } from '../lib/paths.js';
-import { discoverDataRoots, discoverWxAccounts, getWeixinProcesses } from '../wxenv/discovery.js';
+import { discoverDataRoots, discoverWxAccounts, getWeixinProcesses, isConfirmedMainWeixinProcess, pickAccount, preferredWeixinProcess } from '../wxenv/discovery.js';
 import { imageKeyValidationCount } from '../wxdb/image-dat.js';
 
 const READ_ACCESS = 0x0010;
@@ -23,11 +23,22 @@ const PAGE_NOACCESS = 0x01;
 const DEFAULT_SCAN_LIMIT_BYTES = 512 * 1024 * 1024;
 const DEFAULT_IMAGE_SCAN_LIMIT_BYTES = 1024 * 1024 * 1024;
 const DEFAULT_REGION_LIMIT_BYTES = 64 * 1024 * 1024;
+export const STANDARD_WEIXIN_KEY_SCAN_MAX_MS = 3 * 60 * 1000;
+const DEFAULT_VERIFIED_KEY_SCAN_MAX_MS = STANDARD_WEIXIN_KEY_SCAN_MAX_MS;
 const CHUNK_BYTES = 1024 * 1024;
+const WXKEY_SCAN_YIELD_EVERY_CHUNKS = 4;
+const WXKEY_CODEC_CONTEXT_YIELD_EVERY_WORDS = 32 * 1024;
+const WXKEY_SCAN_PROGRESS_BYTES = 16 * 1024 * 1024;
+const WXKEY_PRIORITY_PROCESS_SHARE = 0.6;
+const WXKEY_MIN_PROCESS_SCAN_MS = 1_000;
 const RAW_KEY_TEXT_CARRY_CHARS = 512;
 const MAX_RAW_KEY_CANDIDATES = 512;
 const MAX_SALT_KEY_CANDIDATES = 4096;
 const MAX_SALT_KEY_CANDIDATES_HARD_LIMIT = 65536;
+const WEIXIN_V4_KEY_BYTES = 32;
+const WEIXIN_V4_PASSPHRASE_KDF_ITER = 256000;
+const WEIXIN_V4_VERIFIED_PASSPHRASE_DERIVE_CANDIDATE_LIMIT = 96;
+const WEIXIN_V4_VERIFIED_POINTER_DERIVE_CANDIDATE_LIMIT = MAX_RAW_KEY_CANDIDATES;
 const SALT_NEIGHBOR_BYTES = 160;
 const ANCHOR_NEIGHBOR_BYTES = 256;
 const SALT_POINTER_NEIGHBOR_BYTES = 96;
@@ -56,12 +67,64 @@ const WEIXIN_V4_KEY_POINTER_PATTERN = Buffer.from([
 const LOCAL_KEY_SCAN_MAX_FILES = 2000;
 const LOCAL_KEY_SCAN_MAX_FILE_BYTES = 4 * 1024 * 1024;
 const LOCAL_KEY_SCAN_CACHE_MS = 5 * 60 * 1000;
-const LOCAL_KEY_SCAN_ALLOWED_EXTENSIONS = new Set(['', '.ini', '.json', '.xml', '.txt', '.log', '.cfg', '.conf', '.config', '.dat', '.mmkv', '.db-shm', '.db-wal']);
-const LOCAL_KEY_SCAN_SKIP_DIRS = /^(cache|image|video|file|attach|voice|audio|cdn|thumb|log)$/i;
+const LOCAL_KEY_SCAN_ALLOWED_EXTENSIONS = new Set(['', '.ini', '.json', '.xml', '.txt', '.log', '.cfg', '.conf', '.config', '.dat', '.mmkv']);
+const LOCAL_KEY_SCAN_SKIP_DIRS = /^(cache|image|video|file|attach|voice|audio|cdn|thumb|log|db_storage|wxdb-mirror)$/i;
 
 let localKeyScanCache = { at: 0, signature: '', result: null };
 
 let ffi = null;
+
+function wxKeyErrorSummary(error = null) {
+  const code = String(error?.code || '').trim();
+  const message = String(error?.message || String(error || '')).replace(/[a-f0-9]{64,}/ig, '[redacted-key]').replace(/\s+/g, ' ').trim();
+  return [code, message].filter(Boolean).join(': ').slice(0, 180);
+}
+
+function rememberLocalKeyScanWarning(warnings, stage, error = null) {
+  if (!Array.isArray(warnings)) return;
+  if (warnings.length >= 8) return;
+  warnings.push({
+    stage: String(stage || 'local_key_scan').trim() || 'local_key_scan',
+    error: wxKeyErrorSummary(error) || 'unknown error',
+  });
+}
+
+function localKeyScanWarningSummary(warnings = []) {
+  const list = Array.isArray(warnings) ? warnings.filter(item => item?.error) : [];
+  return {
+    warning_count: list.length,
+    warnings: list,
+    first_warning: list[0]?.error || '',
+  };
+}
+
+function isMissingLocalKeyPathError(error = null) {
+  return String(error?.code || '').trim() === 'ENOENT';
+}
+
+function platformPathIdentity(value = '') {
+  const text = String(value || '').trim();
+  return process.platform === 'win32' ? text.toLowerCase() : text;
+}
+
+function wxKeyAbortError() {
+  return Object.assign(new Error('密钥扫描已取消'), { name: 'AbortError', status: 499 });
+}
+
+function throwIfWxKeyAborted(signal) {
+  if (signal?.aborted) throw (signal.reason instanceof Error ? signal.reason : wxKeyAbortError());
+}
+
+async function yieldWxKeyScan({ signal = null, deadline = 0 } = {}) {
+  await new Promise(resolve => setImmediate(resolve));
+  throwIfWxKeyAborted(signal);
+  return !!deadline && Date.now() >= deadline;
+}
+
+function notifyWxKeyScanProgress(options = {}, data = {}) {
+  if (typeof options.on_progress !== 'function') return;
+  try { options.on_progress(data); } catch {}
+}
 
 async function loadKernel32() {
   if (ffi) return ffi;
@@ -105,6 +168,7 @@ export async function probeWxKey({
   include_raw = false,
   scan_max_bytes = 0,
   scan_max_region_bytes = 0,
+  scan_max_ms = 0,
   scan_include_mapped = false,
   scan_writable_only = true,
   v4_pointer_max_candidates = 0,
@@ -150,23 +214,44 @@ export async function probeWxKey({
   image_scan_max_bytes = 0,
   image_scan_max_ms = 0,
   image_include_mapped = false,
+  signal = null,
 } = {}) {
-  const processes = await getWeixinProcesses();
-  const main = processes.find(p => p.is_main);
-  if (!main) {
+  throwIfWxKeyAborted(signal);
+  const processes = await getWeixinProcesses({ signal });
+  throwIfWxKeyAborted(signal);
+  const processEnumerationFailed = processes.process_enumeration_failed === true;
+  const processEnumerationError = String(processes.process_enumeration_error || '').trim();
+  const processGeneration = wxKeyProcessGeneration(processes);
+  if (processEnumerationFailed) {
+    return {
+      ok: false,
+      stage: 'process_enumeration',
+      reason: `无法枚举微信进程，不能把探测失败当成“微信未运行”${processEnumerationError ? `：${processEnumerationError}` : ''}`,
+      process_count: 0,
+      process_generation: processGeneration,
+      process_enumeration_failed: true,
+      process_enumeration_error: processEnumerationError,
+      scan_process_count: 0,
+    };
+  }
+  const orderedProcesses = orderWeixinProcessesForKeyScan(processes);
+  const primary = preferredWeixinProcess(orderedProcesses);
+  if (!primary) {
     return {
       ok: false,
       stage: 'process',
       reason: missingWeixinProcessMessage(processes.length),
       process_count: processes.length,
+      process_generation: processGeneration,
     };
   }
   if (process.platform !== 'win32') {
     return {
       ok: false,
       stage: 'unsupported_platform',
-      process: { pid: main.pid, path: main.path },
+      process: { pid: primary.pid, path: primary.path },
       process_count: processes.length,
+      process_generation: processGeneration,
       scan_process_count: 0,
       reason: process.platform === 'darwin'
         ? 'Mac 微信内存自动密钥扫描尚未适配，请填写手动数据库密钥。'
@@ -174,74 +259,121 @@ export async function probeWxKey({
     };
   }
 
-  const targets = scan_all_processes ? orderedWeixinScanProcesses(processes, main) : [main];
+  const targets = scan_all_processes ? orderedProcesses : [primary];
   const accessibleTargets = [];
   const accessErrors = [];
   for (const target of targets) {
+    throwIfWxKeyAborted(signal);
     const access = await verifyReadOnlyProcessAccess(target.pid);
     if (access.ok) accessibleTargets.push(target);
     else accessErrors.push({ pid: target.pid, type: weixinProcessType(target), error: access.error || 'open failed' });
   }
-  if (!accessibleTargets.some(p => p.pid === main.pid)) {
+  if (!accessibleTargets.length) {
     return {
       ok: false,
       stage: 'open_process',
-      process: { pid: main.pid, path: main.path },
+      process: { pid: primary.pid, path: primary.path },
       process_count: processes.length,
+      process_generation: processGeneration,
       scan_process_count: accessibleTargets.length,
       access_errors: accessErrors,
-      reason: accessErrors.find(e => e.pid === main.pid)?.error || '只读打开 Weixin.exe 失败。',
+      reason: accessErrors.find(e => e.pid === primary.pid)?.error || '只读打开 Weixin.exe 失败。',
     };
   }
 
   const result = {
     ok: false,
     stage: 'read_only_handle',
-    process: { pid: main.pid, path: main.path },
+    process: { pid: accessibleTargets[0].pid, path: accessibleTargets[0].path },
     process_count: processes.length,
+    process_generation: processGeneration,
     scan_all_processes: !!scan_all_processes,
     scan_process_count: accessibleTargets.length,
+    main_process_confirmed: isConfirmedMainWeixinProcess(primary),
     scan_processes: accessibleTargets.map(redactProcessForDiagnostics),
     ...(accessErrors.length ? { access_errors: accessErrors } : {}),
     access_mask: `0x${SAFE_ACCESS.toString(16)}`,
     read_only_handle_ok: true,
     candidate_count: 0,
-    reason: scan_all_processes ? '已验证可用只读权限打开 Weixin 进程。' : '已验证可用只读权限打开主进程。',
+    reason: scan_all_processes ? '已验证可用只读权限打开 Weixin 进程。' : '已验证可用只读权限打开首选 Weixin 进程。',
   };
   if (scan) {
     const aggregate = createScanAggregate();
     const perProcess = [];
-    for (const target of accessibleTargets) {
-      const scanResult = await scanProcessForRawKeyCandidates(target.pid, {
+    const rawScanMaxMs = normalizeScanMaxMs(scan_max_ms);
+    const rawScanDeadline = rawScanMaxMs ? Date.now() + rawScanMaxMs : 0;
+    let rawScanTimedOut = false;
+    let rawScanAttempts = 0;
+    for (const [targetIndex, target] of accessibleTargets.entries()) {
+      throwIfWxKeyAborted(signal);
+      const remainingScanMs = rawScanDeadline ? rawScanDeadline - Date.now() : 0;
+      if (rawScanDeadline && remainingScanMs < 1_000) {
+        rawScanTimedOut = true;
+        break;
+      }
+      rawScanAttempts++;
+      const processMaxMs = rawScanDeadline
+        ? allocateSharedProcessScanMs(remainingScanMs, accessibleTargets.length - targetIndex, {
+          priority: targetIndex === 0 && shouldPrioritizeWeixinProcessScan(target),
+        })
+        : 0;
+      const scanResult = await scanProcessWithIsolation(result, target, 'raw_key_scan', signal, () => scanProcessForRawKeyCandidates(target.pid, {
         include_raw,
         max_bytes: scan_max_bytes || undefined,
         max_region_bytes: scan_max_region_bytes || undefined,
+        max_ms: processMaxMs || undefined,
         include_mapped: scan_include_mapped === true,
         writable_only: scan_writable_only !== false,
         v4_pointer_max_candidates: v4_pointer_max_candidates || undefined,
-      });
+        signal,
+      }));
+      if (!scanResult) continue;
       mergeScanAggregate(aggregate, scanResult);
       perProcess.push(processScanSummary(target, scanResult));
+      if (scanResult.timed_out === true) {
+        rawScanTimedOut = true;
+      }
     }
     result.stage = 'scan';
-    result.scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: accessibleTargets.length };
+    result.scan_process_attempt_count = rawScanAttempts;
+    result.scan_process_count = perProcess.length;
+    result.scan_mode = { ...(perProcess[0]?.scan_mode || {}), max_ms: rawScanMaxMs || 0, process_count: perProcess.length, target_count: accessibleTargets.length };
     result.raw_scan_processes = perProcess;
     result.candidate_count = aggregate.candidate_count;
     result.unique_candidate_count = aggregate.uniqueCount();
+    result.v4_pointer_pattern_hit_count = perProcess.reduce((sum, item) => sum + Number(item.v4_pointer_pattern_hit_count || 0), 0);
+    result.v4_pointer_pattern_candidate_count = perProcess.reduce((sum, item) => sum + Number(item.v4_pointer_pattern_candidate_count || 0), 0);
     result.scanned_bytes = aggregate.scanned_bytes;
     result.region_count = aggregate.region_count;
     result.candidate_hashes = aggregate.hashes();
-    if (include_raw) result._raw_candidates = aggregate.raws();
-    result.reason = result.unique_candidate_count
-      ? '已找到 raw key 形态候选；仍需 SQLCipher 验证以匹配数据库。'
-      : '未找到 raw key 形态候选。';
+    result.scan_timed_out = rawScanTimedOut;
+    result.scan_timeout_scope = rawScanMaxMs ? 'shared_all_processes' : '';
+    if (rawScanMaxMs) result.scan_timeout_ms = rawScanMaxMs;
+    if (rawScanTimedOut) result.scan_incomplete = true;
+    if (include_raw) {
+      result._raw_v4_pointer_candidates = aggregate.priorityRaws();
+      result._raw_candidates = aggregate.raws();
+    }
+    result.reason = rawScanTimedOut
+      ? (result.unique_candidate_count
+        ? '自动扫描达到共享时间上限，已公平检查可读微信进程并保留已读取范围内的数据库密钥/口令形态候选。'
+        : '自动扫描达到共享时间上限，已公平检查可读微信进程；未命中不能视为数据库密钥不存在。')
+      : (result.unique_candidate_count
+      ? (result.scan_incomplete
+        ? '已从部分可读微信进程找到数据库密钥/口令形态候选；其他进程扫描失败，候选仍需 SQLCipher 验证。'
+        : '已找到数据库密钥/口令形态候选；仍需 SQLCipher 验证以匹配数据库。')
+      : (result.scan_incomplete
+        ? (perProcess.length
+          ? '部分微信进程扫描失败；可读进程中未找到数据库密钥/口令形态候选。'
+          : '所有目标微信进程都在扫描期间变得不可读，未完成密钥候选扫描。')
+        : '未找到数据库密钥/口令形态候选。'));
   }
   if (scan_db_salts?.length) {
     const aggregate = createScanAggregate();
     const perProcess = [];
     let saltHitCount = 0;
     for (const target of accessibleTargets) {
-      const dbKeyResult = await scanProcessForDbSaltKeyCandidates(target.pid, {
+      const dbKeyResult = await scanProcessWithIsolation(result, target, 'db_salt_scan', signal, () => scanProcessForDbSaltKeyCandidates(target.pid, {
         db_salts: scan_db_salts,
         include_raw: include_db_raw,
         max_bytes: db_scan_max_bytes || undefined,
@@ -252,13 +384,15 @@ export async function probeWxKey({
         reverse_pointer_max_hits: db_reverse_pointer_max_hits || undefined,
         include_mapped: true,
         writable_only: false,
-      });
+        signal,
+      }));
+      if (!dbKeyResult) continue;
       saltHitCount += Number(dbKeyResult.salt_hit_count || 0);
       mergeScanAggregate(aggregate, dbKeyResult);
       perProcess.push(processScanSummary(target, dbKeyResult, { salt_hit_count: dbKeyResult.salt_hit_count || 0 }));
     }
     result.stage = 'scan';
-    result.db_salt_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: accessibleTargets.length };
+    result.db_salt_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: perProcess.length, target_count: accessibleTargets.length };
     result.db_salt_scan_processes = perProcess;
     result.db_salt_hit_count = saltHitCount;
     result.db_salt_candidate_count = aggregate.candidate_count;
@@ -276,7 +410,7 @@ export async function probeWxKey({
     const perProcess = [];
     let anchorHitCount = 0;
     for (const target of accessibleTargets) {
-      const anchorResult = await scanProcessForAnchorKeyCandidates(target.pid, {
+      const anchorResult = await scanProcessWithIsolation(result, target, 'anchor_scan', signal, () => scanProcessForAnchorKeyCandidates(target.pid, {
         anchors: scan_memory_anchors,
         include_raw: include_anchor_raw,
         max_bytes: anchor_scan_max_bytes || undefined,
@@ -289,7 +423,9 @@ export async function probeWxKey({
         reverse_pointer_max_hits: anchor_reverse_pointer_max_hits || undefined,
         include_mapped: true,
         writable_only: false,
-      });
+        signal,
+      }));
+      if (!anchorResult) continue;
       anchorHitCount += Number(anchorResult.anchor_hit_count || 0);
       mergeScanAggregate(aggregate, anchorResult);
       perProcess.push(processScanSummary(target, anchorResult, {
@@ -299,7 +435,7 @@ export async function probeWxKey({
       }));
     }
     result.stage = 'scan';
-    result.anchor_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: accessibleTargets.length };
+    result.anchor_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: perProcess.length, target_count: accessibleTargets.length };
     result.anchor_scan_processes = perProcess;
     result.anchor_hit_count = anchorHitCount;
     result.anchor_candidate_count = aggregate.candidate_count;
@@ -317,8 +453,9 @@ export async function probeWxKey({
     if (addressTargets.length) {
       const aggregate = createScanAggregate();
       const perProcess = [];
-      for (const target of accessibleTargets.filter(p => p.pid === main.pid)) {
-        const addressResult = await scanProcessForPointerTargetKeyCandidates(target.pid, {
+      const addressScanTargets = accessibleTargets.slice(0, 1);
+      for (const target of addressScanTargets) {
+        const addressResult = await scanProcessWithIsolation(result, target, 'anchor_address_scan', signal, () => scanProcessForPointerTargetKeyCandidates(target.pid, {
           target_addresses: addressTargets,
           include_raw: include_anchor_address_raw,
           max_bytes: anchor_address_scan_max_bytes || anchor_reverse_pointer_max_bytes || undefined,
@@ -330,14 +467,16 @@ export async function probeWxKey({
           reverse_pointer_high_entropy_targets: anchor_address_reverse_pointer_high_entropy_targets,
           second_hop_reverse_pointers: anchor_address_second_hop_reverse_pointers,
           include_mapped: true,
-        });
+          signal,
+        }));
+        if (!addressResult) continue;
         mergeScanAggregate(aggregate, addressResult);
         perProcess.push(processScanSummary(target, addressResult, {
           anchor_address_target_count: addressResult.target_address_count || 0,
         }));
       }
       result.stage = 'scan';
-      result.anchor_address_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: perProcess.length };
+      result.anchor_address_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: perProcess.length, target_count: addressScanTargets.length };
       result.anchor_address_scan_processes = perProcess;
       result.anchor_address_target_count = addressTargets.length;
       result.anchor_address_candidate_count = aggregate.candidate_count;
@@ -356,7 +495,7 @@ export async function probeWxKey({
     let codecContextHitCount = 0;
     let codecSaltMatchCount = 0;
     for (const target of accessibleTargets) {
-      const codecResult = await scanProcessForCodecContextKeyCandidates(target.pid, {
+      const codecResult = await scanProcessWithIsolation(result, target, 'codec_context_scan', signal, () => scanProcessForCodecContextKeyCandidates(target.pid, {
         db_salts: scan_codec_salts,
         include_raw: include_codec_raw,
         max_bytes: codec_scan_max_bytes || undefined,
@@ -364,7 +503,9 @@ export async function probeWxKey({
         max_candidates: codec_scan_max_candidates || undefined,
         include_mapped: codec_scan_include_mapped === true,
         writable_only: codec_scan_writable_only !== false,
-      });
+        signal,
+      }));
+      if (!codecResult) continue;
       codecContextHitCount += Number(codecResult.codec_context_hit_count || 0);
       codecSaltMatchCount += Number(codecResult.codec_context_salt_match_count || 0);
       mergeScanAggregate(aggregate, codecResult);
@@ -378,7 +519,7 @@ export async function probeWxKey({
       }));
     }
     result.stage = 'scan';
-    result.codec_context_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: accessibleTargets.length };
+    result.codec_context_scan_mode = { ...(perProcess[0]?.scan_mode || {}), process_count: perProcess.length, target_count: accessibleTargets.length };
     result.codec_context_scan_processes = perProcess;
     result.codec_context_hit_count = codecContextHitCount;
     result.codec_context_salt_match_count = codecSaltMatchCount;
@@ -393,15 +534,21 @@ export async function probeWxKey({
   if (scan_image) {
     const aggregate = createScanAggregate();
     const perProcess = [];
+    const imageScanDeadline = image_scan_max_ms ? Date.now() + Math.max(1000, Number(image_scan_max_ms)) : 0;
     for (const target of accessibleTargets) {
-      const imageResult = await scanProcessForImageKeyCandidates(target.pid, {
+      throwIfWxKeyAborted(signal);
+      if (imageScanDeadline && Date.now() >= imageScanDeadline) break;
+      const remainingImageScanMs = imageScanDeadline ? Math.max(1000, imageScanDeadline - Date.now()) : 0;
+      const imageResult = await scanProcessWithIsolation(result, target, 'image_key_scan', signal, () => scanProcessForImageKeyCandidates(target.pid, {
         validation_samples: image_samples,
         include_raw: include_image_raw,
         max_bytes: image_scan_max_bytes || undefined,
-        max_ms: image_scan_max_ms || undefined,
+        max_ms: remainingImageScanMs || undefined,
         include_mapped: image_include_mapped,
         stop_after_found: true,
-      });
+        signal,
+      }));
+      if (!imageResult) continue;
       mergeScanAggregate(aggregate, imageResult);
       perProcess.push(processScanSummary(target, imageResult));
       if (imageResult.unique_candidate_count && image_samples?.length) break;
@@ -417,6 +564,20 @@ export async function probeWxKey({
     if (result.image_unique_candidate_count) result.reason = '已找到可解开图片样本的图片 key 候选。';
   }
   return result;
+}
+
+export async function currentWxKeyProcessGeneration({ signal = null } = {}) {
+  throwIfWxKeyAborted(signal);
+  const processes = await getWeixinProcesses({ signal });
+  throwIfWxKeyAborted(signal);
+  return {
+    process_generation: wxKeyProcessGeneration(processes),
+    process_count: processes.length,
+    main_process_present: processes.some(isConfirmedMainWeixinProcess),
+    preferred_process_present: !!preferredWeixinProcess(processes),
+    process_enumeration_failed: processes.process_enumeration_failed === true,
+    process_enumeration_error: String(processes.process_enumeration_error || '').trim(),
+  };
 }
 
 function missingWeixinProcessMessage(processCount = 0) {
@@ -444,12 +605,34 @@ export async function verifyReadOnlyProcessAccess(pid) {
 
 export async function scanLocalWeixinKeyCandidates({
   include_raw = false,
+  account_id = '',
   max_files = LOCAL_KEY_SCAN_MAX_FILES,
   max_file_bytes = LOCAL_KEY_SCAN_MAX_FILE_BYTES,
   cache = true,
+  signal = null,
 } = {}) {
-  const roots = await localKeyCandidateRoots();
-  const signature = JSON.stringify({ roots, max_files: Number(max_files || 0), max_file_bytes: Number(max_file_bytes || 0) });
+  throwIfWxKeyAborted(signal);
+  const roots = await localKeyCandidateRoots({ signal, account_id });
+  const rootWarnings = Array.isArray(roots._local_key_scan_warnings) ? roots._local_key_scan_warnings : [];
+  throwIfWxKeyAborted(signal);
+  const normalizedMaxFiles = normalizePositiveLimit(max_files, LOCAL_KEY_SCAN_MAX_FILES);
+  const normalizedMaxFileBytes = normalizePositiveLimit(max_file_bytes, LOCAL_KEY_SCAN_MAX_FILE_BYTES);
+  const fingerprint = await localKeyScanFingerprint(roots, {
+    max_files: normalizedMaxFiles,
+    max_file_bytes: normalizedMaxFileBytes,
+    signal,
+  });
+  throwIfWxKeyAborted(signal);
+  const fingerprintWarnings = Array.isArray(fingerprint.warnings) ? fingerprint.warnings : [];
+  const scanWarnings = [...rootWarnings, ...fingerprintWarnings].slice(0, 8);
+  const signature = JSON.stringify({
+    roots,
+    max_files: normalizedMaxFiles,
+    max_file_bytes: normalizedMaxFileBytes,
+    fingerprint: fingerprint.hash,
+    warning_count: scanWarnings.length,
+    first_warning: scanWarnings[0]?.error || '',
+  });
   if (cache && localKeyScanCache.result && localKeyScanCache.signature === signature && Date.now() - localKeyScanCache.at < LOCAL_KEY_SCAN_CACHE_MS) {
     return include_raw ? localKeyScanCache.result : publicLocalKeyScanResult(localKeyScanCache.result);
   }
@@ -459,21 +642,60 @@ export async function scanLocalWeixinKeyCandidates({
     skipped_large: 0,
     skipped_ext: 0,
     read_errors: 0,
+    stat_errors: 0,
+    dir_errors: 0,
     with_candidates: 0,
   };
   const byExt = {};
   const seenFiles = new Set();
-  for (const root of roots) {
+  const priorityRootCount = Math.max(0, Math.min(roots.length, Number(roots._local_key_priority_root_count || 0) || 0));
+  const priorityBudget = priorityRootCount > 0
+    ? Math.max(priorityRootCount, Math.floor(normalizedMaxFiles / 2))
+    : 0;
+  const priorityRootBudget = priorityRootCount > 0 ? Math.max(1, Math.floor(priorityBudget / priorityRootCount)) : 0;
+  for (const root of roots.slice(0, priorityRootCount)) {
+    throwIfWxKeyAborted(signal);
+    const rootLimit = Math.min(normalizedMaxFiles, fileStats.scanned + priorityRootBudget);
     await scanLocalKeyRoot(root, rawSet, fileStats, byExt, seenFiles, {
-      max_files: normalizePositiveLimit(max_files, LOCAL_KEY_SCAN_MAX_FILES),
-      max_file_bytes: normalizePositiveLimit(max_file_bytes, LOCAL_KEY_SCAN_MAX_FILE_BYTES),
+      max_files: rootLimit,
+      max_file_bytes: normalizedMaxFileBytes,
+      signal,
+      warnings: scanWarnings,
     });
-    if (fileStats.scanned >= normalizePositiveLimit(max_files, LOCAL_KEY_SCAN_MAX_FILES)) break;
+    if (fileStats.scanned >= normalizedMaxFiles) break;
   }
+  fileStats.priority_roots = priorityRootCount;
+  fileStats.priority_scanned = fileStats.scanned;
+  for (const root of roots) {
+    throwIfWxKeyAborted(signal);
+    await scanLocalKeyRoot(root, rawSet, fileStats, byExt, seenFiles, {
+      max_files: normalizedMaxFiles,
+      max_file_bytes: normalizedMaxFileBytes,
+      signal,
+      warnings: scanWarnings,
+    });
+    if (fileStats.scanned >= normalizedMaxFiles) break;
+  }
+  const warningSummary = localKeyScanWarningSummary(scanWarnings);
+  const scanIncomplete = fingerprint.truncated === true
+    || warningSummary.warning_count > 0
+    || fileStats.read_errors > 0
+    || fileStats.stat_errors > 0
+    || fileStats.dir_errors > 0;
   const result = {
-    ok: true,
+    ok: !scanIncomplete,
     stage: 'local_key_scan',
+    incomplete: scanIncomplete,
     root_count: roots.length,
+    warning_count: warningSummary.warning_count,
+    warnings: warningSummary.warnings,
+    first_warning: warningSummary.first_warning,
+    cache_fingerprint: {
+      hash_12: fingerprint.hash.slice(0, 12),
+      file_count: fingerprint.file_count,
+      truncated: fingerprint.truncated,
+      warning_count: Number(fingerprint.warning_count || 0) || 0,
+    },
     file_stats: fileStats,
     by_ext: byExt,
     candidate_count: rawSet.size,
@@ -481,48 +703,179 @@ export async function scanLocalWeixinKeyCandidates({
     candidate_hashes: [...rawSet].slice(0, 64).map(raw => crypto.createHash('sha256').update(raw).digest('hex').slice(0, 12)),
     ...(include_raw ? { raw_candidates: [...rawSet] } : {}),
   };
-  localKeyScanCache = {
-    at: Date.now(),
-    signature,
-    result: { ...result, raw_candidates: [...rawSet] },
-  };
+  if (!scanIncomplete) {
+    localKeyScanCache = {
+      at: Date.now(),
+      signature,
+      result: { ...result, raw_candidates: [...rawSet] },
+    };
+  }
   return include_raw ? result : publicLocalKeyScanResult(result);
 }
 
-async function localKeyCandidateRoots() {
-  const roots = [];
-  const dataRoots = await discoverDataRoots().catch(() => []);
+export function clearLocalWeixinKeyScanCache() {
+  localKeyScanCache = { at: 0, signature: '', result: null };
+}
+
+async function localKeyCandidateRoots({ signal = null, account_id = '' } = {}) {
+  throwIfWxKeyAborted(signal);
+  const priorityRoots = [];
+  const broadRoots = [];
+  const warnings = [];
+  let dataRoots = [];
+  try {
+    dataRoots = await discoverDataRoots({ signal });
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    rememberLocalKeyScanWarning(warnings, 'discover_data_roots', e);
+  }
+  throwIfWxKeyAborted(signal);
   for (const root of dataRoots || []) {
-    roots.push(path.join(root, 'xwechat_files', 'all_users'));
-    roots.push(path.join(root, 'all_users'));
+    priorityRoots.push(path.join(root, 'xwechat_files', 'all_users'));
+    priorityRoots.push(path.join(root, 'all_users'));
   }
-  const accounts = await discoverWxAccounts().catch(() => []);
-  for (const account of accounts || []) {
-    if (account?.account_root) roots.push(account.account_root);
-  }
-  roots.push(DATA_DIR);
+  if (process.env.APPDATA) priorityRoots.push(path.join(process.env.APPDATA, 'Tencent', 'xwechat', 'config'));
+  priorityRoots.push(DATA_DIR);
   if (process.env.HOME) {
-    roots.push(path.join(process.env.HOME, '.wx-cli'));
-    roots.push(path.join(process.env.HOME, '.wechat-mcp'));
+    priorityRoots.push(path.join(process.env.HOME, '.wx-cli'));
+    priorityRoots.push(path.join(process.env.HOME, '.wechat-mcp'));
   }
-  if (process.env.APPDATA) roots.push(path.join(process.env.APPDATA, 'Tencent', 'xwechat', 'config'));
+  let accounts = [];
+  try {
+    accounts = await discoverWxAccounts({ signal });
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    rememberLocalKeyScanWarning(warnings, 'discover_accounts', e);
+  }
+  throwIfWxKeyAborted(signal);
+  const selectedAccount = pickAccount(accounts || [], account_id);
+  if (selectedAccount?.account_root) broadRoots.push(selectedAccount.account_root);
+  for (const account of accounts || []) {
+    if (account?.account_root) broadRoots.push(account.account_root);
+  }
   const out = [];
   const seen = new Set();
-  for (const root of roots.filter(Boolean)) {
-    const key = root.toLowerCase();
+  let priorityCount = 0;
+  for (const [rootIndex, root] of [...priorityRoots, ...broadRoots].filter(Boolean).entries()) {
+    throwIfWxKeyAborted(signal);
+    const key = platformPathIdentity(root);
     if (seen.has(key)) continue;
     seen.add(key);
-    const st = await fsp.stat(root).catch(() => null);
-    if (st?.isDirectory()) out.push(root);
+    let st = null;
+    try {
+      st = await fsp.stat(root);
+    } catch (e) {
+      if (!isMissingLocalKeyPathError(e)) rememberLocalKeyScanWarning(warnings, 'stat_root', e);
+    }
+    if (st?.isDirectory()) {
+      out.push(root);
+      if (rootIndex < priorityRoots.length) priorityCount += 1;
+    }
   }
+  out._local_key_scan_warnings = warnings;
+  out._local_key_priority_root_count = priorityCount;
   return out;
+}
+
+async function localKeyScanFingerprint(roots = [], options = {}) {
+  const entries = [];
+  const seen = new Set();
+  const warnings = [];
+  let truncated = false;
+  const maxFiles = normalizePositiveLimit(options.max_files, LOCAL_KEY_SCAN_MAX_FILES);
+  const priorityRootCount = Math.max(0, Math.min(roots.length, Number(roots._local_key_priority_root_count || 0) || 0));
+  const priorityBudget = priorityRootCount > 0 ? Math.max(priorityRootCount, Math.floor(maxFiles / 2)) : 0;
+  const priorityRootBudget = priorityRootCount > 0 ? Math.max(1, Math.floor(priorityBudget / priorityRootCount)) : 0;
+  for (const root of roots.slice(0, priorityRootCount)) {
+    throwIfWxKeyAborted(options.signal);
+    await collectLocalKeyFingerprintRoot(root, entries, seen, {
+      ...options,
+      max_files: Math.min(maxFiles, entries.length + priorityRootBudget),
+      warnings,
+    });
+    if (entries.length >= maxFiles) break;
+  }
+  for (const root of roots || []) {
+    throwIfWxKeyAborted(options.signal);
+    await collectLocalKeyFingerprintRoot(root, entries, seen, { ...options, max_files: maxFiles, warnings });
+    if (entries.length >= maxFiles) {
+      truncated = true;
+      break;
+    }
+  }
+  entries.sort((a, b) => a.localeCompare(b));
+  return {
+    hash: crypto.createHash('sha256').update(JSON.stringify(entries)).digest('hex'),
+    file_count: entries.length,
+    truncated,
+    warning_count: warnings.length,
+    warnings,
+  };
+}
+
+async function collectLocalKeyFingerprintRoot(root, entries, seen, options = {}) {
+  const stack = [root];
+  const maxFiles = normalizePositiveLimit(options.max_files, LOCAL_KEY_SCAN_MAX_FILES);
+  const maxFileBytes = normalizePositiveLimit(options.max_file_bytes, LOCAL_KEY_SCAN_MAX_FILE_BYTES);
+  const rootReal = await fsp.realpath(root).catch(() => path.resolve(root));
+  while (stack.length && entries.length < maxFiles) {
+    throwIfWxKeyAborted(options.signal);
+    const dir = stack.pop();
+    let list = [];
+    try {
+      list = await fsp.readdir(dir, { withFileTypes: true });
+    } catch (e) {
+      if (!isMissingLocalKeyPathError(e)) rememberLocalKeyScanWarning(options.warnings, 'fingerprint_readdir', e);
+      continue;
+    }
+    for (const entry of list) {
+      throwIfWxKeyAborted(options.signal);
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (LOCAL_KEY_SCAN_SKIP_DIRS.test(entry.name)) continue;
+        stack.push(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const ext = path.extname(full).toLowerCase();
+      if (ext === '.db' || ext === '.sqlite' || ext === '.sqlite3' || !LOCAL_KEY_SCAN_ALLOWED_EXTENSIONS.has(ext)) continue;
+      const key = platformPathIdentity(full);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let st = null;
+      try {
+        st = await fsp.stat(full);
+      } catch (e) {
+        if (!isMissingLocalKeyPathError(e)) rememberLocalKeyScanWarning(options.warnings, 'fingerprint_stat', e);
+      }
+      if (!st?.isFile() || st.size > maxFileBytes) continue;
+      const relative = path.relative(rootReal, path.resolve(full)).split(path.sep).join('/');
+      entries.push([
+        relative,
+        st.size,
+        st.mtimeMs,
+        st.ctimeMs,
+      ].join(':'));
+      if (entries.length >= maxFiles) break;
+    }
+  }
 }
 
 async function scanLocalKeyRoot(root, rawSet, fileStats, byExt, seenFiles, options) {
   const stack = [root];
   while (stack.length && fileStats.scanned < options.max_files) {
+    throwIfWxKeyAborted(options.signal);
     const dir = stack.pop();
-    const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+    let entries = [];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch (e) {
+      if (!isMissingLocalKeyPathError(e)) {
+        fileStats.dir_errors++;
+        rememberLocalKeyScanWarning(options.warnings, 'scan_readdir', e);
+      }
+      continue;
+    }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
@@ -531,6 +884,7 @@ async function scanLocalKeyRoot(root, rawSet, fileStats, byExt, seenFiles, optio
         continue;
       }
       if (!entry.isFile()) continue;
+      throwIfWxKeyAborted(options.signal);
       await scanLocalKeyFile(full, rawSet, fileStats, byExt, seenFiles, options);
       if (fileStats.scanned >= options.max_files) break;
     }
@@ -538,7 +892,8 @@ async function scanLocalKeyRoot(root, rawSet, fileStats, byExt, seenFiles, optio
 }
 
 async function scanLocalKeyFile(file, rawSet, fileStats, byExt, seenFiles, options) {
-  const key = file.toLowerCase();
+  throwIfWxKeyAborted(options.signal);
+  const key = platformPathIdentity(file);
   if (seenFiles.has(key)) return;
   seenFiles.add(key);
   const ext = path.extname(file).toLowerCase();
@@ -546,7 +901,15 @@ async function scanLocalKeyFile(file, rawSet, fileStats, byExt, seenFiles, optio
     fileStats.skipped_ext++;
     return;
   }
-  const st = await fsp.stat(file).catch(() => null);
+  let st = null;
+  try {
+    st = await fsp.stat(file);
+  } catch (e) {
+    if (!isMissingLocalKeyPathError(e)) {
+      fileStats.stat_errors++;
+      rememberLocalKeyScanWarning(options.warnings, 'scan_stat', e);
+    }
+  }
   if (!st?.isFile()) return;
   if (st.size > options.max_file_bytes) {
     fileStats.skipped_large++;
@@ -555,8 +918,11 @@ async function scanLocalKeyFile(file, rawSet, fileStats, byExt, seenFiles, optio
   let buf;
   try {
     buf = await fsp.readFile(file);
-  } catch {
+    throwIfWxKeyAborted(options.signal);
+  } catch (e) {
+    if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : wxKeyAbortError();
     fileStats.read_errors++;
+    rememberLocalKeyScanWarning(options.warnings, 'scan_read', e);
     return;
   }
   fileStats.scanned++;
@@ -584,7 +950,7 @@ function normalizePositiveLimit(value, fallback) {
   return Math.max(1, Math.floor(n));
 }
 
-function orderedWeixinScanProcesses(processes, main) {
+export function orderWeixinProcessesForKeyScan(processes, main = null) {
   const out = [];
   const seen = new Set();
   const add = (process) => {
@@ -592,9 +958,36 @@ function orderedWeixinScanProcesses(processes, main) {
     seen.add(process.pid);
     out.push(process);
   };
-  add(main);
-  for (const process of processes || []) add(process);
+  if (isConfirmedMainWeixinProcess(main)) add(main);
+  const ordered = [...(processes || [])].sort((left, right) => {
+    const mainDiff = Number(isConfirmedMainWeixinProcess(right)) - Number(isConfirmedMainWeixinProcess(left));
+    if (mainDiff) return mainDiff;
+    const workingSetDiff = Number(right?.working_set_bytes || 0) - Number(left?.working_set_bytes || 0);
+    if (workingSetDiff) return workingSetDiff;
+    const privateMemoryDiff = Number(right?.private_memory_bytes || 0) - Number(left?.private_memory_bytes || 0);
+    if (privateMemoryDiff) return privateMemoryDiff;
+    return Number(left?.pid || 0) - Number(right?.pid || 0);
+  });
+  for (const process of ordered) add(process);
   return out;
+}
+
+export function shouldPrioritizeWeixinProcessScan(process) {
+  return isConfirmedMainWeixinProcess(process);
+}
+
+export function allocateSharedProcessScanMs(remainingMs, remainingProcesses, { priority = false } = {}) {
+  const available = Math.max(0, Math.floor(Number(remainingMs || 0) || 0));
+  const processCount = Math.max(1, Math.floor(Number(remainingProcesses || 1) || 1));
+  if (available < WXKEY_MIN_PROCESS_SCAN_MS) return 0;
+  if (processCount === 1) return available;
+  if (!priority) return Math.max(WXKEY_MIN_PROCESS_SCAN_MS, Math.floor(available / processCount));
+  const reservedForOthers = (processCount - 1) * WXKEY_MIN_PROCESS_SCAN_MS;
+  const priorityTarget = Math.floor(available * WXKEY_PRIORITY_PROCESS_SHARE);
+  return Math.max(
+    WXKEY_MIN_PROCESS_SCAN_MS,
+    Math.min(priorityTarget, available - reservedForOthers),
+  );
 }
 
 function redactProcessForDiagnostics(process) {
@@ -602,18 +995,21 @@ function redactProcessForDiagnostics(process) {
     pid: Number(process?.pid || 0),
     type: weixinProcessType(process),
     is_main: !!process?.is_main,
+    main_process_confirmed: isConfirmedMainWeixinProcess(process),
   };
 }
 
 function weixinProcessType(process) {
   const text = String(process?.command_line || '');
   const type = text.match(/--type=([^\s"]+)/i)?.[1];
-  return type || 'main';
+  if (type) return type;
+  return isConfirmedMainWeixinProcess(process) ? 'main' : 'unknown';
 }
 
 function createScanAggregate() {
   const hashSet = new Set();
   const rawSet = new Set();
+  const priorityRawSet = new Set();
   return {
     candidate_count: 0,
     scanned_bytes: 0,
@@ -628,6 +1024,12 @@ function createScanAggregate() {
       rawSet.add(text);
       hashSet.add(crypto.createHash('sha256').update(text).digest('hex').slice(0, 12));
     },
+    addPriorityRaw(value) {
+      const text = String(value || '').trim().toLowerCase();
+      if (!text) return;
+      priorityRawSet.add(text);
+      this.addRaw(text);
+    },
     uniqueCount() {
       return rawSet.size || hashSet.size;
     },
@@ -635,9 +1037,30 @@ function createScanAggregate() {
       return [...hashSet].slice(0, 64);
     },
     raws() {
-      return [...rawSet];
+      return [
+        ...priorityRawSet,
+        ...[...rawSet].filter(raw => !priorityRawSet.has(raw)),
+      ];
+    },
+    priorityRaws() {
+      return [...priorityRawSet];
     },
   };
+}
+
+function wxKeyProcessGeneration(processes = []) {
+  const identities = (Array.isArray(processes) ? processes : [])
+    .map(process => [
+      Math.max(0, Number(process?.pid || 0) || 0),
+      String(process?.started_at || '').trim(),
+      platformPathIdentity(process?.path || ''),
+      weixinProcessType(process),
+      weixinProcessType(process),
+    ].join('|'))
+    .filter(identity => !identity.startsWith('0|'))
+    .sort();
+  if (!identities.length) return '';
+  return crypto.createHash('sha256').update(identities.join('\n')).digest('hex').slice(0, 24);
 }
 
 function mergeScanAggregate(aggregate, scanResult = {}) {
@@ -645,6 +1068,7 @@ function mergeScanAggregate(aggregate, scanResult = {}) {
   aggregate.scanned_bytes += Number(scanResult.scanned_bytes || 0);
   aggregate.region_count += Number(scanResult.region_count || 0);
   for (const hash of scanResult.candidate_hashes || []) aggregate.addHash(hash);
+  for (const raw of scanResult.v4_pointer_raw_candidates || []) aggregate.addPriorityRaw(raw);
   for (const raw of scanResult.raw_candidates || []) aggregate.addRaw(raw);
 }
 
@@ -657,6 +1081,7 @@ function processScanSummary(process, scanResult = {}, extra = {}) {
     v4_pointer_pattern_candidate_count: Number(scanResult.v4_pointer_pattern_candidate_count || 0),
     scanned_bytes: Number(scanResult.scanned_bytes || 0),
     region_count: Number(scanResult.region_count || 0),
+    timed_out: scanResult.timed_out === true,
     reverse_pointer_hit_count: Number(scanResult.reverse_pointer_hit_count || 0),
     reverse_pointer_scanned_bytes: Number(scanResult.reverse_pointer_scanned_bytes || 0),
     reverse_pointer_direct_candidate_count: Number(scanResult.reverse_pointer_direct_candidate_count || 0),
@@ -677,6 +1102,29 @@ function processScanSummary(process, scanResult = {}, extra = {}) {
   };
 }
 
+function processScanErrorSummary(process, stage, error = null) {
+  return {
+    ...redactProcessForDiagnostics(process),
+    stage: String(stage || 'scan').trim().slice(0, 80) || 'scan',
+    error: wxKeyErrorSummary(error) || 'process scan failed',
+  };
+}
+
+async function scanProcessWithIsolation(result, target, stage, signal, scan) {
+  try {
+    const value = await scan();
+    throwIfWxKeyAborted(signal);
+    return value;
+  } catch (error) {
+    if (signal?.aborted || error?.name === 'AbortError' || error?.status === 499) throw error;
+    result.scan_errors ||= [];
+    if (result.scan_errors.length < 24) result.scan_errors.push(processScanErrorSummary(target, stage, error));
+    result.scan_error_count = Number(result.scan_error_count || 0) + 1;
+    result.scan_incomplete = true;
+    return null;
+  }
+}
+
 export function findRawKeyCandidates(buffer) {
   const text = Buffer.isBuffer(buffer) ? buffer.toString('latin1') : String(buffer || '');
   const candidates = new Map();
@@ -684,12 +1132,14 @@ export function findRawKeyCandidates(buffer) {
   if (text.includes('\0')) addRawKeyMatches(candidates, text.replace(/\0/g, ''));
   // Some recent Weixin builds keep only the SQLCipher key half as a plain hex
   // string in memory. The DB salt is added later by wxdb normalization.
+  addBareHexMatches(candidates, text, 192);
   addBareHexMatches(candidates, text, 160);
   addBareHexMatches(candidates, text, 128);
   addBareHexMatches(candidates, text, 96);
   addBareHexMatches(candidates, text, 64);
   if (text.includes('\0')) {
     const compact = text.replace(/\0/g, '');
+    addBareHexMatches(candidates, compact, 192);
     addBareHexMatches(candidates, compact, 160);
     addBareHexMatches(candidates, compact, 128);
     addBareHexMatches(candidates, compact, 96);
@@ -726,7 +1176,7 @@ function addBareHexMatches(candidates, text, size) {
     const before = start > 0 ? text.charCodeAt(start - 1) : 0;
     const after = end < text.length ? text.charCodeAt(end) : 0;
     if (isHexCode(before) || isHexCode(after)) continue;
-    addCandidate(candidates, match[0], `hex${size}`);
+    addRawKeyHexCandidates(candidates, match[0], `hex${size}`);
     if (candidates.size >= MAX_RAW_KEY_CANDIDATES) return;
   }
 }
@@ -810,10 +1260,12 @@ function findAnchorNeighborKeyCandidatesWithLimit(buffer, anchors = [], neighbor
 }
 
 export async function scanProcessForDbSaltKeyCandidates(pid, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const salts = normalizeDbSaltBuffers(options.db_salts || []);
   if (!salts.length) {
     return { candidate_count: 0, unique_candidate_count: 0, salt_hit_count: 0, scanned_bytes: 0, region_count: 0, candidate_hashes: [] };
   }
+  throwIfWxKeyAborted(options.signal);
   const api = await loadKernel32();
   const handle = openReadOnlyProcess(api, pid);
   try {
@@ -833,9 +1285,11 @@ export async function scanProcessForDbSaltKeyCandidates(pid, options = {}) {
     let carry = Buffer.alloc(0);
 
     for (const region of regions) {
+      throwIfWxKeyAborted(options.signal);
       if (scanned >= scanLimit || candidates.size >= maxCandidates) break;
       const toScan = region.size > regionLimit ? regionLimit : region.size;
       for (let offset = 0n; offset < toScan && scanned < scanLimit; offset += BigInt(CHUNK_BYTES)) {
+        throwIfWxKeyAborted(options.signal);
         if (candidates.size >= maxCandidates) break;
         const len = Number(minBigInt(BigInt(CHUNK_BYTES), toScan - offset, scanLimit - scanned));
         if (len <= 0) break;
@@ -858,6 +1312,7 @@ export async function scanProcessForDbSaltKeyCandidates(pid, options = {}) {
           addHitAddress(hitAddresses, hitAddressSet, hitAddress);
           const pointerTargets = findSaltNeighborPointers(chunk, saltOffset, neighborBytes, 16);
           for (const target of pointerTargets) {
+            throwIfWxKeyAborted(options.signal);
             if (candidates.size >= maxCandidates) break;
             await addAnchorPointerTargetCandidates(api, handle, regions, target, candidates, maxCandidates);
           }
@@ -870,10 +1325,11 @@ export async function scanProcessForDbSaltKeyCandidates(pid, options = {}) {
     }
     const reverse = options.reverse_pointer_scan && hitAddresses.length && candidates.size < maxCandidates
       ? await scanReversePointersForCandidates(api, handle, regions, hitAddresses, candidates, {
-          max_candidates: maxCandidates,
-          max_bytes: options.reverse_pointer_max_bytes || Number(scanLimit),
-          max_hits: options.reverse_pointer_max_hits,
-        })
+        max_candidates: maxCandidates,
+        max_bytes: options.reverse_pointer_max_bytes || Number(scanLimit),
+        max_hits: options.reverse_pointer_max_hits,
+        signal: options.signal,
+      })
       : { pointer_hit_count: 0, scanned_bytes: 0 };
 
     return {
@@ -903,10 +1359,12 @@ export async function scanProcessForDbSaltKeyCandidates(pid, options = {}) {
 }
 
 export async function scanProcessForAnchorKeyCandidates(pid, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const anchors = normalizeAnchorBuffers(options.anchors || []);
   if (!anchors.length) {
     return { candidate_count: 0, unique_candidate_count: 0, anchor_hit_count: 0, scanned_bytes: 0, region_count: 0, candidate_hashes: [] };
   }
+  throwIfWxKeyAborted(options.signal);
   const api = await loadKernel32();
   const handle = openReadOnlyProcess(api, pid);
   try {
@@ -929,9 +1387,11 @@ export async function scanProcessForAnchorKeyCandidates(pid, options = {}) {
     let carry = Buffer.alloc(0);
 
     for (const region of regions) {
+      throwIfWxKeyAborted(options.signal);
       if (scanned >= scanLimit || (candidates.size >= maxCandidates && hitAddresses.length >= MAX_REVERSE_POINTER_TARGETS)) break;
       const toScan = region.size > regionLimit ? regionLimit : region.size;
       for (let offset = 0n; offset < toScan && scanned < scanLimit; offset += BigInt(CHUNK_BYTES)) {
+        throwIfWxKeyAborted(options.signal);
         if (candidates.size >= maxCandidates && hitAddresses.length >= MAX_REVERSE_POINTER_TARGETS) break;
         const len = Number(minBigInt(BigInt(CHUNK_BYTES), toScan - offset, scanLimit - scanned));
         if (len <= 0) break;
@@ -957,6 +1417,7 @@ export async function scanProcessForAnchorKeyCandidates(pid, options = {}) {
           if (followLocalPointers && candidates.size < maxCandidates) {
             const pointerTargets = findSaltNeighborPointers(chunk, anchorOffset, neighborBytes, 1);
             for (const target of pointerTargets) {
+              throwIfWxKeyAborted(options.signal);
               if (candidates.size >= maxCandidates) break;
               await addPointerTargetCandidates(api, handle, regions, target, candidates, maxCandidates);
             }
@@ -970,10 +1431,11 @@ export async function scanProcessForAnchorKeyCandidates(pid, options = {}) {
     }
     const reverse = options.reverse_pointer_scan && hitAddresses.length && candidates.size < maxCandidates
       ? await scanReversePointersForCandidates(api, handle, regions, hitAddresses, candidates, {
-          max_candidates: maxCandidates,
-          max_bytes: options.reverse_pointer_max_bytes || Number(scanLimit),
-          max_hits: options.reverse_pointer_max_hits,
-        })
+        max_candidates: maxCandidates,
+        max_bytes: options.reverse_pointer_max_bytes || Number(scanLimit),
+        max_hits: options.reverse_pointer_max_hits,
+        signal: options.signal,
+      })
       : { pointer_hit_count: 0, scanned_bytes: 0 };
 
     return {
@@ -1008,6 +1470,7 @@ export async function scanProcessForAnchorKeyCandidates(pid, options = {}) {
 }
 
 export async function scanProcessForRawKeyCandidates(pid, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const api = await loadKernel32();
   const handle = openReadOnlyProcess(api, pid);
   try {
@@ -1017,19 +1480,54 @@ export async function scanProcessForRawKeyCandidates(pid, options = {}) {
     const readRegions = enumerateCandidateRegions(api, handle, { writableOnly: false, includeMapped: true });
     const scanLimit = BigInt(options.max_bytes || DEFAULT_SCAN_LIMIT_BYTES);
     const regionLimit = BigInt(options.max_region_bytes || DEFAULT_REGION_LIMIT_BYTES);
+    const maxMs = normalizeScanMaxMs(options.max_ms);
+    const deadline = maxMs ? Date.now() + maxMs : 0;
     const v4PointerMaxCandidates = normalizeMaxSaltCandidates(options.v4_pointer_max_candidates || MAX_RAW_KEY_CANDIDATES);
     const candidates = new Map();
+    const v4PointerCandidates = new Map();
     let candidateCount = 0;
     let v4PointerPatternHitCount = 0;
     let v4PointerPatternCandidateCount = 0;
     let scanned = 0n;
+    let timedOut = false;
+    let chunkCount = 0;
+    let nextProgressAt = BigInt(WXKEY_SCAN_PROGRESS_BYTES);
+    const reportProgress = (done = false) => {
+      if (!done && scanned < nextProgressAt) return;
+      while (nextProgressAt <= scanned) nextProgressAt += BigInt(WXKEY_SCAN_PROGRESS_BYTES);
+      notifyWxKeyScanProgress(options, {
+        scan_kind: 'raw',
+        scanned_bytes: Number(scanned),
+        scan_limit_bytes: Number(scanLimit),
+        region_count: regions.length,
+        candidate_count: candidates.size + v4PointerCandidates.size,
+        done,
+        timed_out: timedOut,
+      });
+    };
 
     for (const region of regions) {
+      throwIfWxKeyAborted(options.signal);
+      if (deadline && Date.now() >= deadline) {
+        timedOut = true;
+        break;
+      }
       if (scanned >= scanLimit) break;
       const toScan = region.size > regionLimit ? regionLimit : region.size;
       let carry = '';
       let byteCarry = Buffer.alloc(0);
       for (let offset = 0n; offset < toScan && scanned < scanLimit; offset += BigInt(CHUNK_BYTES)) {
+        throwIfWxKeyAborted(options.signal);
+        chunkCount++;
+        if (chunkCount % WXKEY_SCAN_YIELD_EVERY_CHUNKS === 0
+          && await yieldWxKeyScan({ signal: options.signal, deadline })) {
+          timedOut = true;
+          break;
+        }
+        if (deadline && Date.now() >= deadline) {
+          timedOut = true;
+          break;
+        }
         const len = Number(minBigInt(BigInt(CHUNK_BYTES), toScan - offset, scanLimit - scanned));
         if (len <= 0) break;
         const buf = Buffer.allocUnsafe(len);
@@ -1038,10 +1536,18 @@ export async function scanProcessForRawKeyCandidates(pid, options = {}) {
         const read = Number(readOut[0] || 0n);
         if (!ok || read <= 0) continue;
         scanned += BigInt(read);
+        reportProgress();
         const chunk = byteCarry.length ? Buffer.concat([byteCarry, buf.subarray(0, read)]) : buf.subarray(0, read);
-        const v4Stats = addWeixinV4PatternPointerCandidates(candidates, chunk, api, handle, readRegions, v4PointerMaxCandidates);
+        const v4Stats = addWeixinV4PatternPointerCandidates(v4PointerCandidates, chunk, api, handle, readRegions, v4PointerMaxCandidates, {
+          deadline,
+          signal: options.signal,
+        });
         v4PointerPatternHitCount += v4Stats.hit_count;
         v4PointerPatternCandidateCount += v4Stats.candidate_count;
+        if (v4Stats.timed_out) {
+          timedOut = true;
+          break;
+        }
         const text = carry + buf.subarray(0, read).toString('latin1');
         const found = findRawKeyCandidates(text);
         candidateCount += found.length;
@@ -1054,23 +1560,31 @@ export async function scanProcessForRawKeyCandidates(pid, options = {}) {
       }
     }
 
+    const orderedCandidates = prioritizedCandidateValues(v4PointerCandidates, candidates);
+    reportProgress(true);
+
     return {
       scan_mode: {
         writable_only: writableOnly,
         include_mapped: includeMapped,
         max_bytes: Number(scanLimit),
         max_region_bytes: Number(regionLimit),
+        max_ms: maxMs || 0,
         v4_pointer_pattern: true,
         v4_pointer_max_candidates: v4PointerMaxCandidates,
       },
       candidate_count: candidateCount + v4PointerPatternCandidateCount,
-      unique_candidate_count: candidates.size,
+      unique_candidate_count: orderedCandidates.length,
       v4_pointer_pattern_hit_count: v4PointerPatternHitCount,
       v4_pointer_pattern_candidate_count: v4PointerPatternCandidateCount,
+      timed_out: timedOut,
       scanned_bytes: Number(scanned),
       region_count: regions.length,
-      candidate_hashes: [...candidates.values()].map(c => c.hash.slice(0, 12)),
-      ...(options.include_raw ? { raw_candidates: [...candidates.values()].map(c => c.raw) } : {}),
+      candidate_hashes: orderedCandidates.map(c => c.hash.slice(0, 12)),
+      ...(options.include_raw ? {
+        v4_pointer_raw_candidates: [...v4PointerCandidates.values()].map(c => c.raw),
+        raw_candidates: orderedCandidates.map(c => c.raw),
+      } : {}),
     };
   } finally {
     api.CloseHandle(handle);
@@ -1078,6 +1592,7 @@ export async function scanProcessForRawKeyCandidates(pid, options = {}) {
 }
 
 export async function scanProcessForVerifiedWeixinV4DbKeys(pid, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const pages = normalizeVerifiedDbPages(options.db_pages || []);
   if (!pages.length) {
     return { candidate_count: 0, unique_candidate_count: 0, matched_salt_count: 0, hex_pattern_count: 0, scanned_bytes: 0, region_count: 0, candidate_hashes: [] };
@@ -1087,20 +1602,75 @@ export async function scanProcessForVerifiedWeixinV4DbKeys(pid, options = {}) {
   try {
     const writableOnly = options.writable_only === true;
     const includeMapped = options.include_mapped !== false;
-    const regions = enumerateCandidateRegions(api, handle, { writableOnly, includeMapped });
+    const regions = prioritizeScanRegions(enumerateCandidateRegions(api, handle, { writableOnly, includeMapped }));
+    const readRegions = enumerateCandidateRegions(api, handle, { writableOnly: false, includeMapped: true });
     const scanLimit = BigInt(options.max_bytes || DEFAULT_SCAN_LIMIT_BYTES);
     const regionLimit = BigInt(options.max_region_bytes || DEFAULT_REGION_LIMIT_BYTES);
+    const maxMs = normalizeScanMaxMs(options.max_ms || DEFAULT_VERIFIED_KEY_SCAN_MAX_MS);
+    const deadline = maxMs ? Date.now() + maxMs : 0;
     const found = new Map();
     const matchedSalts = new Set();
     const seenHex = new Set();
+    const pointerCandidates = new Map();
+    const processedPointerCandidates = new Set();
+    const deriveState = {
+      attempts: 0,
+      matches: 0,
+      limit: options.derive_passphrase_keys === true
+        ? normalizeVerifiedPassphraseDeriveLimit(options.max_passphrase_derive_candidates)
+        : 0,
+    };
+    const pointerDeriveState = {
+      attempts: 0,
+      matches: 0,
+      limit: options.derive_passphrase_keys === true
+        ? normalizeVerifiedPointerDeriveLimit(options.max_pointer_passphrase_derive_candidates)
+        : 0,
+    };
     let scanned = 0n;
     let hexPatternCount = 0;
+    let pointerPatternHitCount = 0;
+    let pointerPatternCandidateCount = 0;
+    let timedOut = false;
+    let chunkCount = 0;
+    let nextProgressAt = BigInt(WXKEY_SCAN_PROGRESS_BYTES);
+    const reportProgress = (done = false) => {
+      if (!done && scanned < nextProgressAt) return;
+      while (nextProgressAt <= scanned) nextProgressAt += BigInt(WXKEY_SCAN_PROGRESS_BYTES);
+      notifyWxKeyScanProgress(options, {
+        scan_kind: 'verified_weixin_v4',
+        scanned_bytes: Number(scanned),
+        scan_limit_bytes: Number(scanLimit),
+        region_count: regions.length,
+        candidate_count: found.size,
+        matched_salt_count: matchedSalts.size,
+        done,
+        timed_out: timedOut,
+      });
+    };
 
     for (const region of regions) {
+      throwIfWxKeyAborted(options.signal);
+      if (deadline && Date.now() >= deadline) {
+        timedOut = true;
+        break;
+      }
       if (scanned >= scanLimit || matchedSalts.size >= pages.length) break;
       const toScan = region.size > regionLimit ? regionLimit : region.size;
       let carry = '';
+      let byteCarry = Buffer.alloc(0);
       for (let offset = 0n; offset < toScan && scanned < scanLimit; offset += BigInt(CHUNK_BYTES)) {
+        throwIfWxKeyAborted(options.signal);
+        chunkCount++;
+        if (chunkCount % WXKEY_SCAN_YIELD_EVERY_CHUNKS === 0
+          && await yieldWxKeyScan({ signal: options.signal, deadline })) {
+          timedOut = true;
+          break;
+        }
+        if (deadline && Date.now() >= deadline) {
+          timedOut = true;
+          break;
+        }
         if (matchedSalts.size >= pages.length) break;
         const len = Number(minBigInt(BigInt(CHUNK_BYTES), toScan - offset, scanLimit - scanned));
         if (len <= 0) break;
@@ -1110,20 +1680,69 @@ export async function scanProcessForVerifiedWeixinV4DbKeys(pid, options = {}) {
         const read = Number(readOut[0] || 0n);
         if (!ok || read <= 0) continue;
         scanned += BigInt(read);
+        reportProgress();
+        const chunk = byteCarry.length ? Buffer.concat([byteCarry, buf.subarray(0, read)]) : buf.subarray(0, read);
+        // Quoted key material is direct evidence. Validate it before spending
+        // the shared deadline on structural pointer heuristics.
         const text = carry + buf.subarray(0, read).toString('latin1');
         const stats = addVerifiedWeixinV4RawKeyMatches(found, matchedSalts, seenHex, text, pages, {
           includeBareHex: options.include_bare_hex === true,
+          derivePassphraseKeys: options.derive_passphrase_keys === true,
+          deriveState,
         });
         hexPatternCount += stats.hex_pattern_count;
         carry = text.slice(-RAW_KEY_TEXT_CARRY_CHARS);
+        if (matchedSalts.size >= pages.length) break;
+        const pointerStats = addWeixinV4PatternPointerCandidates(
+          pointerCandidates,
+          chunk,
+          api,
+          handle,
+          readRegions,
+          WEIXIN_V4_VERIFIED_POINTER_DERIVE_CANDIDATE_LIMIT,
+          { deadline, signal: options.signal },
+        );
+        pointerPatternHitCount += pointerStats.hit_count;
+        pointerPatternCandidateCount += pointerStats.candidate_count;
+        if (pointerStats.timed_out) {
+          timedOut = true;
+          break;
+        }
+        const pointerVerification = verifyNewWeixinV4PointerCandidates(
+          found,
+          matchedSalts,
+          processedPointerCandidates,
+          pointerCandidates,
+          pages,
+          pointerDeriveState,
+          { deadline, signal: options.signal },
+        );
+        if (pointerVerification.timed_out) {
+          timedOut = true;
+          break;
+        }
+        byteCarry = chunk.subarray(Math.max(0, chunk.length - (WEIXIN_V4_KEY_POINTER_PATTERN.length + 8 - 1)));
+        if (matchedSalts.size >= pages.length) break;
       }
+      if (timedOut) break;
     }
+
+    reportProgress(true);
 
     return {
       candidate_count: found.size,
       unique_candidate_count: found.size,
       matched_salt_count: matchedSalts.size,
+      matched_salts: [...matchedSalts],
       hex_pattern_count: hexPatternCount,
+      v4_pointer_pattern_hit_count: pointerPatternHitCount,
+      v4_pointer_pattern_candidate_count: pointerPatternCandidateCount,
+      v4_pointer_verified_candidate_count: processedPointerCandidates.size,
+      pointer_passphrase_derive_attempts: pointerDeriveState.attempts,
+      pointer_passphrase_derived_match_count: pointerDeriveState.matches,
+      passphrase_derive_attempts: pointerDeriveState.attempts + deriveState.attempts,
+      passphrase_derived_match_count: pointerDeriveState.matches + deriveState.matches,
+      timed_out: timedOut,
       scanned_bytes: Number(scanned),
       region_count: regions.length,
       scan_mode: {
@@ -1131,8 +1750,12 @@ export async function scanProcessForVerifiedWeixinV4DbKeys(pid, options = {}) {
         include_mapped: includeMapped,
         max_bytes: Number(scanLimit),
         max_region_bytes: Number(regionLimit),
+        max_ms: maxMs || 0,
         verified_weixin_v4_hmac: true,
         include_bare_hex: options.include_bare_hex === true,
+        derive_passphrase_keys: options.derive_passphrase_keys === true,
+        max_passphrase_derive_candidates: deriveState.limit,
+        max_pointer_passphrase_derive_candidates: pointerDeriveState.limit,
       },
       candidate_hashes: [...found.values()].map(c => c.hash.slice(0, 12)),
       ...(options.include_raw ? { raw_candidates: [...found.values()].map(c => c.raw) } : {}),
@@ -1143,20 +1766,24 @@ export async function scanProcessForVerifiedWeixinV4DbKeys(pid, options = {}) {
 }
 
 export async function scanProcessForCodecContextKeyCandidates(pid, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const salts = normalizeDbSaltBuffers(options.db_salts || []);
   if (!salts.length) {
     return { candidate_count: 0, unique_candidate_count: 0, codec_context_hit_count: 0, codec_context_salt_match_count: 0, scanned_bytes: 0, region_count: 0, candidate_hashes: [] };
   }
   const saltSet = new Set(salts.map(salt => salt.toString('hex')));
+  throwIfWxKeyAborted(options.signal);
   const api = await loadKernel32();
   const handle = openReadOnlyProcess(api, pid);
   try {
     const writableOnly = options.writable_only !== false;
     const includeMapped = options.include_mapped === true;
-    const scanRegions = enumerateCandidateRegions(api, handle, { writableOnly, includeMapped });
+    const scanRegions = prioritizeScanRegions(enumerateCandidateRegions(api, handle, { writableOnly, includeMapped }));
     const readRegions = enumerateCandidateRegions(api, handle, { writableOnly: false, includeMapped: true });
     const scanLimit = BigInt(options.max_bytes || DEFAULT_SCAN_LIMIT_BYTES);
     const regionLimit = BigInt(options.max_region_bytes || DEFAULT_REGION_LIMIT_BYTES);
+    const maxMs = normalizeScanMaxMs(options.max_ms || DEFAULT_VERIFIED_KEY_SCAN_MAX_MS);
+    const deadline = maxMs ? Date.now() + maxMs : 0;
     const maxCandidates = normalizeMaxSaltCandidates(options.max_candidates);
     const candidates = new Map();
     let scanned = 0n;
@@ -1169,11 +1796,46 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
     const seenCodecAddresses = new Set();
     let carry = Buffer.alloc(0);
     const carryBytes = 128;
+    let timedOut = false;
+    let chunkCount = 0;
+    let codecWordCount = 0;
+    let nextProgressAt = BigInt(WXKEY_SCAN_PROGRESS_BYTES);
+    const reportProgress = (done = false) => {
+      if (!done && scanned < nextProgressAt) return;
+      while (nextProgressAt <= scanned) nextProgressAt += BigInt(WXKEY_SCAN_PROGRESS_BYTES);
+      notifyWxKeyScanProgress(options, {
+        scan_kind: 'codec_context',
+        scanned_bytes: Number(scanned),
+        scan_limit_bytes: Number(scanLimit),
+        region_count: scanRegions.length,
+        candidate_count: candidates.size,
+        codec_context_hit_count: codecContextHitCount,
+        codec_context_salt_match_count: codecContextSaltMatchCount,
+        done,
+        timed_out: timedOut,
+      });
+    };
 
     for (const region of scanRegions) {
+      throwIfWxKeyAborted(options.signal);
+      if (deadline && Date.now() >= deadline) {
+        timedOut = true;
+        break;
+      }
       if (scanned >= scanLimit || candidates.size >= maxCandidates) break;
       const toScan = region.size > regionLimit ? regionLimit : region.size;
       for (let offset = 0n; offset < toScan && scanned < scanLimit; offset += BigInt(CHUNK_BYTES)) {
+        throwIfWxKeyAborted(options.signal);
+        chunkCount++;
+        if (chunkCount % WXKEY_SCAN_YIELD_EVERY_CHUNKS === 0
+          && await yieldWxKeyScan({ signal: options.signal, deadline })) {
+          timedOut = true;
+          break;
+        }
+        if (deadline && Date.now() >= deadline) {
+          timedOut = true;
+          break;
+        }
         if (candidates.size >= maxCandidates) break;
         const len = Number(minBigInt(BigInt(CHUNK_BYTES), toScan - offset, scanLimit - scanned));
         if (len <= 0) break;
@@ -1183,10 +1845,21 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
         const read = Number(readOut[0] || 0n);
         if (!ok || read <= 0) continue;
         scanned += BigInt(read);
+        reportProgress();
         const chunk = carry.length ? Buffer.concat([carry, buf.subarray(0, read)]) : buf.subarray(0, read);
         const chunkBase = region.base + offset - BigInt(carry.length);
         const alignedFrom = Number((8n - (chunkBase % 8n)) % 8n);
         for (let pos = alignedFrom; pos <= chunk.length - 128; pos += 8) {
+          codecWordCount++;
+          if (codecWordCount % WXKEY_CODEC_CONTEXT_YIELD_EVERY_WORDS === 0
+            && await yieldWxKeyScan({ signal: options.signal, deadline })) {
+            timedOut = true;
+            break;
+          }
+          if (deadline && Date.now() >= deadline) {
+            timedOut = true;
+            break;
+          }
           if (candidates.size >= maxCandidates) break;
           const address = chunkBase + BigInt(pos);
           const addressKey = address.toString();
@@ -1207,10 +1880,14 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
             codecKeyPointerCandidateCount += stats.key_pointer_candidate_count;
           }
         }
+        if (timedOut) break;
         carry = chunk.subarray(Math.max(0, chunk.length - carryBytes));
       }
+      if (timedOut) break;
       carry = Buffer.alloc(0);
     }
+
+    reportProgress(true);
 
     return {
       scan_mode: {
@@ -1219,6 +1896,7 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
         read_include_mapped: true,
         max_bytes: Number(scanLimit),
         max_region_bytes: Number(regionLimit),
+        max_ms: maxMs || 0,
         max_candidates: maxCandidates,
         db_salt_count: salts.length,
       },
@@ -1230,6 +1908,7 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
       codec_pass_candidate_count: codecPassCandidateCount,
       codec_key_pointer_read_count: codecKeyPointerReadCount,
       codec_key_pointer_candidate_count: codecKeyPointerCandidateCount,
+      timed_out: timedOut,
       scanned_bytes: Number(scanned),
       region_count: scanRegions.length,
       candidate_hashes: [...candidates.values()].map(c => c.hash.slice(0, 12)),
@@ -1241,6 +1920,7 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
 }
 
 export async function scanProcessForImageKeyCandidates(pid, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const samples = (options.validation_samples || [])
     .map(sample => Buffer.isBuffer(sample) ? sample : Buffer.from(String(sample || ''), 'base64'))
     .filter(sample => sample.length >= 16)
@@ -1252,7 +1932,7 @@ export async function scanProcessForImageKeyCandidates(pid, options = {}) {
   const api = await loadKernel32();
   const handle = openReadOnlyProcess(api, pid);
   try {
-    const regions = enumerateCandidateRegions(api, handle, { writableOnly: false, includeMapped: options.include_mapped === true });
+    const regions = prioritizeScanRegions(enumerateCandidateRegions(api, handle, { writableOnly: false, includeMapped: options.include_mapped === true }));
     const scanLimit = BigInt(options.max_bytes || DEFAULT_IMAGE_SCAN_LIMIT_BYTES);
     const regionLimit = BigInt(options.max_region_bytes || DEFAULT_REGION_LIMIT_BYTES);
     const deadline = options.max_ms ? Date.now() + Math.max(1000, Number(options.max_ms)) : 0;
@@ -1263,10 +1943,12 @@ export async function scanProcessForImageKeyCandidates(pid, options = {}) {
     let carry = Buffer.alloc(0);
 
     for (const region of regions) {
+      throwIfWxKeyAborted(options.signal);
       if (deadline && Date.now() >= deadline) break;
       if (scanned >= scanLimit || candidates.size >= stopAfter) break;
       const toScan = region.size > regionLimit ? regionLimit : region.size;
       for (let offset = 0n; offset < toScan && scanned < scanLimit; offset += BigInt(CHUNK_BYTES)) {
+        throwIfWxKeyAborted(options.signal);
         if (deadline && Date.now() >= deadline) break;
         if (candidates.size >= stopAfter) break;
         const len = Number(minBigInt(BigInt(CHUNK_BYTES), toScan - offset, scanLimit - scanned));
@@ -1317,7 +1999,7 @@ function enumerateCandidateRegions(api, handle, { writableOnly = true, includeMa
       isReadableProtect(info.Protect, writableOnly) &&
       size > 0n
     ) {
-      regions.push({ base, size, protect: info.Protect });
+      regions.push({ base, size, protect: info.Protect, type: info.Type });
     }
     const next = base + size;
     if (next <= address || next > 0x7ffffffffffffffen) break;
@@ -1332,6 +2014,24 @@ function isReadableProtect(protect, writableOnly) {
     ? (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
     : (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
   return !!(protect & mask);
+}
+
+function prioritizeScanRegions(regions = []) {
+  return [...regions].sort((left, right) => {
+    const priorityDiff = scanRegionPriority(left) - scanRegionPriority(right);
+    if (priorityDiff) return priorityDiff;
+    if (left.base < right.base) return -1;
+    if (left.base > right.base) return 1;
+    return 0;
+  });
+}
+
+function scanRegionPriority(region = {}) {
+  const writable = isReadableProtect(Number(region.protect || 0), true);
+  if (region.type === MEM_PRIVATE) return writable ? 0 : 2;
+  if (region.type === MEM_MAPPED) return writable ? 1 : 3;
+  if (region.type === MEM_IMAGE) return writable ? 4 : 5;
+  return 6;
 }
 
 function normalizeDbSaltBuffers(values) {
@@ -1475,6 +2175,7 @@ function addHitAddress(out, seen, address) {
 }
 
 async function scanReversePointersForCandidates(api, handle, regions, targetAddresses, candidates, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const targetWindow = expandedPointerTargetWindow(options.target_items || targetAddresses, options.target_range_bytes);
   if (!targetWindow.targets.length || candidates.size >= options.max_candidates) return { pointer_hit_count: 0, scanned_bytes: 0 };
   const { targetSet, targetLabelMap, minTarget, maxTarget } = targetWindow;
@@ -1499,9 +2200,11 @@ async function scanReversePointersForCandidates(api, handle, regions, targetAddr
   let followedPointerTargetCount = 0;
 
   for (const region of regions) {
+    throwIfWxKeyAborted(options.signal);
     if (scanned >= scanLimit || pointerHitCount >= maxHits) break;
     const toScan = region.size;
     for (let offset = 0n; offset < toScan && scanned < scanLimit; offset += BigInt(CHUNK_BYTES)) {
+      throwIfWxKeyAborted(options.signal);
       if (pointerHitCount >= maxHits) break;
       const len = Number(minBigInt(BigInt(CHUNK_BYTES), toScan - offset, scanLimit - scanned));
       if (len <= 0) break;
@@ -1531,6 +2234,7 @@ async function scanReversePointersForCandidates(api, handle, regions, targetAddr
         await addHighEntropyPointerTargetCandidates(api, handle, regions, chunk, pos, candidates, maxCandidates, highEntropyTargetState);
         const pointerTargets = findSaltNeighborPointerInfos(chunk, pos, REVERSE_POINTER_NEIGHBOR_BYTES, 6);
         for (const target of pointerTargets) {
+          throwIfWxKeyAborted(options.signal);
           const key = target.value.toString();
           if (deferredPointerTargetSet.has(key)) continue;
           deferredPointerTargetSet.add(key);
@@ -1552,11 +2256,13 @@ async function scanReversePointersForCandidates(api, handle, regions, targetAddr
         layout_sample: false,
         high_entropy_targets: options.high_entropy_targets,
         second_hop_reverse_pointers: false,
+        signal: options.signal,
       })
     : { pointer_hit_count: 0, scanned_bytes: 0 };
   const secondHopCandidateCount = Math.max(0, candidates.size - secondHopCandidateCountBefore);
   deferredPointerTargets.sort((a, b) => a.distance - b.distance || a.pos - b.pos);
   for (const target of deferredPointerTargets) {
+    throwIfWxKeyAborted(options.signal);
     if (candidates.size >= maxCandidates) break;
     await addPointerTargetCandidates(api, handle, regions, target.value, candidates, maxCandidates);
     followedPointerTargetCount++;
@@ -1583,17 +2289,19 @@ async function scanReversePointersForCandidates(api, handle, regions, targetAddr
 }
 
 export async function scanProcessForPointerTargetKeyCandidates(pid, options = {}) {
+  throwIfWxKeyAborted(options.signal);
   const targetItems = normalizePointerAddressItems(options.target_addresses || []);
   const targets = targetItems.map(item => item.address);
   if (!targets.length) {
     return { candidate_count: 0, unique_candidate_count: 0, target_address_count: 0, scanned_bytes: 0, region_count: 0, candidate_hashes: [] };
   }
+  throwIfWxKeyAborted(options.signal);
   const api = await loadKernel32();
   const handle = openReadOnlyProcess(api, pid);
   try {
     const writableOnly = options.writable_only === true;
     const includeMapped = options.include_mapped !== false;
-    const regions = enumerateCandidateRegions(api, handle, { writableOnly, includeMapped });
+    const regions = prioritizeScanRegions(enumerateCandidateRegions(api, handle, { writableOnly, includeMapped }));
     const maxCandidates = normalizeMaxSaltCandidates(options.max_candidates);
     const candidates = new Map();
     const reverse = await scanReversePointersForCandidates(api, handle, regions, targets, candidates, {
@@ -1606,6 +2314,7 @@ export async function scanProcessForPointerTargetKeyCandidates(pid, options = {}
       high_entropy_targets: options.reverse_pointer_high_entropy_targets,
       second_hop_reverse_pointers: options.second_hop_reverse_pointers,
       target_items: targetItems,
+      signal: options.signal,
     });
     return {
       scan_mode: {
@@ -2192,54 +2901,123 @@ function addVerifiedWeixinV4RawKeyMatches(found, matchedSalts, seenHex, text, pa
     if (hex.length % 2 !== 0 || seenHex.has(hex)) continue;
     seenHex.add(hex);
     hexPatternCount++;
-    verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, hex, pages);
+    verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, hex, pages, options);
   }
   if (options.includeBareHex === true) {
-    for (const size of [160, 128, 96, 64]) {
-      hexPatternCount += addVerifiedBareWeixinV4HexMatches(found, matchedSalts, seenHex, text, pages, size);
-    }
+    hexPatternCount += addVerifiedBareWeixinV4HexMatches(found, matchedSalts, seenHex, text, pages, options);
     if (text.includes('\0')) {
-      const compact = text.replace(/\0/g, '');
-      for (const size of [160, 128, 96, 64]) {
-        hexPatternCount += addVerifiedBareWeixinV4HexMatches(found, matchedSalts, seenHex, compact, pages, size);
-      }
+      hexPatternCount += addVerifiedUtf16WeixinV4HexMatches(found, matchedSalts, seenHex, text, pages, options);
     }
   }
   return { hex_pattern_count: hexPatternCount };
 }
 
-function addVerifiedBareWeixinV4HexMatches(found, matchedSalts, seenHex, text, pages, size) {
-  const re = new RegExp(`[a-fA-F0-9]{${size}}`, 'g');
+function addVerifiedBareWeixinV4HexMatches(found, matchedSalts, seenHex, text, pages, options = {}) {
+  const re = /(^|[^a-fA-F0-9])([a-fA-F0-9]{192}|[a-fA-F0-9]{160}|[a-fA-F0-9]{128}|[a-fA-F0-9]{96}|[a-fA-F0-9]{64})(?=$|[^a-fA-F0-9])/g;
   let match;
   let count = 0;
   while ((match = re.exec(text))) {
-    const start = match.index;
-    const end = start + size;
-    const before = start > 0 ? text.charCodeAt(start - 1) : 0;
-    const after = end < text.length ? text.charCodeAt(end) : 0;
-    if (isHexCode(before) || isHexCode(after)) continue;
-    const hex = match[0].toLowerCase();
+    const hex = String(match[2] || '').toLowerCase();
     if (seenHex.has(hex)) continue;
     seenHex.add(hex);
     count++;
-    verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, hex, pages);
+    verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, hex, pages, options);
     if (matchedSalts.size >= pages.length) break;
   }
   return count;
 }
 
-function verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, hex, pages) {
+function addVerifiedUtf16WeixinV4HexMatches(found, matchedSalts, seenHex, text, pages, options = {}) {
+  const acceptedLengths = new Set([64, 96, 128, 160, 192]);
+  let count = 0;
+  for (let alignment = 0; alignment < 2; alignment++) {
+    let pos = alignment;
+    while (pos + 1 < text.length) {
+      if (!isHexCode(text.charCodeAt(pos)) || text.charCodeAt(pos + 1) !== 0) {
+        pos += 2;
+        continue;
+      }
+      let end = pos;
+      let hex = '';
+      while (end + 1 < text.length && isHexCode(text.charCodeAt(end)) && text.charCodeAt(end + 1) === 0) {
+        if (hex.length <= 192) hex += text[end];
+        end += 2;
+      }
+      pos = end;
+      if (!acceptedLengths.has(hex.length) || seenHex.has(hex.toLowerCase())) continue;
+      hex = hex.toLowerCase();
+      seenHex.add(hex);
+      count++;
+      verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, hex, pages, options);
+      if (matchedSalts.size >= pages.length) break;
+    }
+    if (matchedSalts.size >= pages.length) break;
+  }
+  return count;
+}
+
+function verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, hex, pages, options = {}) {
   for (const keyHex of verifiedWeixinV4KeyHexCandidates(hex)) {
     if (!/^[a-f0-9]{64}$/.test(keyHex)) continue;
     const key = Buffer.from(keyHex, 'hex');
     for (const item of pages) {
       if (matchedSalts.has(item.salt)) continue;
-      if (!verifyWeixinV4EncKeyForPage(key, item.page)) continue;
+      if (verifyWeixinV4EncKeyForPage(key, item.page)) {
+        matchedSalts.add(item.salt);
+        addRawStringCandidate(found, keyHex, MAX_SALT_KEY_CANDIDATES_HARD_LIMIT);
+        addRawStringCandidate(found, `${keyHex}${item.salt}`, MAX_SALT_KEY_CANDIDATES_HARD_LIMIT);
+        continue;
+      }
+      const derived = deriveVerifiedWeixinV4PassphrasePageKey(keyHex, item.salt, options);
+      if (!derived || !verifyWeixinV4EncKeyForPage(Buffer.from(derived, 'hex'), item.page)) continue;
       matchedSalts.add(item.salt);
+      if (options.deriveState) options.deriveState.matches++;
       addRawStringCandidate(found, keyHex, MAX_SALT_KEY_CANDIDATES_HARD_LIMIT);
-      addRawStringCandidate(found, `${keyHex}${item.salt}`, MAX_SALT_KEY_CANDIDATES_HARD_LIMIT);
     }
   }
+}
+
+function verifyNewWeixinV4PointerCandidates(found, matchedSalts, processed, candidates, pages, deriveState, { deadline = 0, signal = null } = {}) {
+  for (const item of candidates.values()) {
+    throwIfWxKeyAborted(signal);
+    if (deadline && Date.now() >= deadline) return { timed_out: true };
+    const raw = String(item?.raw || '').trim().toLowerCase();
+    if (!raw || processed.has(raw)) continue;
+    processed.add(raw);
+    verifyWeixinV4KeyHexAgainstPages(found, matchedSalts, raw, pages, {
+      derivePassphraseKeys: deriveState?.limit > 0,
+      deriveState,
+    });
+    if (matchedSalts.size >= pages.length) break;
+  }
+  return { timed_out: false };
+}
+
+function deriveVerifiedWeixinV4PassphrasePageKey(keyHex, saltHex, options = {}) {
+  const state = options.deriveState;
+  if (options.derivePassphraseKeys !== true || !state || state.attempts >= state.limit) return '';
+  if (!/^[a-f0-9]{64}$/.test(String(keyHex || '')) || !/^[a-f0-9]{32}$/.test(String(saltHex || ''))) return '';
+  state.attempts++;
+  const derived = crypto.pbkdf2Sync(
+    Buffer.from(keyHex, 'hex'),
+    Buffer.from(saltHex, 'hex'),
+    WEIXIN_V4_PASSPHRASE_KDF_ITER,
+    WEIXIN_V4_KEY_BYTES,
+    'sha512',
+  ).toString('hex');
+  return derived;
+}
+
+function normalizeVerifiedPassphraseDeriveLimit(value) {
+  const n = Number(value || WEIXIN_V4_VERIFIED_PASSPHRASE_DERIVE_CANDIDATE_LIMIT);
+  if (!Number.isFinite(n) || n <= 0) return WEIXIN_V4_VERIFIED_PASSPHRASE_DERIVE_CANDIDATE_LIMIT;
+  return Math.min(Math.floor(n), MAX_RAW_KEY_CANDIDATES);
+}
+
+function normalizeVerifiedPointerDeriveLimit(value) {
+  const n = Number(value || WEIXIN_V4_VERIFIED_POINTER_DERIVE_CANDIDATE_LIMIT);
+  if (!Number.isFinite(n) || n <= 0) return WEIXIN_V4_VERIFIED_POINTER_DERIVE_CANDIDATE_LIMIT;
+  return Math.min(Math.floor(n), WEIXIN_V4_VERIFIED_POINTER_DERIVE_CANDIDATE_LIMIT);
 }
 
 function verifiedWeixinV4KeyHexCandidates(hex) {
@@ -2297,11 +3075,27 @@ function addRawStringCandidate(candidates, raw, maxCandidates = MAX_SALT_KEY_CAN
   return true;
 }
 
-function addWeixinV4PatternPointerCandidates(candidates, bytes, api, handle, readRegions, maxCandidates = MAX_RAW_KEY_CANDIDATES) {
+function prioritizedCandidateValues(priorityCandidates, candidates) {
+  const out = [];
+  const seen = new Set();
+  for (const collection of [priorityCandidates, candidates]) {
+    for (const item of collection?.values?.() || []) {
+      const hash = String(item?.hash || '').trim();
+      if (!hash || seen.has(hash)) continue;
+      seen.add(hash);
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function addWeixinV4PatternPointerCandidates(candidates, bytes, api, handle, readRegions, maxCandidates = MAX_RAW_KEY_CANDIDATES, { deadline = 0, signal = null } = {}) {
   let hitCount = 0;
   let candidateCount = 0;
   let pos = bytes.lastIndexOf(WEIXIN_V4_KEY_POINTER_PATTERN);
   while (pos >= 8) {
+    throwIfWxKeyAborted(signal);
+    if (deadline && Date.now() >= deadline) return { hit_count: hitCount, candidate_count: candidateCount, timed_out: true };
     hitCount++;
     if (candidates.size < maxCandidates) {
       const address = bytes.readBigUInt64LE(pos - 8);
@@ -2314,7 +3108,7 @@ function addWeixinV4PatternPointerCandidates(candidates, bytes, api, handle, rea
     }
     pos = bytes.lastIndexOf(WEIXIN_V4_KEY_POINTER_PATTERN, pos - 1);
   }
-  return { hit_count: hitCount, candidate_count: candidateCount };
+  return { hit_count: hitCount, candidate_count: candidateCount, timed_out: false };
 }
 
 function addWeixinV4PointerKeyCandidate(candidates, key, maxCandidates = MAX_RAW_KEY_CANDIDATES) {
@@ -2359,6 +3153,12 @@ function normalizeMaxSaltCandidates(value) {
   const n = Number(value || 0);
   if (!Number.isFinite(n) || n <= 0) return MAX_SALT_KEY_CANDIDATES;
   return Math.max(1, Math.min(Math.floor(n), MAX_SALT_KEY_CANDIDATES_HARD_LIMIT));
+}
+
+function normalizeScanMaxMs(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.max(1_000, Math.min(Math.floor(n), 10 * 60 * 1_000));
 }
 
 function normalizeAnchorDirectCandidateLimit(value, maxCandidates, reversePointerScan = false) {
@@ -2483,3 +3283,16 @@ function minBigInt(...values) {
 }
 
 export const WXKEY_SAFE_ACCESS_MASK = SAFE_ACCESS;
+export const __wxkeyInternals = {
+  addVerifiedWeixinV4RawKeyMatches,
+  allocateSharedProcessScanMs,
+  createScanAggregate,
+  mergeScanAggregate,
+  normalizeVerifiedDbPages,
+  orderWeixinProcessesForKeyScan,
+  shouldPrioritizeWeixinProcessScan,
+  prioritizeScanRegions,
+  scanRegionPriority,
+  verifyNewWeixinV4PointerCandidates,
+  wxKeyProcessGeneration,
+};

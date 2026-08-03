@@ -11,41 +11,72 @@ let voipEngineCache = { at: 0, path: '' };
 let ffmpegCache = { at: 0, path: '', source: '', checked: [] };
 const WORKER_PATH = fileURLToPath(new URL('./wxgf-native-worker.js', import.meta.url));
 
-export async function decodeWxgfToImage(data) {
+export async function decodeWxgfToImage(data, { signal = null } = {}) {
+  throwIfWxgfAborted(signal);
   if (!isWxgf(data)) return null;
-  const native = await decodeWxgfWithNativeDll(data);
+  const native = await decodeWxgfWithNativeDll(data, { signal });
   if (native) return native;
-  return decodeWxgfWithFfmpeg(data);
+  return decodeWxgfWithFfmpeg(data, { signal });
 }
 
-export async function extractVideoFrameToImage(file) {
-  const ffmpeg = await findFfmpeg();
+export async function extractVideoFrameToImage(file, { signal = null } = {}) {
+  throwIfWxgfAborted(signal);
+  const ffmpeg = await findFfmpeg({ signal });
+  throwIfWxgfAborted(signal);
   if (!ffmpeg || !file) return null;
   const output = await runBinary(
     ffmpeg,
     ['-hide_banner', '-loglevel', 'error', '-ss', '00:00:01', '-i', file, '-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '4', '-f', 'image2', '-'],
     Buffer.alloc(0),
-    { timeoutMs: 15000 },
-  ).catch(() => null);
+    { timeoutMs: 15000, signal },
+  ).catch(e => {
+    if (isWxgfAbort(e, signal)) throw e;
+    return null;
+  });
+  throwIfWxgfAborted(signal);
   const mime = detectImageMime(output);
   return mime ? { mime, bytes: output } : null;
 }
 
-export async function transcodeAudioToWav(file) {
-  const ffmpeg = await findFfmpeg();
+export async function transcodeAudioToWav(file, { signal = null } = {}) {
+  throwIfWxgfAborted(signal);
+  const ffmpeg = await findFfmpeg({ signal });
+  throwIfWxgfAborted(signal);
   if (!ffmpeg || !file) return null;
   const output = await runBinary(
     ffmpeg,
     ['-hide_banner', '-loglevel', 'error', '-i', file, '-vn', '-ac', '1', '-ar', '16000', '-f', 'wav', '-'],
     Buffer.alloc(0),
-    { timeoutMs: 15000 },
-  ).catch(() => null);
+    { timeoutMs: 15000, signal },
+  ).catch(e => {
+    if (isWxgfAbort(e, signal)) throw e;
+    return null;
+  });
+  throwIfWxgfAborted(signal);
   return isWav(output) ? { mime: 'audio/wav', bytes: output } : null;
 }
 
-export async function probeMediaTools() {
-  const ffmpeg = await resolveFfmpeg();
-  const voipEngine = await findVoipEngineDll();
+function wxgfAbortError() {
+  return Object.assign(new Error('请求已取消'), { name: 'AbortError', status: 499 });
+}
+
+function throwIfWxgfAborted(signal) {
+  if (signal?.aborted) throw (signal.reason instanceof Error ? signal.reason : wxgfAbortError());
+}
+
+function isWxgfAbort(error, signal = null) {
+  return !!signal?.aborted
+    || error?.name === 'AbortError'
+    || error?.status === 499
+    || error?.code === 'ABORT_ERR';
+}
+
+export async function probeMediaTools({ signal = null } = {}) {
+  throwIfWxgfAborted(signal);
+  const ffmpeg = await resolveFfmpeg({ signal });
+  throwIfWxgfAborted(signal);
+  const voipEngine = await findVoipEngineDll({ signal });
+  throwIfWxgfAborted(signal);
   return {
     ffmpeg: {
       available: !!ffmpeg.path,
@@ -99,31 +130,49 @@ export function findWxgfPartitions(data) {
   return [];
 }
 
-async function decodeWxgfWithNativeDll(data) {
-  const dllPath = await findVoipEngineDll();
+async function decodeWxgfWithNativeDll(data, { signal = null } = {}) {
+  throwIfWxgfAborted(signal);
+  const dllPath = await findVoipEngineDll({ signal });
+  throwIfWxgfAborted(signal);
   if (!dllPath) return null;
-  const output = await runBinary(process.execPath, [WORKER_PATH, dllPath], data, { timeoutMs: 15000 }).catch(() => null);
+  const output = await runBinary(process.execPath, [WORKER_PATH, dllPath], data, { timeoutMs: 15000, signal }).catch(e => {
+    if (isWxgfAbort(e, signal)) throw e;
+    return null;
+  });
+  throwIfWxgfAborted(signal);
   const mime = detectImageMime(output);
   return mime ? { mime, bytes: output } : null;
 }
 
-async function decodeWxgfWithFfmpeg(data) {
-  const ffmpeg = await findFfmpeg();
+async function decodeWxgfWithFfmpeg(data, { signal = null } = {}) {
+  throwIfWxgfAborted(signal);
+  const ffmpeg = await findFfmpeg({ signal });
+  throwIfWxgfAborted(signal);
   if (!ffmpeg) return null;
   const partition = findWxgfPartitions(data)[0];
   if (!partition) return null;
   const frame = data.subarray(partition.offset, partition.offset + partition.size);
-  const output = await runBinary(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'hevc', '-i', '-', '-vframes', '1', '-c:v', 'mjpeg', '-q:v', '4', '-f', 'image2', '-'], frame, { timeoutMs: 15000 }).catch(() => null);
+  const output = await runBinary(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'hevc', '-i', '-', '-vframes', '1', '-c:v', 'mjpeg', '-q:v', '4', '-f', 'image2', '-'], frame, { timeoutMs: 15000, signal }).catch(e => {
+    if (isWxgfAbort(e, signal)) throw e;
+    return null;
+  });
+  throwIfWxgfAborted(signal);
   const mime = detectImageMime(output);
   return mime ? { mime, bytes: output } : null;
 }
 
-async function findVoipEngineDll() {
+async function findVoipEngineDll({ signal = null } = {}) {
+  throwIfWxgfAborted(signal);
   if (voipEngineCache.path && Date.now() - voipEngineCache.at < 10 * 60 * 1000) return voipEngineCache.path;
   const candidates = [];
   if (process.env.WX_SUMMARY_VOIP_ENGINE) candidates.push(process.env.WX_SUMMARY_VOIP_ENGINE);
-  const processes = await getWeixinProcesses().catch(() => []);
+  const processes = await getWeixinProcesses({ signal }).catch(e => {
+    if (isWxgfAbort(e, signal)) throw e;
+    return [];
+  });
+  throwIfWxgfAborted(signal);
   for (const proc of processes) {
+    throwIfWxgfAborted(signal);
     const exeDir = proc.path ? path.dirname(proc.path) : '';
     if (exeDir) {
       candidates.push(path.join(exeDir, 'VoipEngine.dll'));
@@ -141,6 +190,7 @@ async function findVoipEngineDll() {
   );
 
   for (const candidate of uniquePaths(candidates)) {
+    throwIfWxgfAborted(signal);
     const st = await fsp.stat(candidate).catch(() => null);
     if (st?.isFile()) {
       voipEngineCache = { at: Date.now(), path: candidate };
@@ -151,16 +201,21 @@ async function findVoipEngineDll() {
   return '';
 }
 
-async function findFfmpeg() {
-  return (await resolveFfmpeg()).path;
+async function findFfmpeg({ signal = null } = {}) {
+  return (await resolveFfmpeg({ signal })).path;
 }
 
-async function resolveFfmpeg() {
+async function resolveFfmpeg({ signal = null } = {}) {
+  throwIfWxgfAborted(signal);
   if (Date.now() - ffmpegCache.at < 10 * 60 * 1000) return ffmpegCache;
   const checked = [];
-  for (const candidate of await collectFfmpegCandidates()) {
+  for (const candidate of await collectFfmpegCandidates({ signal })) {
+    throwIfWxgfAborted(signal);
     checked.push(candidate.source);
-    const ok = await runBinary(candidate.file, ['-version'], Buffer.alloc(0), { timeoutMs: 5000 }).then(() => true, () => false);
+    const ok = await runBinary(candidate.file, ['-version'], Buffer.alloc(0), { timeoutMs: 5000, signal }).then(() => true, e => {
+      if (isWxgfAbort(e, signal)) throw e;
+      return false;
+    });
     if (ok) {
       ffmpegCache = { at: Date.now(), path: candidate.file, source: candidate.source, checked: uniqueStrings(checked) };
       return ffmpegCache;
@@ -170,7 +225,8 @@ async function resolveFfmpeg() {
   return ffmpegCache;
 }
 
-async function collectFfmpegCandidates() {
+async function collectFfmpegCandidates({ signal = null } = {}) {
+  throwIfWxgfAborted(signal);
   const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
   const candidates = [];
   const add = (file, source) => {
@@ -196,8 +252,13 @@ async function collectFfmpegCandidates() {
     add('ffmpeg', 'PATH');
   }
 
-  const processes = await getWeixinProcesses().catch(() => []);
+  const processes = await getWeixinProcesses({ signal }).catch(e => {
+    if (isWxgfAbort(e, signal)) throw e;
+    return [];
+  });
+  throwIfWxgfAborted(signal);
   for (const proc of processes) {
+    throwIfWxgfAborted(signal);
     const exeDir = proc.path ? path.dirname(proc.path) : '';
     if (exeDir) {
       add(path.join(exeDir, exe), 'Weixin install dir');
@@ -213,39 +274,83 @@ async function collectFfmpegCandidates() {
   return uniqueCandidates(candidates);
 }
 
-function runBinary(file, args, input, { timeoutMs }) {
+function runBinary(file, args, input, { timeoutMs, signal = null }) {
   return new Promise((resolve, reject) => {
     if (input?.length > MAX_WXGF_BYTES) {
       reject(new Error('wxgf input too large'));
+      return;
+    }
+    if (signal?.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : wxgfAbortError());
       return;
     }
     const child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const stdout = [];
     const stderr = [];
     let outBytes = 0;
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error('wxgf conversion timed out'));
+    let errBytes = 0;
+    let settled = false;
+    let terminationError = null;
+    let forceKillTimer = null;
+    let timeoutTimer = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(forceKillTimer);
+      signal?.removeEventListener?.('abort', onAbort);
+      fn(value);
+    };
+    const terminate = error => {
+      if (!terminationError) terminationError = error;
+      try { child.kill(); } catch {}
+      if (!forceKillTimer) {
+        forceKillTimer = setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch {}
+        }, 1500);
+        forceKillTimer.unref?.();
+      }
+    };
+    const onAbort = () => {
+      terminate(signal.reason instanceof Error ? signal.reason : wxgfAbortError());
+    };
+    timeoutTimer = setTimeout(() => {
+      terminate(new Error('wxgf conversion timed out'));
     }, timeoutMs);
+    signal?.addEventListener?.('abort', onAbort, { once: true });
     child.stdout.on('data', chunk => {
       outBytes += chunk.length;
       if (outBytes <= MAX_WXGF_BYTES) stdout.push(chunk);
-      else child.kill();
+      else terminate(new Error('wxgf conversion output too large'));
     });
     child.stderr.on('data', chunk => {
-      if (stderr.reduce((n, b) => n + b.length, 0) < 4096) stderr.push(chunk);
+      if (errBytes >= 4096) return;
+      const remaining = 4096 - errBytes;
+      const limited = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      stderr.push(limited);
+      errBytes += limited.length;
     });
     child.on('error', err => {
-      clearTimeout(timer);
-      reject(err);
+      if (!terminationError) terminationError = err;
     });
-    child.on('exit', code => {
-      clearTimeout(timer);
+    child.stdin.on('error', err => {
+      if (!terminationError) terminationError = err;
+      terminate(terminationError);
+    });
+    child.on('close', code => {
       const output = Buffer.concat(stdout);
-      if (code === 0 && output.length) resolve(output);
-      else reject(new Error(Buffer.concat(stderr).toString('utf-8').slice(0, 200) || `process exited ${code}`));
+      if (terminationError) {
+        finish(reject, terminationError);
+        return;
+      }
+      if (code === 0 && output.length) finish(resolve, output);
+      else finish(reject, new Error(Buffer.concat(stderr).toString('utf-8').slice(0, 200) || `process exited ${code}`));
     });
-    child.stdin.end(input || Buffer.alloc(0));
+    try {
+      child.stdin.end(input || Buffer.alloc(0));
+    } catch (e) {
+      terminate(e);
+    }
   });
 }
 
