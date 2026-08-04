@@ -16301,6 +16301,23 @@ async function verifyLinkPreviewPrivateNetworkGuard() {
     'link preview progress should tell users when links are skipped by the configured cap',
   );
 
+  const annotatedTargets = __llmInternals.extractMessageLinkTargets([
+    { time: '09:03', sender: '小张', type: 'text', content: '需要梯子 https://true-sota.com/(需梯子)' },
+    { time: '09:03', sender: '小张', type: 'text', content: '已编码说明 https://true-sota.com/(%E9%9C%80' },
+    { time: '09:04', sender: '小李', type: 'text', content: '原文 https://github.com/mattpocock/skills；原文：Hypers0nic--Python' },
+    { time: '09:05', sender: '小王', type: 'text', content: '正常路径 https://example.com/(guide) https://example.com/path[part]' },
+  ], { allow_private_networks: false });
+  assert.deepEqual(
+    [...new Set(annotatedTargets.map(item => item.url))],
+    [
+      'https://true-sota.com/',
+      'https://github.com/mattpocock/skills',
+      'https://example.com/(guide)',
+      'https://example.com/path[part]',
+    ],
+    'link extraction should cut adjacent Chinese annotations without damaging valid parenthesized or bracketed URL paths',
+  );
+
   let publicFallbackAiBody = '';
   globalThis.fetch = async (url, options = {}) => {
     const target = String(url);
@@ -17491,7 +17508,14 @@ async function verifyMediaAndNicknameParsing() {
     'digest summarization should use the configured long-context model for the full request while keeping chunk and merge model choices explicit',
   );
   assert.ok(summarizer.includes('你正在合并分段摘要') && summarizer.includes('不要因为后段覆盖前段而丢掉链接、待办'), 'chunk-merge prompt should explicitly preserve links and todos from every segment');
-  assert.ok(summarizer.includes("tools: [{ type: 'web_search_preview' }]") && summarizer.includes("`${settings.llm.base_url}/responses`"), 'OpenAI-compatible link research should use Responses web_search_preview when available');
+  assert.ok(
+    summarizer.includes("const AI_WEB_SEARCH_TOOL_TYPES = Object.freeze(['web_search', 'web_search_preview'])")
+      && summarizer.includes('function aiWebSearchToolCandidates')
+      && summarizer.includes('function rememberAiWebSearchTool')
+      && summarizer.includes("`${settings.llm.base_url}/responses`")
+      && summarizer.includes('body: { ...body, tools: [{ type: toolType }] }'),
+    'OpenAI-compatible link research should probe both Responses web-search tool aliases and remember the working one',
+  );
   assert.ok(summarizer.includes('你是链接研究助手') && summarizer.includes('sources 放实际依据 URL'), 'AI link research should ask for source-backed link summaries, not just repeat URLs');
   assert.ok(
     summarizer.includes("status: 'unsupported_content'")
@@ -17506,7 +17530,9 @@ async function verifyMediaAndNicknameParsing() {
   assert.ok(
     summarizer.includes("sources: { type: 'array', minItems: 1")
       && summarizer.includes('function aiResearchRequestedUrlForItem')
+      && summarizer.includes('function aiResearchItemDirectlyMatchesRequestedUrl')
       && summarizer.includes('function verifiedAiResearchSources')
+      && summarizer.includes('allow_external')
       && summarizer.includes('item.accessed === false')
       && summarizer.includes('!sources.length')
       && summarizer.includes('function linkResearchLookupKeys')
@@ -17514,7 +17540,7 @@ async function verifyMediaAndNicknameParsing() {
       && summarizer.includes('${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}')
       && summarizer.includes('normalizeHttpUrl(redactSensitiveUrl(url))')
       && summarizer.includes('normalizeHttpUrl(redactSensitiveUrl(preview?.final_url))'),
-    'AI link research should only attach source-backed results that match the requested URL including query strings and redacted signed URL variants',
+    'AI link research should require each result URL to match the requested link while allowing validated external evidence sources',
   );
   assert.ok(
     summarizer.includes('function markMediaModelFallback')

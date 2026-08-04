@@ -40827,6 +40827,8 @@ async function renderSettings() {
         ok: !!item.ok,
         latency_ms: Number(item.latency_ms || 0) || 0,
       };
+      const toolType = String(item.tool_type || '').trim().toLowerCase();
+      if (['web_search', 'web_search_preview', 'unsupported'].includes(toolType)) target[item.name].tool_type = toolType;
       if (!item.ok && item.error) target[item.name].error = String(item.error).slice(0, 300);
     }
   }
@@ -47969,6 +47971,8 @@ async function renderSetup() {
         ok: !!item.ok,
         latency_ms: Number(item.latency_ms || 0) || 0,
       };
+      const toolType = String(item.tool_type || '').trim().toLowerCase();
+      if (['web_search', 'web_search_preview', 'unsupported'].includes(toolType)) target[item.name].tool_type = toolType;
       if (!item.ok && item.error) target[item.name].error = String(item.error).slice(0, 300);
     }
   }

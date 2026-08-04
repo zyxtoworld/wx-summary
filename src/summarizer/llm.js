@@ -52,6 +52,8 @@ let CONFIGURED_AI_REQUEST_CONCURRENCY = DEFAULT_AI_REQUEST_CONCURRENCY;
 const AI_WAIT_QUEUE = [];
 const AI_WEB_SEARCH_CAPABILITY_CACHE = new Map();
 const MAX_AI_WEB_SEARCH_CAPABILITY_CACHE_ENTRIES = 64;
+const AI_WEB_SEARCH_TOOL_TYPES = Object.freeze(['web_search', 'web_search_preview']);
+const AI_WEB_SEARCH_UNSUPPORTED_TOOL_TYPE = 'unsupported';
 
 function throwIfAborted(signal) {
   if (!signal?.aborted) return;
@@ -402,9 +404,20 @@ async function timedCapabilityTest(name, action, apiKey, signal = null) {
       detail: `能力 ${name} 等待 AI 队列`,
     }, action);
     throwIfAborted(signal);
-    return { name, ok: true, latency_ms: Date.now() - started, sample: cleanField(sample).slice(0, 40) };
+    const sampleText = sample && typeof sample === 'object' && Object.hasOwn(sample, 'text')
+      ? sample.text
+      : sample;
+    const toolType = normalizeAiWebSearchToolType(sample?.tool_type);
+    return {
+      name,
+      ok: true,
+      latency_ms: Date.now() - started,
+      sample: cleanField(sampleText).slice(0, 40),
+      ...(toolType ? { tool_type: toolType } : {}),
+    };
   } catch (e) {
     if (e?.status === 499 || signal?.aborted) throw e;
+    const toolType = normalizeAiWebSearchToolType(e?.ai_web_search_tool_type);
     return {
       name,
       ok: false,
@@ -417,6 +430,7 @@ async function timedCapabilityTest(name, action, apiKey, signal = null) {
       ...(e?.provider_error_detail ? { provider_error_detail: providerErrorCanonicalDetail(e.provider_error_category, e.status) } : {}),
       ...(e?.provider_request_id ? { provider_request_id: sanitizeText(e.provider_request_id).slice(0, 128) } : {}),
       ...(Number(e?.retry_after_ms || 0) > 0 ? { retry_after_ms: Math.min(7 * 24 * 60 * 60 * 1000, Number(e.retry_after_ms)) } : {}),
+      ...(toolType ? { tool_type: toolType } : {}),
     };
   }
 }
@@ -529,22 +543,37 @@ async function testOpenAiResponses({ base_url, api_key, model, timeout_ms, signa
 }
 
 async function testOpenAiResponsesWebSearch({ base_url, api_key, model, timeout_ms, signal = null }) {
-  const json = await fetchJson(`${base_url}/responses`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${api_key}` },
-    body: {
-      model,
-      temperature: 0,
-      tools: [{ type: 'web_search_preview' }],
-      input: '请使用可用的网页搜索/打开工具查看 https://example.com/ ，用一句简体中文回答它是什么页面。无法访问也要用中文说明。',
-    },
-    timeout_ms,
-    api_key,
-    signal,
-  });
-  const text = extractResponsesText(json);
-  if (!text) throw httpError(502, 'Responses web_search returned empty content');
-  return text;
+  let lastError = null;
+  for (let index = 0; index < AI_WEB_SEARCH_TOOL_TYPES.length; index += 1) {
+    const toolType = AI_WEB_SEARCH_TOOL_TYPES[index];
+    try {
+      const json = await fetchJson(`${base_url}/responses`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${api_key}` },
+        body: {
+          model,
+          temperature: 0,
+          tools: [{ type: toolType }],
+          input: '请使用可用的网页搜索/打开工具查看 https://example.com/ ，用一句简体中文回答它是什么页面。无法访问也要用中文说明。',
+        },
+        timeout_ms,
+        api_key,
+        signal,
+      });
+      const text = extractResponsesText(json);
+      if (!text) throw httpError(502, 'Responses web_search returned empty content');
+      return { text, tool_type: toolType };
+    } catch (error) {
+      lastError = error;
+      const unsupported = isLikelyUnsupportedWebSearchError(error);
+      const isLastTool = index === AI_WEB_SEARCH_TOOL_TYPES.length - 1;
+      if (!unsupported || isLastTool) {
+        if (unsupported && isLastTool) markAiWebSearchErrorToolType(error, AI_WEB_SEARCH_UNSUPPORTED_TOOL_TYPE);
+        throw error;
+      }
+    }
+  }
+  throw lastError || httpError(502, 'Responses web_search returned empty content');
 }
 
 async function testAnthropicSummaryJson({ base_url, api_key, model, timeout_ms, signal = null }) {
@@ -2512,8 +2541,59 @@ function resolveDigestSourceLinkUrl(link = {}, meta = {}) {
 
 function cleanUrlCandidate(value) {
   let s = String(value || '').trim();
-  while (/[),.;:!?，。；：！？、》”’\]}]+$/.test(s)) s = s.slice(0, -1);
+  const annotationBoundary = urlAnnotationBoundary(s);
+  if (annotationBoundary > 0) s = s.slice(0, annotationBoundary);
+  while (/[),.;:!?，。；：！？、》”’\]}]+$/.test(s)) {
+    const last = s.at(-1);
+    if ((last === ')' && hasBalancedUrlPair(s, '(', ')'))
+      || (last === ']' && hasBalancedUrlPair(s, '[', ']'))
+      || (last === '}' && hasBalancedUrlPair(s, '{', '}'))) break;
+    s = s.slice(0, -1);
+  }
   return s;
+}
+
+function urlAnnotationBoundary(value) {
+  const s = String(value || '');
+  for (let index = 0; index < s.length; index += 1) {
+    if (!/[;；:：]/.test(s[index])) continue;
+    const tail = decodeUrlCandidateText(s.slice(index + 1).trim());
+    if (['原文', '原链接', '来源', '正文', '内容', '备注'].some(label => tail.startsWith(label))) return index;
+  }
+  const pairs = { '(': ')', '（': '）', '[': ']', '［': '］' };
+  for (let index = 0; index < s.length; index += 1) {
+    const opener = s[index];
+    const closer = pairs[opener];
+    const suffix = s.slice(index + 1);
+    const decodedSuffix = decodeUrlCandidateText(suffix);
+    if (!closer || !/[\u3400-\u9fff]/u.test(decodedSuffix)) continue;
+    const prefix = s.slice(0, index);
+    if (!/^https?:\/\//i.test(prefix) || !prefix.endsWith('/')) continue;
+    const closeIndex = s.indexOf(closer, index + 1);
+    if (closeIndex < 0 || /^(?:需|需要|须|必须|要)/u.test(decodedSuffix)) return index;
+  }
+  return -1;
+}
+
+function decodeUrlCandidateText(value) {
+  const text = String(value || '');
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+function hasBalancedUrlPair(value, opener, closer) {
+  let depth = 0;
+  for (const char of String(value || '')) {
+    if (char === opener) depth += 1;
+    else if (char === closer) {
+      depth -= 1;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0;
 }
 
 function normalizeHttpUrl(value) {
@@ -3247,7 +3327,6 @@ async function fetchAiLinkResearchBatch(urls, settings, signal = null, onProgres
   const body = {
     model: settings.llm.long_context_model || settings.llm.model,
     temperature: 0,
-    tools: [{ type: 'web_search_preview' }],
     text: {
       format: {
         type: 'json_schema',
@@ -3291,16 +3370,34 @@ async function fetchAiLinkResearchBatch(urls, settings, signal = null, onProgres
     label: 'AI 总结 · 等待 AI 查链接',
     detail: `${urls.length} 个网页链接等待联网核查`,
     limit: settings.llm.ai_concurrency,
-  }, () => {
+  }, async () => {
     consumeAiCallBudget(aiCallBudget, { mode: 'link-research', onProgress });
-    return fetchJson(`${settings.llm.base_url}/responses`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${settings.llm.api_key}` },
-      body,
-      timeout_ms: Math.max(30000, Math.min(Number(settings.llm.timeout_ms || 120000), 120000)),
-      api_key: settings.llm.api_key,
-      signal,
-    });
+    const toolTypes = aiWebSearchToolCandidates(settings);
+    let lastError = null;
+    for (let index = 0; index < toolTypes.length; index += 1) {
+      const toolType = toolTypes[index];
+      try {
+        const json = await fetchJson(`${settings.llm.base_url}/responses`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${settings.llm.api_key}` },
+          body: { ...body, tools: [{ type: toolType }] },
+          timeout_ms: Math.max(30000, Math.min(Number(settings.llm.timeout_ms || 120000), 120000)),
+          api_key: settings.llm.api_key,
+          signal,
+        });
+        rememberAiWebSearchTool(settings, toolType);
+        return json;
+      } catch (error) {
+        lastError = error;
+        const unsupported = isLikelyUnsupportedWebSearchError(error);
+        const isLastTool = index === toolTypes.length - 1;
+        if (!unsupported || isLastTool) {
+          if (unsupported && isLastTool) markAiWebSearchErrorToolType(error, AI_WEB_SEARCH_UNSUPPORTED_TOOL_TYPE);
+          throw error;
+        }
+      }
+    }
+    throw lastError || httpError(502, 'AI link research request failed');
   });
   const text = extractResponsesText(json);
   if (!text) {
@@ -3317,42 +3414,84 @@ async function fetchAiLinkResearchBatch(urls, settings, signal = null, onProgres
       if (key && !requestedByKey.has(key)) requestedByKey.set(key, url);
     }
   }
-  for (const item of arrayOf(parsed?.links)) {
+  for (const item of aiLinkResearchItems(parsed)) {
     const requestedUrl = aiResearchRequestedUrlForItem(item, requestedByKey);
-    const sources = verifiedAiResearchSources(item.sources, requestedUrl);
-    if (!requestedUrl || item.accessed === false || !cleanField(item.summary) || !sources.length) continue;
+    const sources = verifiedAiResearchSources(aiResearchSourceValues(item), requestedUrl, {
+      allow_external: aiResearchItemDirectlyMatchesRequestedUrl(item, requestedUrl),
+    });
+    const summary = cleanField(item.summary || item.description || item.abstract || '');
+    if (!requestedUrl || !aiLinkResearchItemWasAccessed(item) || !summary || !sources.length) continue;
     out.set(requestedUrl, {
-      title: redactSensitiveUrlsInText(cleanField(item.title)).slice(0, 200),
-      summary: redactSensitiveUrlsInText(cleanField(item.summary)).slice(0, 1000),
+      title: redactSensitiveUrlsInText(cleanField(item.title || item.name)).slice(0, 200),
+      summary: redactSensitiveUrlsInText(summary).slice(0, 1000),
       sources,
     });
   }
   return out;
 }
 
+function aiLinkResearchItems(parsed = null) {
+  if (Array.isArray(parsed)) return parsed;
+  if (!parsed || typeof parsed !== 'object') return [];
+  for (const key of ['links', 'results', 'items', 'data']) {
+    const value = parsed[key];
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === 'object' && (value.url || value.link || value.href)) return [value];
+  }
+  if (parsed.url || parsed.link || parsed.href) return [parsed];
+  return [];
+}
+
+function aiResearchSourceValues(item = {}) {
+  return arrayOf(item.sources)
+    .map(source => typeof source === 'string' ? source : (source?.url || source?.link || source?.href || ''))
+    .filter(Boolean);
+}
+
+function aiResearchItemUrl(item = {}) {
+  return item?.url || item?.link || item?.href || '';
+}
+
+function aiResearchItemDirectlyMatchesRequestedUrl(item = {}, requestedUrl = '') {
+  const itemUrl = aiResearchItemUrl(item);
+  const requestedKeys = new Set(linkResearchLookupKeys(requestedUrl));
+  if (!itemUrl || !requestedKeys.size) return false;
+  return linkResearchLookupKeys(itemUrl).some(key => requestedKeys.has(key));
+}
+
+function aiLinkResearchItemWasAccessed(item = {}) {
+  if (item.accessed === false) return false;
+  if (typeof item.accessed === 'boolean') return item.accessed;
+  const status = String(item.status || '').trim().toLowerCase();
+  if (!status) return true;
+  return !/^(?:failed|error|not[_ -]?found|unavailable|blocked|inaccessible|not[_ -]?verified|unknown)$/.test(status);
+}
+
 function aiResearchRequestedUrlForItem(item = {}, requestedByKey = new Map()) {
   const candidates = [
-    item?.url,
+    aiResearchItemUrl(item),
     ...(Array.isArray(item?.sources) ? item.sources : []),
   ];
   for (const candidate of candidates) {
-    for (const key of linkResearchLookupKeys(candidate)) {
+    const source = typeof candidate === 'string' ? candidate : (candidate?.url || candidate?.link || candidate?.href || '');
+    for (const key of linkResearchLookupKeys(source)) {
       if (key && requestedByKey.has(key)) return requestedByKey.get(key);
     }
   }
   return '';
 }
 
-function verifiedAiResearchSources(sources = [], requestedUrl = '') {
+function verifiedAiResearchSources(sources = [], requestedUrl = '', options = {}) {
   const requestedKeys = new Set(linkResearchLookupKeys(requestedUrl));
   if (!requestedKeys.size) return [];
+  const allowExternal = options?.allow_external === true;
   const out = [];
   const seen = new Set();
   for (const source of Array.isArray(sources) ? sources : []) {
     const clean = cleanField(source);
     const normalized = normalizeHttpUrl(clean);
     const sourceKeys = linkResearchLookupKeys(normalized);
-    if (!normalized || !sourceKeys.some(key => requestedKeys.has(key))) continue;
+    if (!normalized || (!allowExternal && !sourceKeys.some(key => requestedKeys.has(key)))) continue;
     const redacted = redactSensitiveUrlsInText(clean).slice(0, 1200);
     if (!redacted || seen.has(redacted)) continue;
     seen.add(redacted);
@@ -3442,6 +3581,22 @@ function shouldUseAiLinkResearch(urls, settings, cfg) {
   return true;
 }
 
+function normalizeAiWebSearchToolType(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (AI_WEB_SEARCH_TOOL_TYPES.includes(normalized)) return normalized;
+  if (normalized === AI_WEB_SEARCH_UNSUPPORTED_TOOL_TYPE) return normalized;
+  return '';
+}
+
+function markAiWebSearchErrorToolType(error, toolType) {
+  const normalized = normalizeAiWebSearchToolType(toolType);
+  if (!normalized || !error || typeof error !== 'object') return error;
+  try {
+    error.ai_web_search_tool_type = normalized;
+  } catch {}
+  return error;
+}
+
 function aiWebSearchCapabilityKey(settings = {}) {
   return [
     settings?.llm?.provider || '',
@@ -3450,20 +3605,50 @@ function aiWebSearchCapabilityKey(settings = {}) {
   ].join('|');
 }
 
-function aiWebSearchRuntimeSupport(settings = {}) {
+function aiWebSearchRuntimeEntry(settings = {}) {
   const key = aiWebSearchCapabilityKey(settings);
   if (!key || !AI_WEB_SEARCH_CAPABILITY_CACHE.has(key)) return undefined;
-  const supported = AI_WEB_SEARCH_CAPABILITY_CACHE.get(key);
+  const entry = AI_WEB_SEARCH_CAPABILITY_CACHE.get(key);
   AI_WEB_SEARCH_CAPABILITY_CACHE.delete(key);
-  AI_WEB_SEARCH_CAPABILITY_CACHE.set(key, supported);
-  return supported;
+  AI_WEB_SEARCH_CAPABILITY_CACHE.set(key, entry);
+  return entry;
+}
+
+function aiWebSearchRuntimeSupport(settings = {}) {
+  const entry = aiWebSearchRuntimeEntry(settings);
+  if (entry === undefined) return undefined;
+  if (entry && typeof entry === 'object' && Object.hasOwn(entry, 'supported')) return !!entry.supported;
+  return entry;
+}
+
+function aiWebSearchRuntimeToolType(settings = {}) {
+  const entry = aiWebSearchRuntimeEntry(settings);
+  return normalizeAiWebSearchToolType(entry && typeof entry === 'object' ? entry.tool_type : '');
 }
 
 function rememberAiWebSearchSupport(settings = {}, supported) {
   const key = aiWebSearchCapabilityKey(settings);
   if (!key) return;
+  const previous = AI_WEB_SEARCH_CAPABILITY_CACHE.get(key);
+  const previousToolType = normalizeAiWebSearchToolType(previous && typeof previous === 'object' ? previous.tool_type : '');
   AI_WEB_SEARCH_CAPABILITY_CACHE.delete(key);
-  AI_WEB_SEARCH_CAPABILITY_CACHE.set(key, !!supported);
+  AI_WEB_SEARCH_CAPABILITY_CACHE.set(key, {
+    supported: !!supported,
+    tool_type: supported ? previousToolType : AI_WEB_SEARCH_UNSUPPORTED_TOOL_TYPE,
+  });
+  while (AI_WEB_SEARCH_CAPABILITY_CACHE.size > MAX_AI_WEB_SEARCH_CAPABILITY_CACHE_ENTRIES) {
+    const oldestKey = AI_WEB_SEARCH_CAPABILITY_CACHE.keys().next().value;
+    if (oldestKey === undefined) break;
+    AI_WEB_SEARCH_CAPABILITY_CACHE.delete(oldestKey);
+  }
+}
+
+function rememberAiWebSearchTool(settings = {}, toolType) {
+  const normalized = normalizeAiWebSearchToolType(toolType);
+  const key = aiWebSearchCapabilityKey(settings);
+  if (!key || !normalized || normalized === AI_WEB_SEARCH_UNSUPPORTED_TOOL_TYPE) return;
+  AI_WEB_SEARCH_CAPABILITY_CACHE.delete(key);
+  AI_WEB_SEARCH_CAPABILITY_CACHE.set(key, { supported: true, tool_type: normalized });
   while (AI_WEB_SEARCH_CAPABILITY_CACHE.size > MAX_AI_WEB_SEARCH_CAPABILITY_CACHE_ENTRIES) {
     const oldestKey = AI_WEB_SEARCH_CAPABILITY_CACHE.keys().next().value;
     if (oldestKey === undefined) break;
@@ -3482,7 +3667,7 @@ function aiWebSearchRuntimeSupportCacheState() {
   };
 }
 
-function savedAiWebSearchSupport(settings = {}) {
+function savedAiWebSearchCapabilityItem(settings = {}) {
   const cap = settings?.llm?.capabilities;
   if (!cap || typeof cap !== 'object') return undefined;
   const baseModel = settings?.llm?.model || '';
@@ -3495,7 +3680,29 @@ function savedAiWebSearchSupport(settings = {}) {
   if (longModel && longModel !== baseModel && (!source || typeof source !== 'object' || source.model !== longModel)) return undefined;
   const item = source.responses_web_search || source.web_search_preview || source.web_search;
   if (!item || typeof item !== 'object' || typeof item.ok !== 'boolean') return undefined;
+  return item;
+}
+
+function savedAiWebSearchSupport(settings = {}) {
+  const item = savedAiWebSearchCapabilityItem(settings);
+  if (!item) return undefined;
+  const toolType = normalizeAiWebSearchToolType(item.tool_type);
+  // A pre-compatibility snapshot had no tool_type. Its false result is not
+  // proof that the endpoint rejects both supported tool aliases.
+  if (!item.ok && !toolType) return undefined;
   return item.ok;
+}
+
+function savedAiWebSearchToolType(settings = {}) {
+  return normalizeAiWebSearchToolType(savedAiWebSearchCapabilityItem(settings)?.tool_type);
+}
+
+function aiWebSearchToolCandidates(settings = {}) {
+  const preferred = aiWebSearchRuntimeToolType(settings)
+    || savedAiWebSearchToolType(settings)
+    || AI_WEB_SEARCH_TOOL_TYPES[0];
+  return [preferred, ...AI_WEB_SEARCH_TOOL_TYPES]
+    .filter((value, index, values) => value && value !== AI_WEB_SEARCH_UNSUPPORTED_TOOL_TYPE && values.indexOf(value) === index);
 }
 
 function extractResponsesText(json) {
@@ -4571,6 +4778,15 @@ async function fetchJson(url, { method, headers = {}, body, timeout_ms, api_key,
         provider_endpoint: providerEndpointPath(url),
         ...requestDiagnostics,
       });
+      if (providerError.raw_message) {
+        try {
+          Object.defineProperty(error, '_provider_error_message', {
+            value: sanitizeText(providerError.raw_message, api_key),
+            enumerable: false,
+            configurable: true,
+          });
+        } catch {}
+      }
       const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
       if (retryAfterMs > 0) error.retry_after_ms = retryAfterMs;
       throw error;
@@ -4717,6 +4933,7 @@ function providerErrorSummary(status = 0, headers = null, json = null, fallback 
     code: safeProviderErrorCode(extracted.code),
     detail: providerErrorCanonicalDetail(category, status),
     request_id: requestId,
+    raw_message: extracted.message || fallback,
     message: `${label}（HTTP ${Math.max(0, Number(status || 0) || 0)}）${requestId ? `；请求 ID：${requestId}` : ''}`,
   };
 }
@@ -5232,7 +5449,10 @@ function isLikelyUnsupportedMediaError(err) {
 
 function isLikelyUnsupportedWebSearchError(err) {
   const status = Number(err?.status || 0);
-  const message = String(err?.message || '').toLowerCase();
+  const message = [err?.message, err?._provider_error_message]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
   return [400, 404, 405, 415, 422, 501].includes(status)
     && /responses|web[_ -]?search|web_search_preview|tool|tools|unsupported|not supported|unknown parameter|invalid.*tool|not found|no such endpoint/.test(message);
 }
@@ -5281,6 +5501,7 @@ function sleep(ms, signal = null) {
 export const __llmInternals = {
   createAiCallBudget,
   consumeAiCallBudget,
+  aiWebSearchToolCandidates,
   aiWebSearchRuntimeSupport,
   aiWebSearchRuntimeSupportCacheState,
   readResponseTextLimited,
@@ -5319,6 +5540,7 @@ export const __llmInternals = {
   linkPreviewProgressDetail,
   linkPreviewStatusMap,
   linkPreviewAllowsPrivateNetworks,
+  fetchAiLinkResearchBatch,
   redactSensitiveUrl,
   linkOriginPathKey,
   linkOriginPathLooseKey,
@@ -5341,8 +5563,10 @@ export const __llmInternals = {
   isLikelyUnsupportedAudioError,
   isLikelyUnsupportedMediaError,
   isLikelyUnsupportedWebSearchError,
+  normalizeAiWebSearchToolType,
   isJsonParseError,
   shouldUseAiLinkResearch,
+  rememberAiWebSearchTool,
   rememberAiWebSearchSupport,
   clearAiWebSearchRuntimeSupportCache,
   cleanupAiStyleText,

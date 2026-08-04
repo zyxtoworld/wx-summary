@@ -306,6 +306,25 @@ function Start-VersionAwareServerLauncher {
     -PassThru
 }
 
+function Read-LauncherFailureDetail {
+  $details = @()
+  foreach ($path in @($StderrLog, $StdoutLog)) {
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    try {
+      $lines = @(Get-Content -LiteralPath $path -Tail 12 -Encoding UTF8 -ErrorAction Stop |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+      if ($lines.Count -gt 0) {
+        $last = $lines[$lines.Count - 1].Trim()
+        if ($last.Length -gt 500) { $last = $last.Substring(0, 500) }
+        $details += "$([System.IO.Path]::GetFileName($path)): $last"
+      }
+    } catch {}
+  }
+  if ($details.Count -gt 0) { return " $($details -join ' | ')" }
+  return " See startup logs: $StderrLog; $StdoutLog"
+}
+
 function Wait-VersionAwareServer {
   param($LauncherProcess)
   $deadline = (Get-Date).AddSeconds($VersionAwareLauncherWaitSeconds)
@@ -317,11 +336,18 @@ function Wait-VersionAwareServer {
       if ($attached) { return $attached }
     }
     if ($LauncherProcess.HasExited) {
-      if ($LauncherProcess.ExitCode -ne 0) {
-        throw "wx-summary version-aware launcher failed with exit code $($LauncherProcess.ExitCode)."
-      }
       $attached = Try-AttachExistingServer
       if ($attached) { return $attached }
+      $rawExitCode = $null
+      try { $rawExitCode = $LauncherProcess.ExitCode } catch {}
+      $exitCodeText = if ($null -eq $rawExitCode -or [string]::IsNullOrWhiteSpace([string]$rawExitCode)) {
+        'unknown'
+      } else {
+        [string]$rawExitCode
+      }
+      if ($exitCodeText -ne '0') {
+        throw "wx-summary version-aware launcher failed with exit code $exitCodeText.$(Read-LauncherFailureDetail)"
+      }
     }
     Start-Sleep -Milliseconds 250
   }

@@ -1483,6 +1483,8 @@ function copyLlmCapabilityItems(source, out) {
       ok: !!item.ok,
       latency_ms: finiteInteger(item.latency_ms, 0, 0, 600000),
     };
+    const toolType = String(item.tool_type || '').trim().toLowerCase();
+    if (['web_search', 'web_search_preview', 'unsupported'].includes(toolType)) out[key].tool_type = toolType;
     const error = String(item.error || '').trim();
     if (error && !item.ok) out[key].error = error.slice(0, 300);
   }
