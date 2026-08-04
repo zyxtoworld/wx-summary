@@ -93,9 +93,13 @@ assert.match(graceful, /const schedulerStopResult = await stopScheduler/);
 assert.match(graceful, /schedulerStopResult\?\.stopped === true/);
 assert.match(graceful, /schedulerStopResult\?\.running !== true/);
 assert.match(graceful, /schedulerStopResult\?\.timed_out !== true/);
-assert.match(graceful, /const finalMirrors = activeWxDbMirrorTaskStatus\(\);[\s\S]*?const databaseSessionCleanupSafe = schedulerCleanupSafe && finalMirrorCleanupSafe && digestCleanupSafe;[\s\S]*?if \(databaseSessionCleanupSafe\) \{[\s\S]*?releaseAllWxDbIsolatedBatchSessions/);
+assert.match(graceful, /const finalMirrors = activeWxDbMirrorTaskStatus\(\);[\s\S]*?const databaseDependenciesSettled = schedulerCleanupSafe && finalMirrorCleanupSafe && digestCleanupSafe;/);
+assert.match(graceful, /setShutdownPhase\('closing_database_read_sessions'\);[\s\S]*?await releaseAllWxDbIsolatedBatchSessions\('service_shutdown'\)/,
+  'shutdown must always close isolated database workers even when another producer failed to settle');
+assert.doesNotMatch(graceful, /if \(databaseDependenciesSettled\) \{[\s\S]*?releaseAllWxDbIsolatedBatchSessions/,
+  'unsettled dependencies may preserve temporary files but must not leave worker processes alive');
 assert.match(graceful, /const temporaryCleanupSafe = shutdownTemporaryCleanupSafe\([\s\S]*?if \(temporaryCleanupSafe\) \{[\s\S]*?clearTmpDirForShutdown/);
-assert.match(graceful, /shutdown_scheduler_cleanup_skipped/);
+assert.match(graceful, /shutdown_database_dependencies_not_settled/);
 assert.match(graceful, /shutdown_temporary_cleanup_skipped/);
 
 console.log('tray lifecycle hardening tests passed');

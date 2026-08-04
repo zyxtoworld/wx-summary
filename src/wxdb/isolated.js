@@ -27,6 +27,10 @@ const PERSISTENT_COLLECT_WORKER_FORCE_EXIT_MS = 5000;
 const MAX_PERSISTENT_COLLECT_WORKERS = 4;
 const PERSISTENT_COLLECT_WORKERS = new Map();
 const CLOSING_PERSISTENT_COLLECT_WORKERS = new Map();
+const ONE_SHOT_WXDB_WORKERS = new Map();
+let NEXT_ONE_SHOT_WXDB_WORKER_ID = 1;
+let WXDB_ISOLATED_WORKER_ADMISSION_CLOSED = false;
+let WXDB_ISOLATED_WORKER_SHUTDOWN_MESSAGE = '';
 const ACCOUNT_IDENTITY_SHARD_EVIDENCE_CACHE = new Map();
 const ACCOUNT_IDENTITY_SHARD_EVIDENCE_CACHE_LIMIT = 48;
 const ACCOUNT_IDENTITY_SHARD_EVIDENCE_PER_ACCOUNT_LIMIT = 24;
@@ -356,6 +360,175 @@ function persistentCollectWorkerRecords() {
   ])];
 }
 
+function oneShotWxDbWorkerRecords() {
+  return [...ONE_SHOT_WXDB_WORKERS.values()];
+}
+
+function wxDbIsolatedWorkerShutdownError(message = '') {
+  return Object.assign(new Error(message || WXDB_ISOLATED_WORKER_SHUTDOWN_MESSAGE || '服务正在关闭，数据库读取任务未开始。'), {
+    name: 'AbortError',
+    status: 503,
+    code: 'wxdb_worker_shutdown',
+    public_code: 'wxdb_worker_shutdown',
+  });
+}
+
+export function activeWxDbIsolatedWorkerStatus() {
+  const persistentRecords = persistentCollectWorkerRecords();
+  const oneShotRecords = oneShotWxDbWorkerRecords();
+  const allRecords = [...persistentRecords, ...oneShotRecords];
+  return {
+    active: allRecords.length,
+    persistent: persistentRecords.length,
+    one_shot: oneShotRecords.length,
+    cleanup_failed: allRecords.filter(record => !!record?.cleanup_error).length,
+    closing: WXDB_ISOLATED_WORKER_ADMISSION_CLOSED,
+  };
+}
+
+function registerOneShotWxDbWorker(child, workerToken, workerType) {
+  let resolveLifecycle = () => {};
+  const id = NEXT_ONE_SHOT_WXDB_WORKER_ID++;
+  const record = {
+    id,
+    child,
+    worker_token: workerToken,
+    worker_type: String(workerType || '').trim(),
+    started_at: Date.now(),
+    closing: false,
+    termination_started: false,
+    cleanup_promise: null,
+    cleanup_error: null,
+    close_promise: null,
+    stop: null,
+    lifecycle_promise: new Promise(resolve => { resolveLifecycle = resolve; }),
+    resolve_lifecycle: () => resolveLifecycle(),
+  };
+  ONE_SHOT_WXDB_WORKERS.set(id, record);
+  return record;
+}
+
+function finalizeOneShotWxDbWorker(record) {
+  if (!record || record.termination_started) return record?.lifecycle_promise || Promise.resolve(false);
+  record.termination_started = true;
+  record.closing = true;
+  record.cleanup_promise = cleanupWorkerCopiesAfterExit(record.child?.pid, record.worker_token)
+    .then(() => {
+      record.cleanup_error = null;
+      ONE_SHOT_WXDB_WORKERS.delete(record.id);
+      return true;
+    })
+    .catch(error => {
+      record.cleanup_error = error;
+      logWarn('wxdb_worker_copy_cleanup_failed', {
+        worker_pid: record.child?.pid,
+        error: String(error?.message || error).slice(0, 240),
+      });
+      return false;
+    })
+    .finally(() => record.resolve_lifecycle());
+  return record.lifecycle_promise;
+}
+
+async function ensureOneShotWxDbWorkerCleanup(record) {
+  if (!record) return false;
+  await record.lifecycle_promise;
+  if (!record.cleanup_error) {
+    ONE_SHOT_WXDB_WORKERS.delete(record.id);
+    return true;
+  }
+  try {
+    record.cleanup_promise = cleanupWorkerCopiesAfterExit(record.child?.pid, record.worker_token);
+    await record.cleanup_promise;
+    record.cleanup_error = null;
+    ONE_SHOT_WXDB_WORKERS.delete(record.id);
+    return true;
+  } catch (error) {
+    record.cleanup_error = error;
+    throw error;
+  }
+}
+
+function waitForOneShotWxDbWorkerLifecycle(record, timeoutMs) {
+  if (!record || (record.termination_started && !record.cleanup_error && !ONE_SHOT_WXDB_WORKERS.has(record.id))) {
+    return Promise.resolve(true);
+  }
+  const timeout = Math.max(1, Number(timeoutMs || 0) || 1);
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(false), timeout);
+    timer.unref?.();
+    record.lifecycle_promise.then(() => finish(true), () => finish(false));
+  });
+}
+
+function oneShotWxDbWorkerCloseTimeoutError(record) {
+  return Object.assign(new Error('一次性数据库读取进程未能在限定时间内退出。'), {
+    status: 500,
+    code: 'wxdb_worker_close_timeout',
+    public_code: 'wxdb_worker_close_timeout',
+    worker_pid: Math.max(0, Number(record?.child?.pid || 0) || 0),
+  });
+}
+
+async function closeOneShotWxDbWorker(record, reason = 'service_shutdown') {
+  if (!record) return false;
+  if (record.close_promise) return record.close_promise;
+  const closePromise = (async () => {
+    record.closing = true;
+    const error = wxDbIsolatedWorkerShutdownError(reason === 'service_shutdown' ? '' : String(reason || ''));
+    if (record.child?.exitCode !== null && !record.termination_started) finalizeOneShotWxDbWorker(record);
+    if (!record.termination_started) {
+      if (typeof record.stop === 'function') record.stop(error);
+      else forceStopWxDbChild(record.child);
+    }
+    if (await waitForOneShotWxDbWorkerLifecycle(record, PERSISTENT_COLLECT_WORKER_CLOSE_GRACE_MS)) {
+      return ensureOneShotWxDbWorkerCleanup(record);
+    }
+    forceStopWxDbChild(record.child);
+    if (await waitForOneShotWxDbWorkerLifecycle(record, PERSISTENT_COLLECT_WORKER_FORCE_EXIT_MS)) {
+      return ensureOneShotWxDbWorkerCleanup(record);
+    }
+    throw oneShotWxDbWorkerCloseTimeoutError(record);
+  })();
+  record.close_promise = closePromise.finally(() => {
+    if (ONE_SHOT_WXDB_WORKERS.get(record.id) === record) record.close_promise = null;
+  });
+  return record.close_promise;
+}
+
+export function closeWxDbIsolatedWorkerAdmission(message = '服务正在关闭，数据库读取任务已取消。') {
+  WXDB_ISOLATED_WORKER_ADMISSION_CLOSED = true;
+  WXDB_ISOLATED_WORKER_SHUTDOWN_MESSAGE = String(message || '').trim();
+  const error = wxDbIsolatedWorkerShutdownError();
+  let cancelled = 0;
+  for (const record of oneShotWxDbWorkerRecords()) {
+    if (record.closing) continue;
+    record.closing = true;
+    if (typeof record.stop === 'function') record.stop(error);
+    else forceStopWxDbChild(record.child);
+    cancelled += 1;
+  }
+  for (const record of persistentCollectWorkerRecords()) {
+    if (record.closing) continue;
+    record.retire_after_request = true;
+    void closePersistentCollectWorker(record, 'service_shutdown').catch(closeError => {
+      logWarn('wxdb_worker_shutdown_close_failed', {
+        worker_pid: record.child?.pid,
+        error: String(closeError?.message || closeError).slice(0, 240),
+      });
+    });
+    cancelled += 1;
+  }
+  return { ...activeWxDbIsolatedWorkerStatus(), cancelled };
+}
+
 function markPersistentCollectWorkerClosing(record) {
   if (!record) return;
   record.closing = true;
@@ -573,14 +746,25 @@ export async function releaseWxDbIsolatedBatchSession(batchId) {
 
 export async function releaseAllWxDbIsolatedBatchSessions(reason = 'service_shutdown') {
   const records = persistentCollectWorkerRecords();
-  const settled = await Promise.allSettled(records.map(record => closePersistentCollectWorker(record, reason)));
+  const oneShotRecords = oneShotWxDbWorkerRecords();
+  const settled = await Promise.allSettled([
+    ...records.map(record => closePersistentCollectWorker(record, reason)),
+    ...oneShotRecords.map(record => closeOneShotWxDbWorker(record, reason)),
+  ]);
   const failed = settled.find(item => item.status === 'rejected');
   if (failed) throw failed.reason;
-  return records.length;
+  return {
+    persistent: records.length,
+    one_shot: oneShotRecords.length,
+    ...activeWxDbIsolatedWorkerStatus(),
+  };
 }
 
 function runWxDbIsolated(workerType = 'collect', options = {}) {
   const { signal = null, onProgress = null, pre_media_filter = null, timeout_ms = 0, ...rawPayload } = options || {};
+  if (WXDB_ISOLATED_WORKER_ADMISSION_CLOSED) {
+    return Promise.reject(wxDbIsolatedWorkerShutdownError());
+  }
   if (typeof pre_media_filter === 'function') {
     throw Object.assign(new Error('独立消息读取不接受不可序列化筛选函数，请传 pre_media_filter_spec。'), {
       status: 500,
@@ -679,16 +863,10 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
         stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
         env: { ...process.env, WX_SUMMARY_WXDB_MESSAGE_WORKER: '1', WX_SUMMARY_WXDB_WORKER_TOKEN: workerToken },
       });
-    let oneShotCleanupStarted = false;
+    const oneShotRecord = persistentRecord ? null : registerOneShotWxDbWorker(child, workerToken, workerType);
     const cleanupOneShotWorkerAfterExit = () => {
-      if (persistentRecord || oneShotCleanupStarted) return;
-      oneShotCleanupStarted = true;
-      void cleanupWorkerCopiesAfterExit(child.pid, workerToken).catch(error => {
-        logWarn('wxdb_worker_copy_cleanup_failed', {
-          worker_pid: child.pid,
-          error: String(error?.message || error).slice(0, 240),
-        });
-      });
+      if (!oneShotRecord) return;
+      void finalizeOneShotWxDbWorker(oneShotRecord);
     };
     if (!persistentRecord) {
       child.once('exit', cleanupOneShotWorkerAfterExit);
@@ -752,6 +930,15 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
       }
       fn(value);
     };
+    if (oneShotRecord) {
+      oneShotRecord.stop = error => {
+        if (!settled) {
+          finish(reject, error || wxDbIsolatedWorkerShutdownError(), { cooperativeStop: true });
+          return;
+        }
+        stopChild({ cooperative: true });
+      };
+    }
     const onAbort = () => finish(reject, isolatedAbortError(signal), { cooperativeStop: true });
     signal?.addEventListener?.('abort', onAbort, { once: true });
     if (signal?.aborted) {

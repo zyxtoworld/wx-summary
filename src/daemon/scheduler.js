@@ -48,6 +48,7 @@ let schedulerGeneration = 0;
 let schedulerLifecycleQueue = Promise.resolve();
 let schedulerLifecycleTransition = null;
 let schedulerTerminalShutdown = false;
+let schedulerStopRequestsPending = 0;
 let schedulerIdleRestart = null;
 let schedulerManualDigestActivityProbe = null;
 const SCHEDULER_LATE_SYNC_GRACE_MS = 30 * 60 * 1000;
@@ -554,7 +555,7 @@ function schedulerTimerCycleActive() {
 }
 
 function schedulerActivityActive() {
-  return schedulerRunActive() || schedulerTimerCycleActive();
+  return schedulerRunActive() || activeRunPromise !== null || schedulerTimerCycleActive();
 }
 
 function schedulerTimerCycleOwnsRun(signal = null) {
@@ -641,8 +642,10 @@ function throwIfSchedulerStartBlocked(signal = null) {
 }
 
 export function startScheduler(options = {}) {
+  const admittedGeneration = schedulerGeneration;
   return queueSchedulerLifecycle(() => withSchedulerLifecycleTransition('start', () => {
     throwIfSchedulerStartBlocked(options?.signal || null);
+    if (admittedGeneration !== schedulerGeneration) return getSchedulerStatus();
     return startSchedulerSerialized(options);
   }));
 }
@@ -753,15 +756,23 @@ export async function restartScheduler(options = {}) {
 export function scheduleSchedulerRestartWhenIdle({ reason = 'scheduler_idle_restart' } = {}) {
   if (schedulerTerminalShutdown) return false;
   const generation = schedulerGeneration;
-  const pendingRun = activeRunPromise;
   if (schedulerIdleRestart?.generation === generation) return true;
   const record = { generation, promise: null };
-  record.promise = Promise.resolve(pendingRun).catch(() => null).then(async () => {
+  record.promise = (async () => {
+    while (schedulerActivityActive()) {
+      const pendingActivity = [...new Set([
+        activeRunPromise,
+        activeTimerCyclePromise,
+      ].filter(Boolean))];
+      if (!pendingActivity.length) break;
+      await Promise.allSettled(pendingActivity);
+      if (schedulerTerminalShutdown || generation !== schedulerGeneration) return getSchedulerStatus();
+    }
     if (schedulerTerminalShutdown) return getSchedulerStatus();
     if (generation !== schedulerGeneration) return getSchedulerStatus();
     logInfo('scheduler_idle_restart_started', { reason });
     return startScheduler();
-  }).catch(error => {
+  })().catch(error => {
     if (isSchedulerAbort(error)) return getSchedulerStatus();
     return markSchedulerRuntimeBlocked(error, {
       reason: 'scheduler_idle_restart_failed',
@@ -772,18 +783,16 @@ export function scheduleSchedulerRestartWhenIdle({ reason = 'scheduler_idle_rest
     if (schedulerIdleRestart === record) schedulerIdleRestart = null;
   });
   schedulerIdleRestart = record;
-  logInfo('scheduler_idle_restart_queued', { reason, waiting_for_active_run: !!pendingRun });
+  logInfo('scheduler_idle_restart_queued', {
+    reason,
+    waiting_for_active_run: !!activeRunPromise,
+    waiting_for_timer_cycle: !!activeTimerCyclePromise,
+  });
   return true;
 }
 
-export function stopScheduler(options = {}) {
-  if (options?.terminal === true) schedulerTerminalShutdown = true;
-  return queueSchedulerLifecycle(() => withSchedulerLifecycleTransition('stop', () => stopSchedulerSerialized(options)));
-}
-
-async function stopSchedulerSerialized({ wait = false, timeout_ms = 30000, reason = 'scheduler_stopped', terminal = false } = {}) {
-  schedulerGeneration++;
-  const result = { stopped: true, running: false, timed_out: false, reason };
+function schedulerStopRuntimeNow({ reason = 'scheduler_stopped', advance_generation = true, log = true } = {}) {
+  if (advance_generation) schedulerGeneration++;
   const hadActiveRuntime = Boolean(
     timer
     || activeRunPromise
@@ -809,24 +818,103 @@ async function stopSchedulerSerialized({ wait = false, timeout_ms = 30000, reaso
   state.timer_active = false;
   state.runtime_state_degraded = false;
   state.next_run_at = '';
+  state.running = schedulerActivityActive();
   if (hadActiveRuntime) {
     state.runtime_stopped_reason = reason;
-    logInfo('scheduler_stopped', { reason });
+    if (log) logInfo('scheduler_stopped', { reason });
   }
+  return hadActiveRuntime;
+}
+
+export function closeSchedulerAdmission(reason = 'scheduler_terminal_shutdown') {
+  const alreadyClosed = schedulerTerminalShutdown;
+  schedulerTerminalShutdown = true;
+  const hadActiveRuntime = schedulerStopRuntimeNow({
+    reason,
+    advance_generation: !alreadyClosed,
+    log: !alreadyClosed,
+  });
+  return {
+    closing: true,
+    running: schedulerActivityActive(),
+    cancelled: hadActiveRuntime,
+  };
+}
+
+function schedulerStopTimeoutResult(reason = 'scheduler_stopped') {
+  return {
+    stopped: false,
+    running: true,
+    timed_out: true,
+    reason,
+  };
+}
+
+export function stopScheduler(options = {}) {
+  const reason = String(options?.reason || 'scheduler_stopped').trim() || 'scheduler_stopped';
+  const wait = options?.wait === true;
+  const timeoutMs = schedulerWaitTimeoutMs(options?.timeout_ms);
+  const deadlineAt = Date.now() + timeoutMs;
+  schedulerStopRequestsPending++;
+  if (options?.terminal === true) closeSchedulerAdmission(reason);
+  else schedulerStopRuntimeNow({ reason, advance_generation: true });
+  const queuedStop = queueSchedulerLifecycle(async () => {
+    try {
+      return await withSchedulerLifecycleTransition('stop', () => stopSchedulerSerialized({
+        ...options,
+        reason,
+        deadline_at: deadlineAt,
+        admission_applied: true,
+      }));
+    } finally {
+      schedulerStopRequestsPending = Math.max(0, schedulerStopRequestsPending - 1);
+    }
+  });
+  if (!wait) return queuedStop;
+  return waitForSchedulerRun(queuedStop, timeoutMs).catch(error => {
+    if (error?.code !== 'scheduler_wait_timeout') throw error;
+    logWarn('scheduler_stop_wait_failed', { error: sanitizeText(error?.message || String(error)) });
+    return schedulerStopTimeoutResult(reason);
+  });
+}
+
+async function stopSchedulerSerialized({
+  wait = false,
+  timeout_ms = 30000,
+  reason = 'scheduler_stopped',
+  terminal = false,
+  deadline_at = 0,
+  admission_applied = false,
+} = {}) {
+  if (!admission_applied) {
+    schedulerStopRuntimeNow({ reason, advance_generation: true });
+  } else {
+    schedulerStopRuntimeNow({ reason, advance_generation: false, log: false });
+  }
+  const result = { stopped: true, running: false, timed_out: false, reason };
   const drainPromises = [...new Set([
     activeRunPromise,
     activeTimerCyclePromise,
     ...(terminal ? [SCHEDULER_RUNTIME_STATE_QUEUE] : []),
   ].filter(Boolean))];
   if (wait && drainPromises.length) {
-    await waitForSchedulerRun(Promise.allSettled(drainPromises), timeout_ms).catch(e => {
+    const remainingMs = Number(deadline_at) > 0
+      ? Math.max(0, Math.floor(Number(deadline_at) - Date.now()))
+      : schedulerWaitTimeoutMs(timeout_ms);
+    if (remainingMs <= 0) {
       result.stopped = false;
       result.running = true;
       result.timed_out = true;
-      logWarn('scheduler_stop_wait_failed', { error: sanitizeText(e?.message || String(e)) });
-    });
+    } else {
+      await waitForSchedulerRun(Promise.allSettled(drainPromises), remainingMs).catch(e => {
+        result.stopped = false;
+        result.running = true;
+        result.timed_out = true;
+        logWarn('scheduler_stop_wait_failed', { error: sanitizeText(e?.message || String(e)) });
+      });
+    }
   }
-  if (state.running || activeTimerCyclePromise || (!wait && activeRunPromise)) {
+  if (state.running || activeRunPromise || activeTimerCyclePromise) {
     result.running = true;
     result.stopped = false;
   }
@@ -902,6 +990,20 @@ export async function runSchedulerOnce({ reason = 'manual', force = false, signa
   if (schedulerRunActive() || activeRunPromise || (schedulerTimerCycleActive() && !schedulerTimerCycleOwnsRun(signal))) {
     logWarn('scheduler_skipped', { reason, detail: 'already_running' });
     const result = { ok: false, skipped: 1, reason, detail: 'already_running', at: new Date().toISOString() };
+    state.last_request_result = result;
+    return result;
+  }
+  if (schedulerStopRequestsPending > 0) {
+    logInfo('scheduler_skipped', { reason, detail: 'scheduler_lifecycle_active', lifecycle_transition: 'stop' });
+    const result = {
+      ok: false,
+      skipped: 1,
+      reason,
+      detail: 'scheduler_lifecycle_active',
+      lifecycle_transition: 'stop',
+      retry_after_ms: 1000,
+      at: new Date().toISOString(),
+    };
     state.last_request_result = result;
     return result;
   }
@@ -1080,8 +1182,13 @@ export async function previewScheduledTargets(settings = null, { signal = null, 
   }));
 }
 
+function schedulerWaitTimeoutMs(timeoutMs) {
+  const parsed = Number(timeoutMs);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.max(1, Math.floor(parsed)) : 30000;
+}
+
 function waitForSchedulerRun(runPromise, timeoutMs) {
-  const timeout = Math.max(1000, Number(timeoutMs || 30000));
+  const timeout = schedulerWaitTimeoutMs(timeoutMs);
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer = null;
@@ -1092,12 +1199,16 @@ function waitForSchedulerRun(runPromise, timeoutMs) {
       callback(value);
     };
     timer = setTimeout(
-      () => finish(reject, new Error(`scheduler run did not finish within ${timeout}ms`)),
+      () => finish(reject, Object.assign(new Error(`scheduler run did not finish within ${timeout}ms`), {
+        code: 'scheduler_wait_timeout',
+      })),
       timeout,
     );
     Promise.resolve(runPromise)
-      .catch(() => undefined)
-      .then(value => finish(resolve, value));
+      .then(
+        value => finish(resolve, value),
+        error => finish(reject, error),
+      );
   });
 }
 

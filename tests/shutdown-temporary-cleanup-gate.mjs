@@ -18,6 +18,7 @@ const settled = {
   schedulerCleanupSafe: true,
   rendererCleanupSafe: true,
   remainingMirrors: { active: 0 },
+  isolatedWorkers: { active: 0, cleanup_failed: 0 },
   capabilityProbes: { active: 0 },
   localActions: {
     active: 0,
@@ -36,6 +37,8 @@ for (const mutation of [
   value => { value.schedulerCleanupSafe = false; },
   value => { value.rendererCleanupSafe = false; },
   value => { value.remainingMirrors.active = 1; },
+  value => { value.isolatedWorkers.active = 1; },
+  value => { value.isolatedWorkers.cleanup_failed = 1; },
   value => { value.capabilityProbes.active = 1; },
   value => { value.localActions.active = 1; },
   value => { value.localActions.active_commands = 1; },
@@ -59,6 +62,7 @@ assert.match(shutdownSource, /const temporaryCleanupSafe = shutdownTemporaryClea
 assert.match(shutdownSource, /if \(temporaryCleanupSafe\) \{[\s\S]*?clearTmpDirForShutdown/);
 assert.match(shutdownSource, /remainingDigest\.requests \|\| remainingDigest\.saves \|\| remainingDigest\.batch_starts/);
 assert.match(shutdownSource, /const finalMirrors = activeWxDbMirrorTaskStatus\(\)/);
+assert.match(shutdownSource, /const isolatedWorkers = activeWxDbIsolatedWorkerStatus\(\)/);
 assert.match(shutdownSource, /const finalLocalActions = localActionWorkStatus\(\)/);
 
 console.log('shutdown temporary cleanup gate tests passed');

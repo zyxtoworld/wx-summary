@@ -19,7 +19,11 @@ function extractFunction(name) {
   throw new Error(`${name} body is incomplete`);
 }
 
-const waitForSchedulerRun = Function(`${extractFunction('waitForSchedulerRun')}; return waitForSchedulerRun;`)();
+const waitForSchedulerRun = Function(`
+  ${extractFunction('schedulerWaitTimeoutMs')}
+  ${extractFunction('waitForSchedulerRun')}
+  return waitForSchedulerRun;
+`)();
 const originalSetTimeout = globalThis.setTimeout;
 const originalClearTimeout = globalThis.clearTimeout;
 const timers = [];
@@ -39,9 +43,13 @@ try {
   assert.equal(timers.length, 1);
   assert.equal(cleared.has(timers[0]), true, 'an early scheduler completion must release its timeout timer');
 
-  assert.equal(await waitForSchedulerRun(Promise.reject(new Error('controlled failure')), 30_000), undefined);
+  await assert.rejects(
+    waitForSchedulerRun(Promise.reject(new Error('controlled failure')), 30_000),
+    /controlled failure/,
+    'scheduler lifecycle failures must propagate instead of being disguised as a successful drain',
+  );
   assert.equal(timers.length, 2);
-  assert.equal(cleared.has(timers[1]), true, 'a rejected scheduler run is swallowed but must still release its timeout timer');
+  assert.equal(cleared.has(timers[1]), true, 'a rejected scheduler lifecycle must still release its timeout timer');
 
   const pending = waitForSchedulerRun(new Promise(() => {}), 5_000);
   assert.equal(timers.length, 3);

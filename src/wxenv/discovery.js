@@ -2809,6 +2809,37 @@ export function setWxDbMirrorIdentityChangeListener(listener = null) {
   wxDbMirrorIdentityChangeListener = typeof listener === 'function' ? listener : null;
 }
 
+async function runTrackedWxDbMirrorTask({ account_id = '', reason = 'auto', signal = null } = {}, action) {
+  if (typeof action !== 'function') throw new TypeError('tracked wxdb mirror task action is required');
+  if (WXDB_MIRROR_TASK_ADMISSION_CLOSED) throw wxDbMirrorShutdownError();
+  const cleanAccountId = String(account_id || '').trim();
+  const cleanReason = String(reason || 'auto').trim() || 'auto';
+  const controller = new AbortController();
+  const unlink = linkWxDbMirrorAbortSignal(controller, signal);
+  const id = NEXT_WXDB_MIRROR_TASK_ID++;
+  ACTIVE_WXDB_MIRROR_TASKS.set(id, {
+    id,
+    account_id: cleanAccountId,
+    reason: cleanReason,
+    started_at: Date.now(),
+    controller,
+  });
+  try {
+    return await action(controller.signal);
+  } finally {
+    unlink();
+    ACTIVE_WXDB_MIRROR_TASKS.delete(id);
+  }
+}
+
+export async function cleanupStaleWxDbMirrorWorkDirsTracked(options = {}) {
+  return runTrackedWxDbMirrorTask({
+    account_id: String(options?.mirror_segment || '').trim(),
+    reason: 'startup_cleanup',
+    signal: options?.signal || null,
+  }, signal => cleanupStaleWxDbMirrorWorkDirs({ ...options, signal }));
+}
+
 async function notifyWxDbMirrorRefreshed({ mirror = null, account = null } = {}) {
   if (!mirror?.refreshed || typeof wxDbMirrorRefreshListener !== 'function') return;
   try {
@@ -2821,30 +2852,18 @@ async function notifyWxDbMirrorRefreshed({ mirror = null, account = null } = {})
 }
 
 export async function ensureWxDbMirror(options = {}) {
-  if (WXDB_MIRROR_TASK_ADMISSION_CLOSED) throw wxDbMirrorShutdownError();
   const accountId = String(options?.account_id || '').trim();
   const reason = String(options?.reason || 'auto').trim() || 'auto';
-  const controller = new AbortController();
-  const unlink = linkWxDbMirrorAbortSignal(controller, options?.signal || null);
-  const id = NEXT_WXDB_MIRROR_TASK_ID++;
-  ACTIVE_WXDB_MIRROR_TASKS.set(id, {
-    id,
+  return runTrackedWxDbMirrorTask({
     account_id: accountId,
     reason,
-    started_at: Date.now(),
-    controller,
-  });
-  try {
-    return await ensureWxDbMirrorTracked({
+    signal: options?.signal || null,
+  }, signal => ensureWxDbMirrorTracked({
       ...options,
       account_id: accountId,
       reason,
-      signal: controller.signal,
-    });
-  } finally {
-    unlink();
-    ACTIVE_WXDB_MIRROR_TASKS.delete(id);
-  }
+      signal,
+    }));
 }
 
 async function notifyWxDbMirrorIdentityChanged(change = {}) {
@@ -9798,6 +9817,7 @@ export const __discoveryInternals = {
   rollbackMirrorRootReplacement,
   runWithWxDbMirrorLock,
   runWithWxDbMirrorIndexWriteLock,
+  runTrackedWxDbMirrorTask,
   sleepForMirrorCopyRetry,
   safeMirrorSourceAccountResolution,
   sourceDiscoveryErrorForRequestedAccount,

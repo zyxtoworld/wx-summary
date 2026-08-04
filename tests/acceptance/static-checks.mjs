@@ -26,7 +26,7 @@ const { PRIVATE_FILE_MODE, readJson, writeFileAtomic, writeJsonAtomic } = await 
 const { MAX_WXDB_KEY_CACHE_FILE_BYTES, __wxdbKeyCacheInternals, clearVerifiedWxdbKeyCache, forgetVerifiedWxdbKeysForAccount, rememberVerifiedWxdbKeysForAccount, resetVerifiedWxdbKeyCache, verifiedWxdbKeyCacheInvalidInfo, verifiedWxdbKeysForAccount } = await import('../../src/config/wxdb-key-cache.js');
 const { __discoveryInternals, cleanupStaleWxDbMirrorWorkDirs, discoverWeixinEnvironment, getWeixinBinaryEvidence, getWeixinModuleEvidence, hasWxDbMirrorIdentityAnchor, isWxDbMirrorIdentityVerified, listDbFiles } = await import('../../src/wxenv/discovery.js');
 const { __wxdbInternals, cleanupCopiedDbs, cleanupWxDbWorkerPlaintextCaches, listChatroomsFromWxDb, probeWxDb, validateCopiedDbWithRawKeys } = await import('../../src/wxdb/index.js');
-const { __wxdbIsolatedInternals, collectMessagesFromWxDbIsolated, extractSelfWxidFromProjectCopyIsolated, listChatroomsFromWxDbIsolated, probeWxDbIsolated, releaseAllWxDbIsolatedBatchSessions, releaseWxDbIsolatedBatchSession } = await import('../../src/wxdb/isolated.js');
+const { __wxdbIsolatedInternals, activeWxDbIsolatedWorkerStatus, collectMessagesFromWxDbIsolated, extractSelfWxidFromProjectCopyIsolated, listChatroomsFromWxDbIsolated, probeWxDbIsolated, releaseAllWxDbIsolatedBatchSessions, releaseWxDbIsolatedBatchSession } = await import('../../src/wxdb/isolated.js');
 const { __wxkeyInternals, findAnchorNeighborKeyCandidates, findDbSaltNeighborKeyCandidates, findImageKeyCandidates, findRawKeyCandidates, probeWxKey, WXKEY_SAFE_ACCESS_MASK } = await import('../../src/wxkey/index.js');
 const { completeImageBytes, decodeWeChatV4ImageDat, validateImageKeyCandidate } = await import('../../src/wxdb/image-dat.js');
 const { findWxgfPartitions } = await import('../../src/wxdb/wxgf.js');
@@ -1569,6 +1569,7 @@ async function verifyIsolatedWxdbAbort() {
     raw_keys: [],
     signal: groupController.signal,
   });
+  assert.ok(activeWxDbIsolatedWorkerStatus().one_shot >= 1, 'a live group-list child must enter the global one-shot registry before the caller can cancel it');
   groupController.abort(Object.assign(new Error('acceptance group worker cancel'), { name: 'AbortError', status: 499 }));
   await assert.rejects(pendingGroups, error => error?.status === 499 && error?.name === 'AbortError', 'isolated group-list reads should reject immediately with the caller abort instead of blocking the service on contact/session SQLite queries');
   const probeController = new AbortController();
@@ -1579,6 +1580,7 @@ async function verifyIsolatedWxdbAbort() {
     probe_scope: 'message',
     signal: probeController.signal,
   });
+  assert.ok(activeWxDbIsolatedWorkerStatus().one_shot >= 1, 'a live database probe child must remain visible to global shutdown before the caller can cancel it');
   probeController.abort(Object.assign(new Error('acceptance probe worker cancel'), { name: 'AbortError', status: 499 }));
   await assert.rejects(pendingProbe, error => error?.status === 499 && error?.name === 'AbortError', 'isolated database-key probes should reject immediately instead of blocking the service on synchronous SQLCipher validation or process scanning');
   const identityController = new AbortController();
@@ -1587,8 +1589,20 @@ async function verifyIsolatedWxdbAbort() {
     raw_keys: [],
     signal: identityController.signal,
   });
+  assert.ok(activeWxDbIsolatedWorkerStatus().one_shot >= 1, 'a live identity child must remain visible to global shutdown before the caller can cancel it');
   identityController.abort(Object.assign(new Error('acceptance identity worker cancel'), { name: 'AbortError', status: 499 }));
   await assert.rejects(pendingIdentity, error => error?.status === 499 && error?.name === 'AbortError', 'isolated account-identity reads should reject immediately instead of blocking the service on synchronous contact/session/message database queries');
+  const oneShotExitDeadline = Date.now() + 10_000;
+  while (Date.now() < oneShotExitDeadline && activeWxDbIsolatedWorkerStatus().one_shot > 0) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(activeWxDbIsolatedWorkerStatus(), {
+    active: 0,
+    persistent: 0,
+    one_shot: 0,
+    cleanup_failed: 0,
+    closing: false,
+  }, 'cancelled one-shot workers must remain tracked until their processes exit and worker-owned plaintext cleanup succeeds');
   const identityChange = {
     storage_id: 'wxacc_0123456789abcdef',
     previous_identity_id: 'wxacct_0123456789abcdef01234567',
@@ -18362,9 +18376,12 @@ async function verifyMediaAndNicknameParsing() {
       && schedulerSourceForUi.includes('export async function restartScheduler(options = {})')
       && schedulerSourceForUi.includes('return startScheduler(options)')
       && schedulerSourceForUi.includes('export function stopScheduler(options = {})')
-      && schedulerSourceForUi.includes('if (options?.terminal === true) schedulerTerminalShutdown = true')
+      && schedulerSourceForUi.includes('export function closeSchedulerAdmission(')
+      && schedulerSourceForUi.includes('if (options?.terminal === true) closeSchedulerAdmission(reason)')
+      && schedulerSourceForUi.includes('const deadlineAt = Date.now() + timeoutMs')
+      && schedulerSourceForUi.includes('const admittedGeneration = schedulerGeneration')
       && schedulerSourceForUi.includes("return queueSchedulerLifecycle(() => withSchedulerLifecycleTransition('start'")
-      && schedulerSourceForUi.includes("return queueSchedulerLifecycle(() => withSchedulerLifecycleTransition('stop', () => stopSchedulerSerialized(options)))")
+      && schedulerSourceForUi.includes("return await withSchedulerLifecycleTransition('stop', () => stopSchedulerSerialized({")
       && schedulerSourceForUi.includes('schedulerAccountsForSetup(settings, { signal, phase: \'start\' })')
       && schedulerSourceForUi.includes('schedulerSettingsNeedSetupWithRuntime(settings, accounts, { signal })')
       && schedulerSourceForUi.includes("disablePersistedSchedulerForSetup(settings, { reason: 'start', signal })")
@@ -18372,8 +18389,8 @@ async function verifyMediaAndNicknameParsing() {
     'committed settings saves should finish their synchronous reconciliation before the browser timeout, return an explicit committed warning on timeout, continue scheduler recovery in the background, and propagate cancellation through scheduler account/key setup scans',
   );
   const schedulerStopSourceForUi = schedulerSourceForUi.slice(
-    schedulerSourceForUi.indexOf('async function stopSchedulerSerialized'),
-    schedulerSourceForUi.indexOf('export function getSchedulerStatus'),
+    schedulerSourceForUi.indexOf('function schedulerStopRuntimeNow'),
+    schedulerSourceForUi.indexOf('export function closeSchedulerAdmission'),
   );
   assert.ok(
     schedulerStopSourceForUi.includes('const hadActiveRuntime = Boolean(')
@@ -20689,10 +20706,21 @@ async function verifyMediaAndNicknameParsing() {
     && mainSourceForUi.includes("if (pathname === '/api/state' && req.method === 'GET')")
     && mainSourceForUi.includes('const [settings, localCapabilities, wechat] = await Promise.all([')
     && mainSourceForUi.includes('loadSettings({ includeSecrets: true })'), 'account state refreshes should accept an empty account list as authoritative through the shared account snapshot writer, reject stale /api/accounts responses by account-data generation, and compute current-account manual-key status from secret-backed settings without exposing the key');
-  assert.ok(appJs.includes('showSettingsSaveNotice') && appJs.includes('settings-save-floating') && appJs.includes('const ok = await openSettingsSection(section, { focusSelector })') && appJs.includes('if (ok) closeLocalActionNotice(notice)') && appJs.includes('scheduleLocalActionNoticeRemoval(notice, {') && appJs.includes("persistent: !!actionText || tone === 'warn' || tone === 'err'") && appJs.includes('if (!settingsPageStillActive())') && appJs.includes('请回到设置页核对本机设置'), 'settings saves that return after leaving the settings page should keep actionable warnings visible until closed and wait for dirty-guarded navigation before closing');
+  assert.ok(appJs.includes('showSettingsSaveNotice')
+    && appJs.includes('settings-save-floating')
+    && appJs.includes('notice._settingsSaveTarget = { section, focusSelector }')
+    && appJs.includes("const target = notice._settingsSaveTarget || {}")
+    && appJs.includes("const ok = await openSettingsSection(target.section || '', { focusSelector: target.focusSelector || '' })")
+    && appJs.includes('if (ok) closeLocalActionNotice(notice)')
+    && appJs.includes('data-settings-save-title')
+    && appJs.includes('messageElement.textContent = cleanMessage')
+    && appJs.includes('scheduleLocalActionNoticeRemoval(notice, {')
+    && appJs.includes("persistent: !!cleanActionText || tone === 'warn' || tone === 'err'")
+    && appJs.includes('if (!settingsPageStillActive())')
+    && appJs.includes('请回到设置页核对本机设置'), 'settings saves that return after leaving the settings page should keep stable focused actions across background updates, remain visible until closed, and wait for dirty-guarded navigation before closing');
   assert.ok(appJs.includes('activeSettingsPostSaveReconcileCount') && appJs.includes('function withSettingsPostSaveReconcile') && appJs.includes('设置已写入，但账号刷新或状态复核没有显示在当前页面') && appJs.includes("label: '隐私与密钥保存后的账号复核'") && appJs.includes("label: '清除手动密钥后的账号复核'") && appJs.includes('设置已写入，正在刷新账号和本机状态。请等复核完成后再离开或切换账号。') && appJs.includes('void loadSettingsGroupsInBackground();'), 'settings post-save account/state reconciliation should block navigation only through authoritative account refresh, then release while the slower cancellable group-list refresh continues in the background');
   assert.ok(appJs.includes('function openSettingsSection') && appJs.includes('function focusSettingsSection') && appJs.includes('settingsSectionElement') && appJs.includes("openSettingsSection('privacy', { focusSelector: '#s-keymode' })") && appJs.includes('setting-card-focus') && indexHtml.includes('data-settings-section="privacy"') && indexHtml.includes('data-settings-section="scheduler"'), 'settings recovery links should scroll/focus the relevant settings section instead of no-oping or same-route rerendering unsaved forms');
-  assert.ok(appJs.includes("function showSettingsSaveNotice(message, { tone = 'warn', actionText = '打开设置', title = '设置保存已返回', section = '', focusSelector = '' } = {})") && appJs.includes('const ok = await openSettingsSection(section, { focusSelector })') && !appJs.includes('void openSettingsSection(section, { focusSelector })') && appJs.includes("label: '清除 API Key', section: 'ai', focusSelector: '#s-apikey-clear'") && appJs.includes("label: '保存 AI 设置', section: 'ai', focusSelector: '#s-save-llm'") && appJs.includes("label: '保存白名单与调度', section: 'scheduler', focusSelector: '#s-save-groups'") && appJs.includes("label: '保存渲染与输出', section: 'render', focusSelector: '#s-save-render'") && appJs.includes("label: '保存隐私与密钥', section: 'privacy', focusSelector: '#s-save-privacy'") && appJs.includes("const clearManualKeyActionLabel = clearingOrphanedManualKey ? '清除遗留手动密钥' : '清除手动密钥'") && appJs.includes('label: clearManualKeyActionLabel,\n        section: \'privacy\',\n        focusSelector: \'#s-keymode\','), 'settings saves that finish after navigation should show the exact saved section and reopen/focus the relevant controls without swallowing cancelled navigation');
+  assert.ok(appJs.includes("function showSettingsSaveNotice(message, { tone = 'warn', actionText = '打开设置', title = '设置保存已返回', section = '', focusSelector = '' } = {})") && appJs.includes("const ok = await openSettingsSection(target.section || '', { focusSelector: target.focusSelector || '' })") && !appJs.includes('void openSettingsSection(section, { focusSelector })') && appJs.includes("label: '清除 API Key', section: 'ai', focusSelector: '#s-apikey-clear'") && appJs.includes("label: '保存 AI 设置', section: 'ai', focusSelector: '#s-save-llm'") && appJs.includes("label: '保存白名单与调度', section: 'scheduler', focusSelector: '#s-save-groups'") && appJs.includes("label: '保存渲染与输出', section: 'render', focusSelector: '#s-save-render'") && appJs.includes("label: '保存隐私与密钥', section: 'privacy', focusSelector: '#s-save-privacy'") && appJs.includes("const clearManualKeyActionLabel = clearingOrphanedManualKey ? '清除遗留手动密钥' : '清除手动密钥'") && appJs.includes('label: clearManualKeyActionLabel,\n        section: \'privacy\',\n        focusSelector: \'#s-keymode\','), 'settings saves that finish after navigation should show the exact saved section and reopen/focus the relevant controls without swallowing cancelled navigation');
   assert.ok(appJs.includes('settingsAccountStale') && appJs.includes('settingsAccountRefreshInFlight') && appJs.includes('settingsAccountRefreshError') && appJs.includes('refreshSettingsAccountsAfterWechatChange') && appJs.includes('正在刷新微信账号列表，请稍后再保存白名单与调度设置') && appJs.includes('当前账号已变化，请重新进入设置页后再保存白名单与调度设置') && appJs.includes("account_id: cleanupOnly ? '' : actionAccountId") && appJs.includes('const accountMeta = await refreshSettingsAccountsAfterWechatChange()') && appJs.includes('const accountWarningSuffix = accountMeta?.error') && appJs.includes('const accountChangedSuccessText = `⚠ ${warningBase}${accountWarningSuffix}`') && appJs.includes('账号列表刷新失败，请确认右上角账号后再继续') && appJs.includes('attachSettingsAccountRetry($st)') && appJs.includes('retrySettingsAccountsFromStatus') && appJs.includes('function settingsAccountRetryActionLabel') && appJs.includes("if (id === 's-privacy-status') return '隐私与密钥设置'") && appJs.includes('账号列表仍刷新失败') && appJs.includes('请确认右上角账号后再继续${actionLabel}') && appJs.includes('可以继续${actionLabel}') && appJs.includes('微信账号列表已变化，请先确认右上角账号，白名单与调度设置已暂停保存') && appJs.includes('settingsSaveWarningText(r, accountChangedSuccessText.replace'), 'settings account refreshes should run before account-scoped scheduler saves, freeze the confirmed account request context, report privacy/manual-key save success together with account warnings, and provide an inline retry with context-specific wording');
   assert.ok(appJs.includes('function accountListIdentitySignature')
     && appJs.includes('const previousAccountsSignature = accountListIdentitySignature(previousAccounts)')
@@ -20994,8 +21022,12 @@ async function verifyMediaAndNicknameParsing() {
     && appJs.includes('globalSettingsWriteBusy()')
     && appJs.includes('|| globalSettingsValidationBusy();')
     && appJs.includes("code: 'setup_save_in_progress'")
-    && appJs.includes('const busy = setupManualKeyClearBusy() || setupSaveBusy()')
+    && appJs.includes('let setupGroupListBusy = false')
+    && appJs.includes('const busy = setupGroupListBusy || setupManualKeyClearBusy() || setupSaveBusy()')
+    && appJs.includes('setButtonKeepDisabled($back, busy || setupNextBusy || staleRevision || step <= 1)')
+    && appJs.includes('setButtonKeepDisabled($next, busy || setupNextBusy || staleRevision)')
     && appJs.includes("const clearButton = document.getElementById('w-clear-manual-key')")
+    && appJs.includes('setButtonKeepDisabled(clearButton, busy || staleRevision || accountBlocked)')
     && appJs.includes('syncSetupNavigationButtons();')
     && appJs.includes('if (setupNextBusy || setupManualKeyClearBusy() || setupSaveBusy()) return')
     && appJs.includes('已有向导保存请求仍在进行中，请等待完成后再清除手动密钥'), 'setup wizard settings writes should be mutually exclusive and disable conflicting navigation/manual-key clear actions while a save is in flight');
@@ -21165,7 +21197,7 @@ async function verifyMediaAndNicknameParsing() {
       && !setupLegacyManualClearSource.includes('clear_manual_key: true'),
     'setup wizard should expose a separate explicit action for deleting the unscoped legacy manual-key candidate without deleting account-bound candidates, and report committed-but-unreconciled clears accurately',
   );
-  assert.ok(appJs.includes('let activeSetupManualKeyClearCount = 0') && appJs.includes('function setupManualKeyClearBusy') && appJs.includes('function syncSetupNavigationButtons') && appJs.includes('const storedManualKey = manualKeyStoredForAccount(setupSettings.wechat, clearAccountId)') && appJs.includes('const orphanedManualKey = !storedManualKey && manualKeyOrphanedForAccount(setupSettings.wechat, clearAccountId)') && appJs.includes('const exactClearMessage = storedManualKey') && appJs.includes('? manualKeyExactClearGateMessage(setupSettings.wechat, clearAccountId)') && appJs.includes('|| (!storedManualKey && !orphanedManualKey)') && appJs.includes('|| !!exactClearMessage;') && appJs.includes('请先确认右上角微信账号后再清除当前账号手动密钥候选') && appJs.includes('activeSetupManualKeyClearCount += 1') && appJs.includes('activeSetupManualKeyClearCount = Math.max(0, activeSetupManualKeyClearCount - 1)') && appJs.includes('if (clearButton) clearButton.disabled = true'), 'setup wizard should keep next/back navigation locked while clearing a saved manual WeChat key, require explicit account confirmation after context changes, allow exact orphan cleanup, and otherwise use the stored exact fingerprint instead of source-read gates');
+  assert.ok(appJs.includes('let activeSetupManualKeyClearCount = 0') && appJs.includes('function setupManualKeyClearBusy') && appJs.includes('function syncSetupNavigationButtons') && appJs.includes('const storedManualKey = manualKeyStoredForAccount(setupSettings.wechat, clearAccountId)') && appJs.includes('const orphanedManualKey = !storedManualKey && manualKeyOrphanedForAccount(setupSettings.wechat, clearAccountId)') && appJs.includes('const exactClearMessage = storedManualKey') && appJs.includes('? manualKeyExactClearGateMessage(setupSettings.wechat, clearAccountId)') && appJs.includes('|| (!storedManualKey && !orphanedManualKey)') && appJs.includes('|| !!exactClearMessage;') && appJs.includes('请先确认右上角微信账号后再清除当前账号手动密钥候选') && appJs.includes('activeSetupManualKeyClearCount += 1') && appJs.includes('activeSetupManualKeyClearCount = Math.max(0, activeSetupManualKeyClearCount - 1)') && appJs.includes('setButtonKeepDisabled(clearButton, busy || staleRevision || accountBlocked)') && !appJs.includes('if (clearButton) clearButton.disabled = true'), 'setup wizard should keep next/back navigation locked through its authoritative synchronizer while clearing a saved manual WeChat key, require explicit account confirmation after context changes, allow exact orphan cleanup, and otherwise use the stored exact fingerprint instead of source-read gates');
   const setupManualSaveStart = appJs.indexOf('if (step === 3)', appJs.indexOf("$next.addEventListener('click'"));
   const setupManualSaveSource = appJs.slice(setupManualSaveStart, appJs.indexOf('if (step === 4)', setupManualSaveStart));
   assert.ok(setupManualSaveSource.includes('manualKeys.text') && setupManualSaveSource.includes('manual_key_account_id: manualKeyAccountId') && setupManualSaveSource.includes('manual_key_account_aliases: selectedAccountAliases(manualKeyAccountId)') && setupManualSaveSource.includes('withSetupSaveRequest(') && setupManualSaveSource.includes("label: '保存前验证手动密钥'") && setupManualSaveSource.includes('temporaryManualKey: manualKeys.text') && setupManualSaveSource.indexOf('temporaryManualKey: manualKeys.text') < setupManualSaveSource.indexOf('const r = await withSetupSaveRequest(') && setupManualSaveSource.includes('manual_key_validation_required: true') && setupManualSaveSource.includes("label: '保存手动密钥'") && setupManualSaveSource.includes("section: 'privacy'") && setupManualSaveSource.includes("focusSelector: '#s-keymode'") && setupManualSaveSource.includes("clearDigestGroupCache('手动密钥设置已变化')") && setupManualSaveSource.includes('preserveMissingSelection: true') && setupManualSaveSource.includes('force: true') && setupManualSaveSource.includes('await refreshSetupAppStateSilently()') && setupManualSaveSource.includes('manualSaveCommitted') && setupManualSaveSource.includes('setupPostSaveReconcileFailureMessage(') && setupManualSaveSource.includes('if (!selectedAccountMatches(manualKeyAccountId))') && setupManualSaveSource.includes('当前右上角账号已变化，输入框未清空') && setupManualSaveSource.includes('已保存提交时选择的账号 ${manualKeys.keys.length} 条手动密钥候选') && setupManualSaveSource.includes('微信账号列表已变化，请先确认右上角账号'), 'setup wizard manual-key saving should fully validate the temporary candidate before any write, bind it to the selected account, force-refresh while preserving that explicit selection, and report committed-but-unreconciled saves without calling a changed account current');
@@ -23403,16 +23435,20 @@ async function verifyMediaAndNicknameParsing() {
     && appJs.includes('const { onRequestStarted, timeoutMs = DEFAULT_API_TIMEOUT_MS, localActionBody: explicitLocalActionBody = null, ...fetchOpts } = opts')
     && appJs.includes("const requestMethod = String(fetchOpts.method || 'GET').toUpperCase()")
     && appJs.includes("const mutation = !['GET', 'HEAD'].includes(requestMethod)")
-    && appJs.includes('let responseReceived = false')
-    && appJs.includes('responseReceived = false;\n      const request = fetch(path')
-    && appJs.includes('responseReceived = true;')
+    && appJs.includes('function apiMutationOutcomeUnknown(')
+    && appJs.includes('let mutationRequestStarted = false')
+    && appJs.includes('let mutationOutcomeConfirmed = false')
+    && appJs.includes('mutationRequestStarted = false;\n      mutationOutcomeConfirmed = false;\n      const request = fetch(path')
+    && appJs.includes('mutationRequestStarted = mutation;')
+    && appJs.includes('mutationOutcomeConfirmed = true;')
     && appJs.includes('fetch(path, { ...fetchOpts, headers, signal: requestSignal.signal })')
     && appJs.includes('const error = requestSignal.timedOut()')
-    && appJs.includes('mutation\n      && requestStartedNotified')
-    && appJs.includes("!responseReceived || String(error?.code || '').trim() === 'api_json_response_too_large'")
+    && appJs.includes('if (apiMutationOutcomeUnknown({')
+    && appJs.includes('requestStarted: mutationRequestStarted')
+    && appJs.includes('outcomeConfirmed: mutationOutcomeConfirmed')
     && appJs.includes('error.mutation_outcome_unknown = true')
     && appJs.includes('requestSignal.done()'),
-  'frontend JSON API calls should have a default timeout and conservatively mark a started mutation with no response as outcome-unknown, without misclassifying a received HTTP rejection as an unconfirmed write');
+  'frontend JSON API calls should have a default timeout and conservatively mark every started mutation without a parsed and validated response as outcome-unknown, without misclassifying a fully read HTTP rejection as an unconfirmed write');
   const knownApiResponseValidationSource = appJs.slice(appJs.indexOf('function validateKnownApiResponse'), appJs.indexOf('function apiRequestPathname'));
   const apiResponseHandlingSource = appJs.slice(appJs.indexOf('async function api(path, opts = {})'), appJs.indexOf('function syncAppStateDependentControls'));
   assert.ok(appJs.includes('function apiPlainObject')
@@ -23741,7 +23777,10 @@ async function verifyMediaAndNicknameParsing() {
     && appJs.includes('rememberSetupObservedRevision(nextState)')
     && appJs.includes('window.addEventListener(APP_STATE_UPDATED_EVENT, onSetupAppStateUpdated)')
     && appJs.includes('const staleRevision = setupObservedRevisionStale()')
-    && appJs.includes('$next.disabled = busy || setupNextBusy || staleRevision'),
+    && appJs.includes('setButtonKeepDisabled($back, busy || setupNextBusy || staleRevision || step <= 1)')
+    && appJs.includes('setButtonKeepDisabled($next, busy || setupNextBusy || staleRevision)')
+    && appJs.includes('setButtonKeepDisabled(clearButton, busy || staleRevision || accountBlocked)')
+    && appJs.includes('setButtonKeepDisabled(clearLegacyButton, busy || staleRevision)'),
   'setup wizard should keep its submitted base revision separate from app-state observed revisions, locally block stale saves, and disable forward actions once another window/background task changes settings');
   assert.ok(appJs.includes('const onSetupAccountListUpdated = event =>')
     && appJs.includes('detail.selectionLost === true')
@@ -24694,8 +24733,8 @@ async function verifyMediaAndNicknameParsing() {
     serverOwnershipIndex > 0
       && !startupBeforeServerOwnership.includes('cleanupStaleWxDbMirrorWorkDirs')
       && !startupBeforeServerOwnership.includes('const wx = await detectWeixin()')
-      && mainEntrySource.includes('void cleanupStaleWxDbMirrorWorkDirs({ continue_on_recovery_error: true })')
-      && mainEntrySource.indexOf('void cleanupStaleWxDbMirrorWorkDirs({ continue_on_recovery_error: true })') > serverOwnershipIndex
+      && mainEntrySource.includes('void cleanupStaleWxDbMirrorWorkDirsTracked({ continue_on_recovery_error: true })')
+      && mainEntrySource.indexOf('void cleanupStaleWxDbMirrorWorkDirsTracked({ continue_on_recovery_error: true })') > serverOwnershipIndex
       && mainEntrySource.includes("logWarn('wxdb_mirror_startup_cleanup_incomplete'")
       && mainEntrySource.includes("logWarn('wxdb_mirror_startup_cleanup_failed'")
       && mainEntrySource.indexOf('const wx = await detectWeixin()') > serverOwnershipIndex
@@ -29364,7 +29403,10 @@ async function verifyWeChatV4ImageDatDecode() {
     && wxenvSource.includes('const indexJson = previousBySegment.size ? await readMirrorIndex() : { accounts: {} }')
     && wxenvSource.includes('if (!continue_on_recovery_error) throw e')
     && !wxenvSource.includes('if (previousDirs.length === 1)')
-    && mainJs.includes('cleanupStaleWxDbMirrorWorkDirs({ continue_on_recovery_error: true })')
+    && wxenvSource.includes('export async function cleanupStaleWxDbMirrorWorkDirsTracked')
+    && wxenvSource.includes("reason: 'startup_cleanup'")
+    && wxenvSource.includes('return runTrackedWxDbMirrorTask({')
+    && mainJs.includes('cleanupStaleWxDbMirrorWorkDirsTracked({ continue_on_recovery_error: true })')
     && mainJs.includes('wxdb_mirror_startup_cleanup_failed'), 'project DB mirror crash recovery should remove stale staging/verify work dirs, accept only a hash-bound whole-tree published manifest, preserve every ambiguous target/previous candidate until a complete source-backed publish succeeds, reject category backups instead of reviving them after verification, and continue all-account background cleanup after the HTTP service is ready');
   assert.ok(wxenvSource.includes('async function importWxDbMirrorUnlocked({')
     && wxenvSource.includes('async function refreshWxDbMirrorScopeUnlocked({')

@@ -27,12 +27,28 @@ const blocker = __schedulerInternals.queueSchedulerLifecycle(async () => {
 await blockerStarted;
 
 const queuedStart = startScheduler();
+const terminalStopStartedAt = Date.now();
 const terminalStop = stopScheduler({
   wait: true,
-  timeout_ms: 5_000,
+  timeout_ms: 40,
   reason: 'contract_terminal_shutdown',
   terminal: true,
 });
+const terminalStopOutcome = await Promise.race([
+  terminalStop.then(value => ({ settled: true, value })),
+  new Promise(resolve => setTimeout(() => resolve({ settled: false, value: null }), 500)),
+]);
+assert.equal(
+  terminalStopOutcome.settled,
+  true,
+  'terminal stop timeout must include time spent waiting for an earlier lifecycle transition',
+);
+assert.equal(terminalStopOutcome.value?.timed_out, true);
+assert.equal(terminalStopOutcome.value?.running, true);
+assert.ok(
+  Date.now() - terminalStopStartedAt < 500,
+  'terminal stop must return within its own deadline even when the lifecycle queue is blocked',
+);
 releaseBlocker();
 await blocker;
 
@@ -41,9 +57,7 @@ await assert.rejects(
   error => error?.name === 'AbortError' && error?.code === 'scheduler_terminal_shutdown',
   'a start already queued before terminal shutdown must still be rejected when it reaches the lifecycle boundary',
 );
-const stopped = await terminalStop;
-assert.equal(stopped.stopped, true);
-assert.equal(stopped.running, false);
+await __schedulerInternals.queueSchedulerLifecycle(() => undefined);
 assert.equal(getSchedulerStatus().timer_active, false);
 assert.equal(scheduleSchedulerRestartWhenIdle({ reason: 'after_terminal_shutdown' }), false, 'idle recovery must not queue a restart after terminal shutdown');
 const lastStartedAtAfterStop = getSchedulerStatus().last_started_at;

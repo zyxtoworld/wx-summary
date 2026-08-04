@@ -8,13 +8,13 @@ const executeSource = source.slice(executeStart, executeEnd);
 const scheduleStart = source.indexOf('async function scheduleNext(');
 const scheduleEnd = source.indexOf('\nasync function executeSchedulerTick(', scheduleStart);
 const scheduleSource = source.slice(scheduleStart, scheduleEnd);
-const stopStart = source.indexOf('async function stopSchedulerSerialized(');
-const stopEnd = source.indexOf('\nexport function getSchedulerStatus(', stopStart);
+const stopStart = source.indexOf('function schedulerStopRuntimeNow(');
+const stopEnd = source.indexOf('\nexport function closeSchedulerAdmission(', stopStart);
 const stopSource = source.slice(stopStart, stopEnd);
 
 assert.ok(executeStart >= 0 && executeEnd > executeStart, 'scheduler tick source must be bounded');
 assert.ok(scheduleStart >= 0 && scheduleEnd > scheduleStart, 'scheduler timer-cycle source must be bounded');
-assert.ok(stopStart >= 0 && stopEnd > stopStart, 'scheduler stop source must be bounded');
+assert.ok(stopStart >= 0 && stopEnd > stopStart, 'scheduler synchronous stop boundary must be bounded');
 
 assert.ok(
   executeSource.includes("disablePersistedSchedulerForSetup(settings, { reason: reason || 'run', signal })")

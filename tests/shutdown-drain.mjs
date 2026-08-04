@@ -66,6 +66,48 @@ const watchdogStart = mainSource.indexOf('function armShutdownDeadlineWatchdog('
 const watchdogEnd = mainSource.indexOf('\nfunction beginShutdownState(', watchdogStart);
 const watchdogSource = mainSource.slice(watchdogStart, watchdogEnd);
 assert.match(watchdogSource, /setTimeout\([\s\S]*?shutdown_deadline_exceeded[\s\S]*?removeRuntimeInfo\(\)[\s\S]*?releaseInstanceLockSync\(\)[\s\S]*?process\.exit\(code\)/, 'deadline watchdog must report the stuck phase, release runtime ownership, and exit');
+assert.match(
+  watchdogSource,
+  /shutdown_deadline_exceeded[\s\S]*?writeShutdownDeadlineEmergencyDiagnostic\([\s\S]*?process\.exit\(code\)/,
+  'deadline watchdog must synchronously emit its terminal diagnostic before process.exit can discard the async logger queue',
+);
+const watchdogEvents = [];
+let watchdogCallback = null;
+const watchdogSandbox = {
+  Buffer,
+  SHUTDOWN_DEADLINE_TIMER: null,
+  SHUTDOWN_PHASE: 'database\ncleanup',
+  SHUTDOWN_STARTED_AT: '2026-01-01T00:00:00.000Z',
+  SHUTDOWN_DEADLINE_AT: '2026-01-01T00:02:00.000Z',
+  SHUTDOWN_TOTAL_BUDGET_MS: 120_000,
+  setTimeout(callback) {
+    watchdogCallback = callback;
+    return { callback };
+  },
+  shutdownDeadlineDelayMs: () => 1,
+  sanitizeText: value => String(value || ''),
+  logError: () => watchdogEvents.push('async-log-queued'),
+  fs: {
+    writeSync(_fd, value) {
+      watchdogEvents.push(`sync:${Buffer.from(value).toString('utf8')}`);
+    },
+  },
+  removeRuntimeInfo: () => watchdogEvents.push('runtime-removed'),
+  releaseInstanceLockSync: () => watchdogEvents.push('lock-released'),
+  process: { exit: code => watchdogEvents.push(`exit:${code}`) },
+};
+vm.runInNewContext(`${watchdogSource}\nglobalThis.__armShutdownDeadlineWatchdog = armShutdownDeadlineWatchdog;`, watchdogSandbox, { timeout: 1_000 });
+assert.equal(watchdogSandbox.__armShutdownDeadlineWatchdog(73), true);
+watchdogCallback();
+const synchronousDiagnostic = watchdogEvents.find(event => event.startsWith('sync:')) || '';
+assert.match(synchronousDiagnostic, /phase=database cleanup/);
+assert.ok(watchdogEvents.indexOf(synchronousDiagnostic) < watchdogEvents.indexOf('exit:73'), 'the synchronous diagnostic must precede hard exit');
+assert.ok(watchdogEvents.indexOf('lock-released') < watchdogEvents.indexOf('exit:73'), 'the hard deadline must release ownership before exit');
+
+watchdogSandbox.fs.writeSync = () => { throw new Error('stderr unavailable'); };
+assert.equal(watchdogSandbox.__armShutdownDeadlineWatchdog(74), true);
+watchdogCallback();
+assert.ok(watchdogEvents.includes('exit:74'), 'a synchronous diagnostic failure must not prevent the hard exit');
 assert.match(shutdownSource, /SHUTTING_DOWN\s*=\s*true;\s*armShutdownDeadlineWatchdog\(code\);/, 'graceful shutdown must arm the hard deadline before its first awaited drain');
 assert.match(shutdownSource, /finally\s*{\s*disarmShutdownDeadlineWatchdog\(\);/, 'normal shutdown must disarm the hard deadline before exiting');
 

@@ -6,14 +6,40 @@ process.env.WX_SUMMARY_ACCEPTANCE_MODE = '1';
 process.env.WX_SUMMARY_ACCEPTANCE_DATA_DIR = acceptanceDataDir;
 process.env.WX_SUMMARY_ACCEPTANCE_WXDB_TMP_DIR = `${acceptanceDataDir}/runtime-tmp/wxdb`;
 
-const [discovery, mainModule] = await Promise.all([
+const [discovery, mainModule, scheduler] = await Promise.all([
   import('../src/wxenv/discovery.js'),
   import('../src/main.js'),
+  import('../src/daemon/scheduler.js'),
 ]);
 
 assert.equal(typeof discovery.closeWxDbMirrorTaskAdmission, 'function', 'mirror work must expose terminal shutdown admission');
+assert.equal(
+  typeof discovery.__discoveryInternals.runTrackedWxDbMirrorTask,
+  'function',
+  'every mirror producer must share the same shutdown registry',
+);
+let notifyTrackedMirrorStarted;
+const trackedMirrorStarted = new Promise(resolve => { notifyTrackedMirrorStarted = resolve; });
+const trackedMirror = discovery.__discoveryInternals.runTrackedWxDbMirrorTask(
+  { reason: 'startup_cleanup_contract' },
+  async signal => {
+    notifyTrackedMirrorStarted();
+    await new Promise((resolve, reject) => {
+      if (signal.aborted) reject(signal.reason);
+      else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  },
+);
+await trackedMirrorStarted;
+assert.equal(discovery.activeWxDbMirrorTaskStatus().active, 1);
 const closedMirrors = discovery.closeWxDbMirrorTaskAdmission('test shutdown');
 assert.equal(closedMirrors.closing, true);
+assert.equal(closedMirrors.aborted, 1);
+await assert.rejects(
+  trackedMirror,
+  error => error?.name === 'AbortError' && error?.code === 'wxdb_mirror_shutdown',
+  'shutdown must abort startup cleanup through the shared mirror registry',
+);
 assert.equal(discovery.activeWxDbMirrorTaskStatus().active, 0);
 await assert.rejects(
   () => discovery.ensureWxDbMirror({ reason: 'late_after_shutdown' }),
@@ -21,6 +47,19 @@ await assert.rejects(
   'mirror work must reject registration after its settled shutdown snapshot',
 );
 assert.equal(discovery.activeWxDbMirrorTaskStatus().active, 0, 'rejected mirror work must never enter the active registry');
+
+assert.equal(typeof scheduler.closeSchedulerAdmission, 'function', 'scheduler work must expose terminal shutdown admission');
+scheduler.closeSchedulerAdmission('test shutdown');
+await assert.rejects(
+  scheduler.startScheduler(),
+  error => error?.name === 'AbortError' && error?.code === 'scheduler_terminal_shutdown',
+  'scheduler starts must reject immediately after terminal shutdown admission closes',
+);
+await assert.rejects(
+  scheduler.runSchedulerOnce({ reason: 'late_after_shutdown', force: true }),
+  error => error?.name === 'AbortError' && error?.code === 'scheduler_terminal_shutdown',
+  'scheduler runs must reject immediately after terminal shutdown admission closes',
+);
 
 const {
   acquireLocalActionSlot,
@@ -69,6 +108,17 @@ assert.throws(
 );
 
 const mainSource = await fsp.readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+const beginShutdownStart = mainSource.indexOf('function beginShutdownState()');
+const beginShutdownEnd = mainSource.indexOf('\nfunction setShutdownPhase(', beginShutdownStart);
+const beginShutdownSource = mainSource.slice(beginShutdownStart, beginShutdownEnd);
+assert.ok(
+  beginShutdownSource.includes("closeSchedulerAdmission('service_shutdown')"),
+  'accepting shutdown must synchronously close scheduler admission before the response-finished callback',
+);
+assert.ok(
+  mainSource.includes('cleanupStaleWxDbMirrorWorkDirsTracked({ continue_on_recovery_error: true })'),
+  'startup mirror cleanup must register with the same shutdown drain as ordinary mirror work',
+);
 const shutdownStart = mainSource.indexOf('async function gracefulShutdown(');
 const shutdownEnd = mainSource.indexOf('\nfunction localActionWorkStatus(', shutdownStart);
 const shutdownSource = mainSource.slice(shutdownStart, shutdownEnd);

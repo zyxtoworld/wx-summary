@@ -2774,6 +2774,14 @@ function responseLimitOptions(label, maxBytes, code, signal = null) {
   };
 }
 
+function apiMutationOutcomeUnknown({ mutation = false, requestStarted = false, outcomeConfirmed = false, error = null } = {}) {
+  return mutation === true
+    && requestStarted === true
+    && outcomeConfirmed !== true
+    && !!error
+    && typeof error === 'object';
+}
+
 async function api(path, opts = {}) {
   assertFrontendAssetNotBlocked(path);
   const { onRequestStarted, timeoutMs = DEFAULT_API_TIMEOUT_MS, localActionBody: explicitLocalActionBody = null, ...fetchOpts } = opts;
@@ -2781,7 +2789,8 @@ async function api(path, opts = {}) {
   const requestMethod = String(fetchOpts.method || 'GET').toUpperCase();
   const mutation = !['GET', 'HEAD'].includes(requestMethod);
   let requestStartedNotified = false;
-  let responseReceived = false;
+  let mutationRequestStarted = false;
+  let mutationOutcomeConfirmed = false;
   try {
     const method = requestMethod;
     const body = fetchOpts.body;
@@ -2805,14 +2814,15 @@ async function api(path, opts = {}) {
       if (ASSET_VERSION) headers['X-WX-Asset-Version'] = ASSET_VERSION;
       if (serializeJsonBody) headers['Content-Type'] = 'application/json';
       if (localActionId) rememberLocalActionExpectedTargetFromRequestBody(path, localActionBody);
-      responseReceived = false;
+      mutationRequestStarted = false;
+      mutationOutcomeConfirmed = false;
       const request = fetch(path, { ...fetchOpts, headers, signal: requestSignal.signal });
+      mutationRequestStarted = mutation;
       if (!requestStartedNotified) {
         requestStartedNotified = true;
         try { onRequestStarted?.(); } catch {}
       }
       const r = await request;
-      responseReceived = true;
       if (!r.ok) {
         const text = await readResponseTextLimited(r, responseLimitOptions(
           '本地服务错误详情',
@@ -2820,6 +2830,7 @@ async function api(path, opts = {}) {
           'api_error_response_too_large',
           requestSignal.signal,
         ));
+        mutationOutcomeConfirmed = true;
         const code = parseHttpErrorCode(text);
         if (isInvalidTokenResponse(r.status, code, text)) {
           forgetPendingLocalAction(localActionId);
@@ -2882,6 +2893,7 @@ async function api(path, opts = {}) {
       if (localActionId && !localActionResponseMatchesId(data, localActionId)) {
         throw localActionResponseMismatchError('本地操作');
       }
+      mutationOutcomeConfirmed = true;
       rememberSettingsRevisionFromPayload(data);
       completePendingLocalActionAfterResponse(localActionId, data);
       if (data && typeof data === 'object' && await reloadIfAssetVersionChanged(data)) {
@@ -2893,10 +2905,12 @@ async function api(path, opts = {}) {
     const error = requestSignal.timedOut()
       ? (requestSignal.timeoutError() || apiTimeoutError(path, timeoutMs))
       : e;
-    if (mutation
-      && requestStartedNotified
-      && error && typeof error === 'object'
-      && (!responseReceived || String(error?.code || '').trim() === 'api_json_response_too_large')) {
+    if (apiMutationOutcomeUnknown({
+      mutation,
+      requestStarted: mutationRequestStarted,
+      outcomeConfirmed: mutationOutcomeConfirmed,
+      error,
+    })) {
       error.mutation_outcome_unknown = true;
     }
     throw error;
@@ -39068,30 +39082,44 @@ function showSettingsSaveNotice(message, { tone = 'warn', actionText = '打开�
     notice.className = 'settings-save-floating';
     notice.setAttribute('role', 'status');
     notice.setAttribute('aria-live', 'polite');
+    notice.innerHTML = `
+      <strong data-settings-save-title></strong>
+      <span data-settings-save-message></span>
+      <button class="btn btn-primary" type="button" data-settings-save-open></button>
+      <button class="btn btn-ghost" type="button" data-settings-save-close>关闭</button>`;
+    notice.querySelector('[data-settings-save-open]')?.addEventListener('click', async event => {
+      const button = event.currentTarget;
+      if (button) button.disabled = true;
+      try {
+        const target = notice._settingsSaveTarget || {};
+        const ok = await openSettingsSection(target.section || '', { focusSelector: target.focusSelector || '' });
+        if (ok) closeLocalActionNotice(notice);
+      } finally {
+        if (button?.isConnected) button.disabled = false;
+      }
+    });
+    notice.querySelector('[data-settings-save-close]')?.addEventListener('click', () => closeLocalActionNotice(notice));
     ensureFloatingNoticeStackContainer().appendChild(notice);
   }
   rememberFloatingNoticeReturnFocus(notice);
   notice.className = `settings-save-floating settings-save-floating-${tone}`;
-  notice.innerHTML = `
-    <strong>${escapeHtml(title)}</strong>
-    <span>${escapeHtml(cleanMessage)}</span>
-    ${actionText ? `<button class="btn btn-primary" type="button" data-settings-save-open>${escapeHtml(actionText)}</button>` : ''}
-    <button class="btn btn-ghost" type="button" data-settings-save-close>关闭</button>`;
+  notice._settingsSaveTarget = { section, focusSelector };
+  const titleElement = notice.querySelector('[data-settings-save-title]');
+  const messageElement = notice.querySelector('[data-settings-save-message]');
+  const actionButton = notice.querySelector('[data-settings-save-open]');
+  const closeButton = notice.querySelector('[data-settings-save-close]');
+  const cleanActionText = String(actionText || '').trim();
+  if (titleElement) titleElement.textContent = String(title || '');
+  if (messageElement) messageElement.textContent = cleanMessage;
+  if (actionButton) {
+    if (!cleanActionText && document.activeElement === actionButton) closeButton?.focus?.({ preventScroll: true });
+    actionButton.hidden = !cleanActionText;
+    actionButton.textContent = cleanActionText;
+  }
   notice.classList.remove('hidden');
   scheduleFloatingNoticeStackSync();
-  notice.querySelector('[data-settings-save-open]')?.addEventListener('click', async event => {
-    const button = event.currentTarget;
-    if (button) button.disabled = true;
-    try {
-      const ok = await openSettingsSection(section, { focusSelector });
-      if (ok) closeLocalActionNotice(notice);
-    } finally {
-      if (button?.isConnected) button.disabled = false;
-    }
-  });
-  notice.querySelector('[data-settings-save-close]')?.addEventListener('click', () => closeLocalActionNotice(notice));
   scheduleLocalActionNoticeRemoval(notice, {
-    persistent: !!actionText || tone === 'warn' || tone === 'err',
+    persistent: !!cleanActionText || tone === 'warn' || tone === 'err',
   });
 }
 
@@ -42948,11 +42976,28 @@ async function renderSettings() {
           : `${label}已通过严格校验；文件阻塞已解除，自动调度将按当前已保存设置运行。`);
       holdSchedulerDirectStatus();
     } catch (e) {
-      schedulerStatus.className = 'status err';
-      if (!setReloadRequiredStatus(schedulerStatus, e, `重新检查${label}`)) {
-        schedulerStatus.textContent = actionFailureMessage(`重新检查${label}`, e, '文件仍未通过校验，自动调度保持停止；请按错误信息修复后重试。');
+      const outcomeUnknown = e?.mutation_outcome_unknown === true;
+      const outcomeUnknownMessage = `重新检查${label}的请求结果未确认；文件和自动调度状态可能已经变化，正在刷新状态。请勿重复操作，刷新完成后先核对当前状态。`;
+      if (!settingsPageStillActive()) {
+        showSettingsSaveNotice(
+          outcomeUnknown ? outcomeUnknownMessage : actionFailureMessage(`重新检查${label}`, e, '请重新进入设置页查看调度状态后重试。'),
+          {
+            tone: outcomeUnknown ? 'warn' : 'err',
+            title: outcomeUnknown ? `重新检查${label}结果待确认` : `重新检查${label}失败`,
+            section: 'scheduler',
+          },
+        );
+      } else if (outcomeUnknown) {
+        schedulerStatus.className = 'status warn';
+        schedulerStatus.textContent = outcomeUnknownMessage;
+        holdSchedulerDirectStatus();
+      } else {
+        schedulerStatus.className = 'status err';
+        if (!setReloadRequiredStatus(schedulerStatus, e, `重新检查${label}`)) {
+          schedulerStatus.textContent = actionFailureMessage(`重新检查${label}`, e, '文件仍未通过校验，自动调度保持停止；请按错误信息修复后重试。');
+        }
+        holdSchedulerDirectStatus();
       }
-      holdSchedulerDirectStatus();
     } finally {
       actionAbort.done();
       activeSettingsSchedulerMutationCount = Math.max(0, activeSettingsSchedulerMutationCount - 1);
@@ -48337,15 +48382,17 @@ async function renderSetup() {
   }
   const activeSetupActionControllers = new Set();
   let activeSetupManualKeyClearCount = 0;
+  let setupNextBusy = false;
+  let setupGroupListBusy = false;
   function setupManualKeyClearBusy() {
     return activeSetupManualKeyClearCount > 0;
   }
   function syncSetupNavigationButtons() {
-    const busy = setupManualKeyClearBusy() || setupSaveBusy();
+    const busy = setupGroupListBusy || setupManualKeyClearBusy() || setupSaveBusy();
     const staleRevision = setupObservedRevisionStale();
-    if ($back) $back.disabled = busy || setupNextBusy || step <= 1;
+    setButtonKeepDisabled($back, busy || setupNextBusy || staleRevision || step <= 1);
     if ($next) {
-      $next.disabled = busy || setupNextBusy || staleRevision;
+      setButtonKeepDisabled($next, busy || setupNextBusy || staleRevision);
       $next.title = staleRevision ? setupObservedRevisionStaleMessage() : '';
     }
     const clearButton = document.getElementById('w-clear-manual-key');
@@ -48361,7 +48408,7 @@ async function renderSetup() {
       const accountBlocked = wizardData.wechat?.account_selection_needs_confirmation === true
         || (!storedManualKey && !orphanedManualKey)
         || !!exactClearMessage;
-      clearButton.disabled = busy || staleRevision || accountBlocked;
+      setButtonKeepDisabled(clearButton, busy || staleRevision || accountBlocked);
       clearButton.title = busy
         ? setupManualKeyClearBusyMessage()
         : staleRevision
@@ -48378,7 +48425,7 @@ async function renderSetup() {
     }
     const clearLegacyButton = document.getElementById('w-clear-legacy-manual-key');
     if (clearLegacyButton) {
-      clearLegacyButton.disabled = busy || staleRevision;
+      setButtonKeepDisabled(clearLegacyButton, busy || staleRevision);
       clearLegacyButton.title = busy
         ? setupManualKeyClearBusyMessage()
         : (staleRevision ? setupObservedRevisionStaleMessage() : '清除未绑定账号的旧版全局手动密钥候选，并重置所有账号的本机加密验证缓存');
@@ -48492,7 +48539,6 @@ async function renderSetup() {
     const submittedDraft = setupManualKeyDraftText();
     activeSetupManualKeyClearCount += 1;
     syncSetupNavigationButtons();
-    if (clearButton) clearButton.disabled = true;
     if ($st) {
       $st.className = 'status';
       $st.textContent = clearingOrphanedManualKey
@@ -48632,7 +48678,6 @@ async function renderSetup() {
     } finally {
       activeSetupManualKeyClearCount = Math.max(0, activeSetupManualKeyClearCount - 1);
       if (setupActive(paintSeq)) {
-        if (clearButton?.isConnected) clearButton.disabled = false;
         syncSetupNavigationButtons();
       }
     }
@@ -49153,7 +49198,6 @@ async function renderSetup() {
     if (_setupWizardDraft && !_setupWizardDraft.dirty && !setupSaveBusy()) _setupWizardDraft = null;
   });
 
-  let setupNextBusy = false;
   function setupNextButtonLabel() {
     if (step === 4) return '完成';
     if (step === 3) {
@@ -49179,16 +49223,14 @@ async function renderSetup() {
     syncSetupDraftFromDom();
     if (_setupWizardDraft) _setupWizardDraft.step = step;
     const paintSeq = ++setupPaintSeq;
+    setupGroupListBusy = false;
     setSetupLiveStatus('', { busy: false, paintSeq });
     $step.textContent = step;
-    $back.disabled = step === 1;
-    $next.disabled = false;
     $next.title = '';
     syncSetupNextButtonLabel();
+    syncSetupNavigationButtons();
     if (setupObservedRevisionStale()) {
       $title.textContent = '向导草稿已过期';
-      $back.disabled = true;
-      $next.disabled = true;
       $body.innerHTML = `
         <div class="notice-card">
           <strong>旧草稿不会覆盖新设置</strong>
@@ -49489,7 +49531,8 @@ async function renderSetup() {
     } else if (step === 4) {
       $title.textContent = '选择群白名单';
       wizardData.whitelistCanSaveDraft = false;
-      $next.disabled = true;
+      setupGroupListBusy = true;
+      syncSetupNavigationButtons();
       $next.textContent = '读取群列表...';
       $body.innerHTML = '<p class="muted small">正在检查本地数据并读取本机微信群列表...</p>';
       setSetupLiveStatus('正在检查本地数据并读取本机微信群列表...', { busy: true, paintSeq });
@@ -49500,7 +49543,6 @@ async function renderSetup() {
         if (step !== 4 || !setupActive(paintSeq)) return;
         const showSetupAccountBlockedMessage = (reason = accountGateMessage()) => {
           wizardData.whitelistCanSaveDraft = false;
-          $next.disabled = false;
           $next.textContent = setupWhitelistUnavailableNextLabel();
           $body.innerHTML = `<p class="status warn" id="w-account-gate-status">${escapeHtml(reason || '请先确认微信账号。')}</p><p class="muted small">${escapeHtml(setupSkipWhitelistMessage('可以先完成 AI 配置'))}</p>`;
           setSetupLiveStatus(reason || '请先确认微信账号。', { tone: 'warn', busy: false, paintSeq });
@@ -49560,7 +49602,6 @@ async function renderSetup() {
         };
         const showSetupAccountChangedMessage = (reason = '微信账号已变化，请确认右上角账号后重新读取群列表。') => {
           wizardData.whitelistCanSaveDraft = false;
-          $next.disabled = false;
           $next.textContent = setupWhitelistUnavailableNextLabel();
           $body.innerHTML = `<p class="status warn">${escapeHtml(reason)}</p><p class="muted small">${escapeHtml(setupSkipWhitelistMessage('可以返回上一步后重新读取群列表'))}</p>`;
           setSetupLiveStatus(reason, { tone: 'warn', busy: false, paintSeq });
@@ -49605,7 +49646,6 @@ async function renderSetup() {
           return;
         }
         wizardData.whitelistCanSaveDraft = true;
-        $next.disabled = false;
         $next.textContent = '完成';
         const setupLegacyWhitelistCount = [...wizardData.whitelist.values()].filter(groupRefIsUnscoped).length;
         const setupLegacySchedulerRuleCount = (Array.isArray(setupSettings.scheduler?.per_group)
@@ -49798,7 +49838,6 @@ async function renderSetup() {
         stopSetupGroupPulse = null;
         if (step !== 4 || !setupActive(paintSeq)) return;
         wizardData.whitelistCanSaveDraft = false;
-        $next.disabled = false;
         $next.textContent = setupWhitelistUnavailableNextLabel();
         if (e?.status === 499 || e?.name === 'AbortError') {
           $body.innerHTML = `<p class="status warn">已取消读取本机微信群列表。</p><p class="muted small">${escapeHtml(setupSkipWhitelistMessage('可以返回重试，也可以先完成配置'))}</p>`;
@@ -49847,11 +49886,16 @@ async function renderSetup() {
       }).finally(() => {
         stopSetupGroupPulse?.();
         stopSetupGroupPulse = null;
-        if (setupActive(paintSeq)) $body.removeAttribute('aria-busy');
+        if (setupActive(paintSeq)) {
+          setupGroupListBusy = false;
+          syncSetupNavigationButtons();
+          $body.removeAttribute('aria-busy');
+        }
         actionAbort.done();
       });
     }
     bindSetupDirtyInputs();
+    syncSetupNavigationButtons();
   }
 
   function focusSetupStepContent() {
@@ -49882,7 +49926,7 @@ async function renderSetup() {
     setupNextBusy = true;
     const startedStep = step;
     const previousText = $next.textContent;
-    $next.disabled = true;
+    syncSetupNavigationButtons();
     try {
       syncSetupDraftFromDom();
     if (step === 2) {
@@ -50407,8 +50451,6 @@ async function renderSetup() {
       if (invalidSecretsReplacement.required && !invalidSecretsReplacement.confirmed) return;
       const finalSaveAccountIndependent = !finalManualKeyWillChange && !finalWhitelistWillChange;
       const submittedSetupSignature = setupWizardDraftSignature();
-      $next.disabled = true;
-      const oldText = $next.textContent;
       $next.textContent = '保存中...';
       const $st = ensureSetupFinishStatus();
       $st.className = 'status';
@@ -50434,8 +50476,6 @@ async function renderSetup() {
             _setupWizardDraft.dirty = true;
             $st.className = 'status warn';
             $st.textContent = '完整验证已通过，但账号或向导草稿在验证期间发生变化；本次没有保存任何设置，请确认当前内容后再次点“完成”。';
-            $next.disabled = false;
-            $next.textContent = oldText;
             return;
           }
           $st.className = 'status';
@@ -50483,8 +50523,6 @@ async function renderSetup() {
           attachSetupAccountConfirm($st, {
             successText: '✓ 已确认当前右上角账号，可以再次点完成。',
           });
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         if (finalManualKeyWillChange) {
@@ -50505,8 +50543,6 @@ async function renderSetup() {
           }, { label: '向导保存后的账号复核', section: 'ai', focusSelector: '#s-save-llm' });
           if (!setupActive()) return;
           if (setupAccountRefreshWasSuperseded(accountMeta, $st, '账号列表已由更新的刷新请求接管；当前新草稿已保留，请按当前右上角账号确认后再次点“完成”。')) {
-            $next.disabled = false;
-            $next.textContent = oldText;
             return;
           }
           const accountWarning = accountMeta?.error
@@ -50526,8 +50562,6 @@ async function renderSetup() {
               successText: '✓ 已确认当前右上角账号，可以再次点完成。',
             });
           }
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         const savedSetupSignature = setupWizardDraftSignature();
@@ -50550,8 +50584,6 @@ async function renderSetup() {
               tone: 'warn',
             });
             if (!continueAfterWarning) {
-              $next.disabled = false;
-              $next.textContent = oldText;
               return;
             }
           }
@@ -50587,8 +50619,6 @@ async function renderSetup() {
             : setupAutoKeyRecoveryRequired
               ? `${latestSetupState.wechat?.key_auto_scan_reason || '最近一次自动密钥扫描未验证通过。'} 向导设置已保存，但数据库访问仍未确认；请返回“检测微信”重新检查，自动重试仍失败时填写并验证手动密钥。`
             : '向导设置已保存，但 AI 设置仍未配置完整；请返回 AI 设置步骤补齐 Base URL、API Key 和模型后再完成。';
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         if (!setupActive()) return;
@@ -50604,8 +50634,6 @@ async function renderSetup() {
         if (!setupActive()) return;
         if (setupAccountRefreshWasSuperseded(accountMeta, $st, '账号列表已由更新的刷新请求接管；向导设置已保存，请按当前右上角账号确认后再完成。')) {
           _setupWizardDraft.dirty = true;
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         if (accountMeta?.error || accountMeta?.selectionLost || accountMeta?.selectionChanged || accountMeta?.accountContextChanged || accountMeta?.staleAutoSwitchSuppressed) {
@@ -50624,8 +50652,6 @@ async function renderSetup() {
           attachSetupAccountConfirm($st, {
             successText: '✓ 已确认当前右上角账号，可以完成向导。',
           });
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         try {
@@ -50649,21 +50675,15 @@ async function renderSetup() {
           _setupWizardDraft.dirty = true;
           $st.className = 'status warn';
           if (setReloadRequiredStatus($st, e, '向导完成前手动密钥验证')) {
-            $next.disabled = false;
-            $next.textContent = oldText;
             return;
           }
           $st.textContent = `${compactErrorSummary(e?.message || '手动密钥未验证通过当前账号消息库样本')} 请返回数据库密钥步骤重新填写或验证后再完成。`;
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         if (setupWizardDraftSignature() !== savedSetupSignature) {
           _setupWizardDraft.dirty = true;
           $st.className = 'status warn';
           $st.textContent = '向导设置已保存，但保存完成前你又修改了当前草稿；页面内容已保留，请再次点“完成”保存新草稿。';
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         _setupWizardDraft = null;
@@ -50676,26 +50696,18 @@ async function renderSetup() {
           _setupWizardDraft.dirty = true;
           $st.className = 'status warn';
           $st.textContent = `${compactErrorSummary(e?.message || '当前输入未通过全部消息库分片验证')} 本次没有保存向导设置，旧密钥候选保持不变；请返回数据库密钥步骤核对后重试。`;
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         $st.className = finalSaveCommitted ? 'status warn' : 'status err';
         if (setReloadRequiredStatus($st, e, finalSaveCommitted ? '向导保存后的状态复核' : '保存向导设置')) {
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         if (setSettingsUnknownStatus($st, e, finalSaveCommitted ? '向导保存后的状态复核' : '保存向导设置')) {
-          $next.disabled = false;
-          $next.textContent = oldText;
           return;
         }
         $st.textContent = finalSaveCommitted
           ? setupPostSaveReconcileFailureMessage('向导设置已保存', e, '请确认右上角账号和设置页状态后再完成。')
           : actionFailureMessage('保存向导设置', e, '保存失败；请确认本地服务仍在运行，刷新页面后可继续配置。');
-        $next.disabled = false;
-        $next.textContent = oldText;
       }
       return;
     }
@@ -50705,10 +50717,8 @@ async function renderSetup() {
     } finally {
       if (setupActive()) {
         setupNextBusy = false;
-        if (step === startedStep || step < 4) {
-          $next.disabled = false;
-          if (step === startedStep) $next.textContent = previousText;
-        }
+        syncSetupNavigationButtons();
+        if (step === startedStep) $next.textContent = previousText;
         if (step !== startedStep) focusSetupStepContent();
         else requestAnimationFrame(() => {
           const active = document.activeElement;

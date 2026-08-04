@@ -6,6 +6,7 @@ process.env.WX_SUMMARY_ACCEPTANCE_DATA_DIR = acceptanceDataDir;
 
 const {
   __schedulerInternals,
+  scheduleSchedulerRestartWhenIdle,
   stopScheduler,
 } = await import('../src/daemon/scheduler.js');
 
@@ -92,8 +93,27 @@ assert.deepEqual(
   'a stop timeout must report that timer-cycle post-processing is still active',
 );
 assert.equal(timedOutCycleController.signal.aborted, true);
+const generationBeforeIdleRestart = __schedulerInternals.schedulerGenerationValue();
+assert.equal(
+  scheduleSchedulerRestartWhenIdle({ reason: 'timer_cycle_timeout_recovery_contract' }),
+  true,
+);
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(
+  __schedulerInternals.schedulerGenerationValue(),
+  generationBeforeIdleRestart,
+  'idle recovery must not start while timer-cycle post-processing is still active',
+);
 releaseTimedOutCycle.resolve();
 await timedOutCycle;
+for (let attempt = 0; attempt < 50 && __schedulerInternals.schedulerGenerationValue() === generationBeforeIdleRestart; attempt++) {
+  await new Promise(resolve => setTimeout(resolve, 10));
+}
+assert.ok(
+  __schedulerInternals.schedulerGenerationValue() > generationBeforeIdleRestart,
+  'idle recovery must start exactly after the complete timer cycle becomes idle',
+);
+await __schedulerInternals.queueSchedulerLifecycle(() => undefined);
 
 const persistenceStarted = deferred();
 const releasePersistence = deferred();

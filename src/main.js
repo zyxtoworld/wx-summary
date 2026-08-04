@@ -10,7 +10,7 @@ import { pipeline } from 'node:stream/promises';
 import { LEGACY_MANUAL_KEY_POLICY, clearDbKeyRuntimeCache, clearDbKeyRuntimeCacheAfterMirrorRefresh, clearDbKeyRuntimeCacheForAccount, collectMessages, dbKeyRuntimeStateVersion, dbRawKeyCandidateBundle, detectWeixin, emptyCollectionMirrorRecheckSummary, hasFailedAutoRawKeyScan, hasPersistedVerifiedRawKeyCandidates, hasVerifiedAutoRawKeys, legacyManualKeyBindingFromResult, listAccounts, listGroups, manualKeyTextMatchesVerifiedRawKeys, mirrorRefreshPreservesDbKeyRuntimeState, rememberEmptyCollectionMirrorRecheck, rememberFailedAutoRawKeyScan, rememberVerifiedAutoRawKeys, rememberVerifiedRawKeys, shouldRecheckMirrorForEmptyCollection as shouldRecheckMirrorForEmptyCollectionCore, validateMessageTimeRange } from './collector/index.js';
 import { MAX_DIGEST_MIN_MESSAGES, MAX_GROUP_WHITELIST_REFS, MAX_LLM_API_KEY_CHARS, MAX_PER_GROUP_OVERRIDES, SETTINGS_FILE, beginSettingsWriteRequest, clearTmpDir, ensureRuntimeDirs, loadSettings, manualKeyAccountFingerprint, manualKeyFullValidationProofMatches, manualKeyVerifiedForAccount, manualKeysForAccount, mergeRecentGroupRefs, normalizeBaseUrl, normalizeManualKeysText, publicSettings, saveLegacyManualKeyForAccount, saveManualKeyVerificationForAccount, saveSettingsPatchInTransaction, settingsExportPolicyRevisionMatches, waitForSettingsSavesToSettle, withSettledSettingsWrites, withSettingsSaveTransaction } from './config/settings.js';
 import { createVerifiedWxdbKeyCacheRevocationTransaction, forgetVerifiedWxdbKeysForAccount, resetVerifiedWxdbKeyCache, verifiedWxdbKeyCacheInvalidInfo } from './config/wxdb-key-cache.js';
-import { clearSchedulerAutoKeyFailuresAfterWxDbMirrorRefresh, getSchedulerStatus, markSchedulerLegacyCursorsCleared, previewScheduledTargets, recordSchedulerStartFailure, restartScheduler, revalidateSchedulerPendingCursorStore, runSchedulerOnce, scheduleSchedulerRestartWhenIdle, schedulerAllTargetAccountsMissingManualKey, schedulerMissingAccountCleanupPlan, setSchedulerManualDigestActivityProbe, startScheduler, stopScheduler } from './daemon/scheduler.js';
+import { clearSchedulerAutoKeyFailuresAfterWxDbMirrorRefresh, closeSchedulerAdmission, getSchedulerStatus, markSchedulerLegacyCursorsCleared, previewScheduledTargets, recordSchedulerStartFailure, restartScheduler, revalidateSchedulerPendingCursorStore, runSchedulerOnce, scheduleSchedulerRestartWhenIdle, schedulerAllTargetAccountsMissingManualKey, schedulerMissingAccountCleanupPlan, setSchedulerManualDigestActivityProbe, startScheduler, stopScheduler } from './daemon/scheduler.js';
 import { DATA_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, assertRealOutputDir, assertSafeTmpPath, cleanTmpName, ensureOrdinaryDataDir, isInside, outputDirFromSettings, platformPathIdentity, resolveInsideTmp } from './lib/paths.js';
 import { configureLogger, logError, logInfo, logWarn, readLogFileTail, readLogTail, waitForLoggerWritesToSettle } from './lib/logger.js';
 import { PRIVATE_FILE_MODE, readJson, writeJsonAtomic } from './lib/json-store.js';
@@ -25,10 +25,10 @@ import * as DigestView from './web/public/js/digest-view-model.js';
 import { clearGroupCursor, getCursorRecoveryInfo, revalidateCursorStore } from './store/cursors.js';
 import { probeWxKey } from './wxkey/index.js';
 import { readDbInventory } from './wxdb/index.js';
-import { clearWxDbIsolatedIdentityEvidenceCache, extractSelfWxidFromProjectCopyIsolated as extractSelfWxidFromProjectCopy, hydrateWxDbIsolatedIdentityEvidenceCache, probeWxDbIsolated as probeWxDb, releaseAllWxDbIsolatedBatchSessions, releaseWxDbIsolatedBatchSession, setWxDbIsolatedIdentityChangeListener } from './wxdb/isolated.js';
+import { activeWxDbIsolatedWorkerStatus, clearWxDbIsolatedIdentityEvidenceCache, closeWxDbIsolatedWorkerAdmission, extractSelfWxidFromProjectCopyIsolated as extractSelfWxidFromProjectCopy, hydrateWxDbIsolatedIdentityEvidenceCache, probeWxDbIsolated as probeWxDb, releaseAllWxDbIsolatedBatchSessions, releaseWxDbIsolatedBatchSession, setWxDbIsolatedIdentityChangeListener } from './wxdb/isolated.js';
 import { probeMediaTools } from './wxdb/wxgf.js';
 import { toWellFormedText } from './web/public/js/unicode-text.js';
-import { activeWxDbMirrorTaskStatus, closeWxDbMirrorTaskAdmission, cleanupStaleWxDbMirrorWorkDirs, discoverWxAccounts, ensureWxDbMirror, getWeixinBinaryEvidence, getWeixinModuleEvidence, isWxDbMirrorIdentityVerified, pickAccount, processStartIdentity, setWxDbMirrorIdentityChangeListener, setWxDbMirrorRefreshListener, waitForActiveWxDbMirrorTasksToSettle, withWxDbMirrorReadLock, wxDbMirrorScopeRecordsForRead } from './wxenv/discovery.js';
+import { activeWxDbMirrorTaskStatus, closeWxDbMirrorTaskAdmission, cleanupStaleWxDbMirrorWorkDirsTracked, discoverWxAccounts, ensureWxDbMirror, getWeixinBinaryEvidence, getWeixinModuleEvidence, isWxDbMirrorIdentityVerified, pickAccount, processStartIdentity, setWxDbMirrorIdentityChangeListener, setWxDbMirrorRefreshListener, waitForActiveWxDbMirrorTasksToSettle, withWxDbMirrorReadLock, wxDbMirrorScopeRecordsForRead } from './wxenv/discovery.js';
 
 const BOOTSTRAP_TOKEN_FILE = path.join(DATA_DIR, 'bootstrap-token.json');
 
@@ -1709,6 +1709,12 @@ function armShutdownDeadlineWatchdog(code = 0) {
       shutdown_deadline_at: SHUTDOWN_DEADLINE_AT,
       budget_ms: SHUTDOWN_TOTAL_BUDGET_MS,
     });
+    writeShutdownDeadlineEmergencyDiagnostic({
+      phase: stalledPhase,
+      shutdown_started_at: SHUTDOWN_STARTED_AT,
+      shutdown_deadline_at: SHUTDOWN_DEADLINE_AT,
+      budget_ms: SHUTDOWN_TOTAL_BUDGET_MS,
+    });
     removeRuntimeInfo();
     releaseInstanceLockSync();
     process.exit(code);
@@ -1716,8 +1722,29 @@ function armShutdownDeadlineWatchdog(code = 0) {
   return true;
 }
 
+function writeShutdownDeadlineEmergencyDiagnostic({
+  phase = 'unknown',
+  shutdown_started_at = '',
+  shutdown_deadline_at = '',
+  budget_ms = 0,
+} = {}) {
+  const cleanPhase = sanitizeText(phase || 'unknown').replace(/\s+/g, ' ').slice(0, 120) || 'unknown';
+  const cleanStartedAt = sanitizeText(shutdown_started_at || '').replace(/\s+/g, ' ').slice(0, 80);
+  const cleanDeadlineAt = sanitizeText(shutdown_deadline_at || '').replace(/\s+/g, ' ').slice(0, 80);
+  const cleanBudgetMs = Math.max(0, Math.floor(Number(budget_ms || 0) || 0));
+  const line = `wx-summary: shutdown deadline exceeded; phase=${cleanPhase}; started_at=${cleanStartedAt || 'unknown'}; deadline_at=${cleanDeadlineAt || 'unknown'}; budget_ms=${cleanBudgetMs}\n`;
+  try {
+    fs.writeSync(2, Buffer.from(line, 'utf8'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function beginShutdownState() {
   SHUTDOWN_REQUESTED = true;
+  closeSchedulerAdmission('service_shutdown');
+  closeWxDbIsolatedWorkerAdmission('service_shutdown');
   cancelScheduledBrowserOpen();
   if (!SHUTDOWN_STARTED_AT) SHUTDOWN_STARTED_AT = new Date().toISOString();
   if (!SHUTDOWN_DEADLINE_AT) SHUTDOWN_DEADLINE_AT = new Date(Date.now() + SHUTDOWN_TOTAL_BUDGET_MS).toISOString();
@@ -1847,6 +1874,22 @@ function readInstanceLockSnapshotSync() {
 
 function readInstanceLockInfoSync() {
   return readInstanceLockSnapshotSync()?.owner || null;
+}
+
+function instanceLockOwnerIsComplete(lockInfo = null) {
+  const pid = Number(lockInfo?.pid || 0);
+  const processStartId = String(lockInfo?.process_start_id || '').trim();
+  const lockToken = String(lockInfo?.lock_token || '').trim().toLowerCase();
+  const projectRoot = String(lockInfo?.project_root || '').trim();
+  const startedAt = Date.parse(String(lockInfo?.started_at || '').trim());
+  return Number.isInteger(pid)
+    && pid > 0
+    && processStartId.length > 0
+    && processStartId.length <= 512
+    && /^[a-f0-9]{32}$/.test(lockToken)
+    && projectRoot.length > 0
+    && sameProjectRoot(projectRoot)
+    && Number.isFinite(startedAt);
 }
 
 function processIsAlive(pid) {
@@ -2129,6 +2172,16 @@ async function acquireInstanceLock(settings, { sourceAssetVersion = '', ignoreRu
         if (action === 'stopped') continue;
       }
       let lockSnapshot = readInstanceLockSnapshotSync();
+      if (
+        instanceLockIsFresh(lockSnapshot?.st)
+        && instanceLockOwnerIsComplete(lockSnapshot?.owner)
+        && await instanceLockOwnerMayBeReclaimed(lockSnapshot.owner, { lockStat: lockSnapshot.st })
+      ) {
+        const reclaimed = await reclaimStaleInstanceLock(lockSnapshot);
+        if (reclaimed) continue;
+        lockSnapshot = readInstanceLockSnapshotSync();
+        if (!lockSnapshot) continue;
+      }
       if (instanceLockIsFresh(lockSnapshot?.st)) {
         await new Promise(resolve => setTimeout(resolve, 1200));
         if (!ignoreRuntimeInfo) {
@@ -5863,6 +5916,7 @@ function shutdownTemporaryCleanupSafe({
   schedulerCleanupSafe = false,
   rendererCleanupSafe = false,
   remainingMirrors = null,
+  isolatedWorkers = null,
   capabilityProbes = null,
   localActions = null,
   remainingDigest = null,
@@ -5870,6 +5924,8 @@ function shutdownTemporaryCleanupSafe({
   return schedulerCleanupSafe === true
     && rendererCleanupSafe === true
     && remainingMirrors?.active === 0
+    && isolatedWorkers?.active === 0
+    && isolatedWorkers?.cleanup_failed === 0
     && capabilityProbes?.active === 0
     && localActions?.active === 0
     && localActions?.active_commands === 0
@@ -6010,28 +6066,36 @@ async function gracefulShutdown(code = 0) {
       && finalLocalActions.queued === 0
       && finalLocalActions.verification_timers === 0
       && finalLocalActions.active_verifications === 0;
-    const databaseSessionCleanupSafe = schedulerCleanupSafe && finalMirrorCleanupSafe && digestCleanupSafe;
-    if (databaseSessionCleanupSafe) {
-      setShutdownPhase('closing_database_read_sessions');
-      await releaseAllWxDbIsolatedBatchSessions('service_shutdown').catch(error => {
-        logError('wxdb_shutdown_session_release_failed', {
-          error: sanitizeText(error?.message || String(error)),
-          error_code: publicApiErrorCode(error?.public_code || error?.code),
-        });
-      });
-    } else {
-      setShutdownPhase('preserving_database_read_sessions');
-      logWarn('shutdown_scheduler_cleanup_skipped', {
-        reason: 'scheduler_mirror_or_digest_work_may_still_use_database_sessions',
+    const databaseDependenciesSettled = schedulerCleanupSafe && finalMirrorCleanupSafe && digestCleanupSafe;
+    if (!databaseDependenciesSettled) {
+      logWarn('shutdown_database_dependencies_not_settled', {
+        reason: 'scheduler_mirror_or_digest_work_did_not_settle_before_worker_shutdown',
         scheduler_cleanup_safe: schedulerCleanupSafe,
         mirror_cleanup_safe: finalMirrorCleanupSafe,
         digest_cleanup_safe: digestCleanupSafe,
       });
     }
+    setShutdownPhase('closing_database_read_sessions');
+    let isolatedWorkerReleaseFailed = false;
+    await releaseAllWxDbIsolatedBatchSessions('service_shutdown').catch(error => {
+      isolatedWorkerReleaseFailed = true;
+      logError('wxdb_shutdown_session_release_failed', {
+        error: sanitizeText(error?.message || String(error)),
+        error_code: publicApiErrorCode(error?.public_code || error?.code),
+      });
+    });
+    const isolatedWorkers = activeWxDbIsolatedWorkerStatus();
+    const isolatedWorkerCleanupSafe = !isolatedWorkerReleaseFailed
+      && isolatedWorkers.active === 0
+      && isolatedWorkers.cleanup_failed === 0;
+    if (!isolatedWorkerCleanupSafe) {
+      logWarn('wxdb_isolated_workers_still_active_during_shutdown', isolatedWorkers);
+    }
     const temporaryCleanupSafe = shutdownTemporaryCleanupSafe({
       schedulerCleanupSafe,
       rendererCleanupSafe,
       remainingMirrors: finalMirrors,
+      isolatedWorkers,
       capabilityProbes: finalCapabilityProbes,
       localActions: finalLocalActions,
       remainingDigest,
@@ -6047,6 +6111,7 @@ async function gracefulShutdown(code = 0) {
         scheduler_cleanup_safe: schedulerCleanupSafe,
         renderer_cleanup_safe: rendererCleanupSafe,
         mirror_cleanup_safe: finalMirrorCleanupSafe,
+        isolated_worker_cleanup_safe: isolatedWorkerCleanupSafe,
         capability_probe_cleanup_safe: finalCapabilityProbes.active === 0,
         local_action_cleanup_safe: finalLocalActionCleanupSafe,
         digest_cleanup_safe: digestCleanupSafe,
@@ -26491,22 +26556,9 @@ export async function main() {
     || !!ENV_BOOTSTRAP_TOKEN
     || await persistRuntimeBootstrapToken(BOOTSTRAP_TOKEN);
   configureLogger(runtimeLoggerSettings(settings.logging));
+  STARTUP_LOGGER_CONFIGURED = true;
   await restoreLocalActionEvidence();
   await restoreDigestTerminalRecovery();
-  void schedulePendingHistoryRecovery(settings, { reason: 'startup', delayMs: 0 }).then(result => {
-    if (!result) return;
-    logInfo('history_startup_recovery_complete', {
-      item_count: Math.max(0, Number(result.item_count || 0) || 0),
-      warning_count: Array.isArray(result.warnings) ? result.warnings.length : 0,
-      retention_restored: Math.max(0, Number(result.retention_restored || 0) || 0),
-      retention_finalized: Math.max(0, Number(result.retention_finalized || 0) || 0),
-      retention_preserved: Math.max(0, Number(result.retention_preserved || 0) || 0),
-      history_base_count: Math.max(0, Number(result.history_base_count || 0) || 0),
-      history_base_discovery_complete: result.history_base_discovery_complete === true,
-    });
-  }).catch(error => {
-    logWarn('history_startup_recovery_failed', { error: sanitizeText(error?.message || String(error)) });
-  });
   if (process.env.WX_SUMMARY_SKIP_TMP_CLEAR !== '1') {
     const startupTmpCleanup = await clearTmpDir({
       preserve: runtimeTmpPreservePaths(settings),
@@ -26564,9 +26616,14 @@ export async function main() {
   if (!server) {
     const firstPort = ports[0] || DEFAULT_PORT;
     const lastPort = ports[ports.length - 1] || firstPort;
-    logError('startup_failed', { error: 'ports_unavailable', first_port: firstPort, last_port: lastPort });
-    console.error(`[wx-summary] 端口 ${firstPort}~${lastPort} 都被占用，请关闭其他服务后重试`);
-    process.exit(1);
+    throw Object.assign(
+      new Error(`端口 ${firstPort}~${lastPort} 都被占用，请关闭其他服务后重试。`),
+      {
+        code: 'startup_ports_unavailable',
+        first_port: firstPort,
+        last_port: lastPort,
+      },
+    );
   }
 
   ACTIVE_SERVER = server;
@@ -26580,6 +26637,21 @@ export async function main() {
   process.on('SIGTERM', requestSignalShutdown);
   if (process.platform !== 'win32') process.on('SIGHUP', requestSignalShutdown);
 
+  void schedulePendingHistoryRecovery(settings, { reason: 'startup', delayMs: 0 }).then(result => {
+    if (!result) return;
+    logInfo('history_startup_recovery_complete', {
+      item_count: Math.max(0, Number(result.item_count || 0) || 0),
+      warning_count: Array.isArray(result.warnings) ? result.warnings.length : 0,
+      retention_restored: Math.max(0, Number(result.retention_restored || 0) || 0),
+      retention_finalized: Math.max(0, Number(result.retention_finalized || 0) || 0),
+      retention_preserved: Math.max(0, Number(result.retention_preserved || 0) || 0),
+      history_base_count: Math.max(0, Number(result.history_base_count || 0) || 0),
+      history_base_discovery_complete: result.history_base_discovery_complete === true,
+    });
+  }).catch(error => {
+    logWarn('history_startup_recovery_failed', { error: sanitizeText(error?.message || String(error)) });
+  });
+
   if (!acceptanceMode) {
     void localActionCapabilitySnapshot().then(snapshot => {
       logInfo('local_action_capability_warmup_completed', {
@@ -26591,7 +26663,7 @@ export async function main() {
     }).catch(error => {
       logWarn('local_action_capability_warmup_failed', { error: sanitizeText(error?.message || String(error)) });
     });
-    void cleanupStaleWxDbMirrorWorkDirs({ continue_on_recovery_error: true }).then(result => {
+    void cleanupStaleWxDbMirrorWorkDirsTracked({ continue_on_recovery_error: true }).then(result => {
       const details = {
         transient_dirs_removed: Math.max(0, Number(result?.transient_dirs_removed || 0) || 0),
         previous_segments_checked: Math.max(0, Number(result?.previous_segments_checked || 0) || 0),
@@ -26687,13 +26759,28 @@ export async function main() {
 }
 
 const entry = process.argv[1] ? path.resolve(process.argv[1]) : '';
-if (entry === url.fileURLToPath(import.meta.url)) {
-  main().catch(e => {
+let STARTUP_LOGGER_CONFIGURED = false;
+async function handleStartupFailure(error) {
+  if (!STARTUP_LOGGER_CONFIGURED) {
     configureLogger(runtimeLoggerSettings());
-    logError('startup_failed', { error: e?.message || String(e) });
-    console.error('启动失败：', sanitizeText(e?.message || String(e)));
-    process.exit(1);
-  });
+    STARTUP_LOGGER_CONFIGURED = true;
+  }
+  const message = sanitizeText(error?.message || String(error));
+  const fields = {
+    error: message,
+    code: publicApiErrorCode(error?.code),
+  };
+  if (Number.isInteger(error?.first_port)) fields.first_port = error.first_port;
+  if (Number.isInteger(error?.last_port)) fields.last_port = error.last_port;
+  logError('startup_failed', fields);
+  console.error('启动失败：', message);
+  const loggerSettled = await waitForLoggerWritesToSettle(SHUTDOWN_LOG_SETTLE_TIMEOUT_MS).catch(() => false);
+  if (!loggerSettled) process.stderr.write('wx-summary: 启动失败日志写入未完成，请保留上面的控制台错误信息。\n');
+  process.exit(1);
+}
+
+if (entry === url.fileURLToPath(import.meta.url)) {
+  main().catch(handleStartupFailure);
 }
 
 export const __mainInternals = {
@@ -26790,6 +26877,7 @@ export const __mainInternals = {
   settingsPatchChangesSchedulerRuntime,
   settingsRequestKeyContextFromPayload,
   instanceLockIsFresh,
+  instanceLockOwnerIsComplete,
   instanceLockObservationMatches,
   instanceLockOwnerMatches,
   instanceLockOwnerMayBeReclaimed,
