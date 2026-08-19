@@ -121,8 +121,37 @@ async function yieldWxKeyScan({ signal = null, deadline = 0 } = {}) {
   return !!deadline && Date.now() >= deadline;
 }
 
+function withWxKeyAbort(promise, signal = null) {
+  if (!signal) return Promise.resolve(promise);
+  if (signal.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : wxKeyAbortError());
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener?.('abort', onAbort);
+      fn(value);
+    };
+    const onAbort = () => finish(
+      reject,
+      signal.reason instanceof Error ? signal.reason : wxKeyAbortError(),
+    );
+    signal.addEventListener?.('abort', onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    Promise.resolve(promise).then(
+      value => finish(resolve, value),
+      error => finish(reject, error),
+    );
+  });
+}
+
 function notifyWxKeyScanProgress(options = {}, data = {}) {
-  if (typeof options.on_progress !== 'function') return;
+  if (options.signal?.aborted || typeof options.on_progress !== 'function') return;
   try { options.on_progress(data); } catch {}
 }
 
@@ -726,7 +755,10 @@ async function localKeyCandidateRoots({ signal = null, account_id = '' } = {}) {
   try {
     dataRoots = await discoverDataRoots({ signal });
   } catch (e) {
-    if (signal?.aborted) throw e;
+    if (signal?.aborted) {
+      throwIfWxKeyAborted(signal);
+      throw e;
+    }
     rememberLocalKeyScanWarning(warnings, 'discover_data_roots', e);
   }
   throwIfWxKeyAborted(signal);
@@ -744,7 +776,10 @@ async function localKeyCandidateRoots({ signal = null, account_id = '' } = {}) {
   try {
     accounts = await discoverWxAccounts({ signal });
   } catch (e) {
-    if (signal?.aborted) throw e;
+    if (signal?.aborted) {
+      throwIfWxKeyAborted(signal);
+      throw e;
+    }
     rememberLocalKeyScanWarning(warnings, 'discover_accounts', e);
   }
   throwIfWxKeyAborted(signal);
@@ -763,8 +798,9 @@ async function localKeyCandidateRoots({ signal = null, account_id = '' } = {}) {
     seen.add(key);
     let st = null;
     try {
-      st = await fsp.stat(root);
+      st = await withWxKeyAbort(fsp.stat(root), signal);
     } catch (e) {
+      if (signal?.aborted) throwIfWxKeyAborted(signal);
       if (!isMissingLocalKeyPathError(e)) rememberLocalKeyScanWarning(warnings, 'stat_root', e);
     }
     if (st?.isDirectory()) {
@@ -817,14 +853,18 @@ async function collectLocalKeyFingerprintRoot(root, entries, seen, options = {})
   const stack = [root];
   const maxFiles = normalizePositiveLimit(options.max_files, LOCAL_KEY_SCAN_MAX_FILES);
   const maxFileBytes = normalizePositiveLimit(options.max_file_bytes, LOCAL_KEY_SCAN_MAX_FILE_BYTES);
-  const rootReal = await fsp.realpath(root).catch(() => path.resolve(root));
+  const rootReal = await withWxKeyAbort(fsp.realpath(root), options.signal).catch(e => {
+    if (options.signal?.aborted) throwIfWxKeyAborted(options.signal);
+    return path.resolve(root);
+  });
   while (stack.length && entries.length < maxFiles) {
     throwIfWxKeyAborted(options.signal);
     const dir = stack.pop();
     let list = [];
     try {
-      list = await fsp.readdir(dir, { withFileTypes: true });
+      list = await withWxKeyAbort(fsp.readdir(dir, { withFileTypes: true }), options.signal);
     } catch (e) {
+      if (options.signal?.aborted) throwIfWxKeyAborted(options.signal);
       if (!isMissingLocalKeyPathError(e)) rememberLocalKeyScanWarning(options.warnings, 'fingerprint_readdir', e);
       continue;
     }
@@ -844,8 +884,9 @@ async function collectLocalKeyFingerprintRoot(root, entries, seen, options = {})
       seen.add(key);
       let st = null;
       try {
-        st = await fsp.stat(full);
+        st = await withWxKeyAbort(fsp.stat(full), options.signal);
       } catch (e) {
+        if (options.signal?.aborted) throwIfWxKeyAborted(options.signal);
         if (!isMissingLocalKeyPathError(e)) rememberLocalKeyScanWarning(options.warnings, 'fingerprint_stat', e);
       }
       if (!st?.isFile() || st.size > maxFileBytes) continue;
@@ -868,8 +909,9 @@ async function scanLocalKeyRoot(root, rawSet, fileStats, byExt, seenFiles, optio
     const dir = stack.pop();
     let entries = [];
     try {
-      entries = await fsp.readdir(dir, { withFileTypes: true });
+      entries = await withWxKeyAbort(fsp.readdir(dir, { withFileTypes: true }), options.signal);
     } catch (e) {
+      if (options.signal?.aborted) throwIfWxKeyAborted(options.signal);
       if (!isMissingLocalKeyPathError(e)) {
         fileStats.dir_errors++;
         rememberLocalKeyScanWarning(options.warnings, 'scan_readdir', e);
@@ -903,8 +945,9 @@ async function scanLocalKeyFile(file, rawSet, fileStats, byExt, seenFiles, optio
   }
   let st = null;
   try {
-    st = await fsp.stat(file);
+    st = await withWxKeyAbort(fsp.stat(file), options.signal);
   } catch (e) {
+    if (options.signal?.aborted) throwIfWxKeyAborted(options.signal);
     if (!isMissingLocalKeyPathError(e)) {
       fileStats.stat_errors++;
       rememberLocalKeyScanWarning(options.warnings, 'scan_stat', e);
@@ -917,7 +960,7 @@ async function scanLocalKeyFile(file, rawSet, fileStats, byExt, seenFiles, optio
   }
   let buf;
   try {
-    buf = await fsp.readFile(file);
+    buf = await withWxKeyAbort(fsp.readFile(file), options.signal);
     throwIfWxKeyAborted(options.signal);
   } catch (e) {
     if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : wxKeyAbortError();
@@ -1116,7 +1159,11 @@ async function scanProcessWithIsolation(result, target, stage, signal, scan) {
     throwIfWxKeyAborted(signal);
     return value;
   } catch (error) {
-    if (signal?.aborted || error?.name === 'AbortError' || error?.status === 499) throw error;
+    if (signal?.aborted) {
+      throwIfWxKeyAborted(signal);
+      throw error;
+    }
+    if (error?.name === 'AbortError' || error?.status === 499) throw error;
     result.scan_errors ||= [];
     if (result.scan_errors.length < 24) result.scan_errors.push(processScanErrorSummary(target, stage, error));
     result.scan_error_count = Number(result.scan_error_count || 0) + 1;
@@ -1537,6 +1584,7 @@ export async function scanProcessForRawKeyCandidates(pid, options = {}) {
         if (!ok || read <= 0) continue;
         scanned += BigInt(read);
         reportProgress();
+        throwIfWxKeyAborted(options.signal);
         const chunk = byteCarry.length ? Buffer.concat([byteCarry, buf.subarray(0, read)]) : buf.subarray(0, read);
         const v4Stats = addWeixinV4PatternPointerCandidates(v4PointerCandidates, chunk, api, handle, readRegions, v4PointerMaxCandidates, {
           deadline,
@@ -1562,6 +1610,7 @@ export async function scanProcessForRawKeyCandidates(pid, options = {}) {
 
     const orderedCandidates = prioritizedCandidateValues(v4PointerCandidates, candidates);
     reportProgress(true);
+    throwIfWxKeyAborted(options.signal);
 
     return {
       scan_mode: {
@@ -1681,6 +1730,7 @@ export async function scanProcessForVerifiedWeixinV4DbKeys(pid, options = {}) {
         if (!ok || read <= 0) continue;
         scanned += BigInt(read);
         reportProgress();
+        throwIfWxKeyAborted(options.signal);
         const chunk = byteCarry.length ? Buffer.concat([byteCarry, buf.subarray(0, read)]) : buf.subarray(0, read);
         // Quoted key material is direct evidence. Validate it before spending
         // the shared deadline on structural pointer heuristics.
@@ -1728,6 +1778,7 @@ export async function scanProcessForVerifiedWeixinV4DbKeys(pid, options = {}) {
     }
 
     reportProgress(true);
+    throwIfWxKeyAborted(options.signal);
 
     return {
       candidate_count: found.size,
@@ -1846,6 +1897,7 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
         if (!ok || read <= 0) continue;
         scanned += BigInt(read);
         reportProgress();
+        throwIfWxKeyAborted(options.signal);
         const chunk = carry.length ? Buffer.concat([carry, buf.subarray(0, read)]) : buf.subarray(0, read);
         const chunkBase = region.base + offset - BigInt(carry.length);
         const alignedFrom = Number((8n - (chunkBase % 8n)) % 8n);
@@ -1888,6 +1940,7 @@ export async function scanProcessForCodecContextKeyCandidates(pid, options = {})
     }
 
     reportProgress(true);
+    throwIfWxKeyAborted(options.signal);
 
     return {
       scan_mode: {

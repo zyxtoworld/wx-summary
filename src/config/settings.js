@@ -6,8 +6,9 @@ import { DATA_DIR, DEFAULT_DIGESTS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TMP_DIR, asse
 import { PRIVATE_FILE_MODE, cloneJson, deepMerge, ensureDir, syncDirectory, writeFileAtomic, writeJsonAtomic } from '../lib/json-store.js';
 import { readFileHandleBounded } from '../lib/bounded-read.js';
 import { preserveInvalidFileBackup } from '../lib/invalid-backup.js';
+import { normalizeAiBaseUrl, validateAiBaseUrl } from '../web/public/js/shared/ai-base-url.js';
 import { protectText, secretProtectionUnavailable, unprotectToText } from './dpapi.js';
-import { toWellFormedText } from '../web/public/js/unicode-text.js';
+import { toWellFormedText } from '../web/public/js/shared/unicode-text.js';
 
 export const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 export const SECRETS_FILE = path.join(DATA_DIR, 'secrets.bin');
@@ -153,7 +154,7 @@ function tmpEntryContainsPreservedPath(entryPath, preserved = []) {
 }
 
 export function normalizeBaseUrl(value) {
-  return String(value || '').trim().replace(/\/+$/, '');
+  return normalizeAiBaseUrl(value);
 }
 
 export function maskSecret(value) {
@@ -1025,6 +1026,12 @@ export function normalizeSettings(settings) {
   if (!outputDirIsSafe(s.output.dir)) s.output.dir = defaults.output.dir;
   s.output.retention_days = finiteInteger(s.output.retention_days, 0, 0, 3650);
   s.output.filename_pattern = normalizeFilenamePattern(s.output.filename_pattern, defaults.output.filename_pattern);
+  s.render.default_theme = ['auto', 'light', 'dark'].includes(s.render.default_theme)
+    ? s.render.default_theme
+    : defaults.render.default_theme;
+  s.render.default_font_size = ['normal', 'large'].includes(s.render.default_font_size)
+    ? s.render.default_font_size
+    : defaults.render.default_font_size;
   delete s.render.width_px;
   delete s.render.dpi_scale;
   s.web.host = '127.0.0.1';
@@ -1556,11 +1563,9 @@ export function validateSettingsObject(settings, { requireBaseUrl = false } = {}
   const errors = [];
   if (!['openai', 'anthropic'].includes(settings.llm.provider)) errors.push('llm.provider must be openai or anthropic');
   if (settings.llm.base_url || requireBaseUrl) {
-    try {
-      const u = new URL(settings.llm.base_url);
-      if (!['http:', 'https:'].includes(u.protocol)) errors.push('llm.base_url must be http(s)');
-    } catch {
-      errors.push('llm.base_url must be a valid URL');
+    const baseUrlValidation = validateAiBaseUrl(settings.llm.base_url);
+    if (!baseUrlValidation.ok) {
+      errors.push('llm.base_url must be a valid http(s) URL without userinfo, query, or fragment');
     }
   }
   if (!outputDirIsSafe(settings.output?.dir)) {
@@ -1798,7 +1803,7 @@ async function saveLegacyManualKeyForAccountUnlocked({ account_id = '', account_
   const accountId = normalizeManualKeyAccountId(account_id);
   const aliases = normalizeManualKeyAccountAliases([accountId, ...(Array.isArray(account_aliases) ? account_aliases : [])]);
   if (!accountId || !aliases.length) {
-    const err = new Error('迁移旧版全局手动数据库密钥必须带当前微信账号。');
+    const err = new Error('迁移未绑定的全局手动数据库密钥必须带当前微信账号。');
     err.status = 428;
     err.code = 'manual_key_account_required';
     err.public_code = 'manual_key_account_required';
@@ -1806,14 +1811,14 @@ async function saveLegacyManualKeyForAccountUnlocked({ account_id = '', account_
   }
   const accountFingerprint = normalizeManualKeyAccountFingerprint(account_fingerprint);
   if (!accountFingerprint) {
-    const err = new Error('迁移旧版全局手动数据库密钥必须带当前账号的项目副本指纹。');
+    const err = new Error('迁移未绑定的全局手动数据库密钥必须带当前账号的项目副本指纹。');
     err.status = 428;
     err.code = 'manual_key_account_fingerprint_required';
     err.public_code = 'manual_key_account_fingerprint_required';
     throw err;
   }
   if (message_db_verified !== true) {
-    const err = new Error('旧版全局手动数据库密钥只有在当前账号全部消息库分片验证通过后才能绑定；本次未修改本机密钥设置。');
+    const err = new Error('未绑定的全局手动数据库密钥只有在当前账号全部消息库分片验证通过后才能绑定；本次未修改本机密钥设置。');
     err.status = 428;
     err.code = 'manual_key_full_validation_required';
     err.public_code = 'manual_key_full_validation_required';
@@ -1833,7 +1838,7 @@ async function saveLegacyManualKeyForAccountUnlocked({ account_id = '', account_
   if (!legacyText) return publicSettings({ settingsFile, secretsFile });
   const expectedText = normalizeManualKeysText(expected_manual_key_text || '');
   if (expectedText && expectedText !== legacyText) {
-    const err = new Error('旧版全局手动数据库密钥在验证期间已变化，已停止自动绑定到当前账号。');
+    const err = new Error('未绑定的全局手动数据库密钥在验证期间已变化，已停止自动绑定到当前账号。');
     err.status = 409;
     err.code = 'manual_key_changed_during_validation';
     err.public_code = 'manual_key_changed_during_validation';

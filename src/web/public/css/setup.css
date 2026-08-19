@@ -1,0 +1,346 @@
+/* ==========================================================================
+   首次启动向导(#/setup)页面样式
+   只放页面级样式;设计变量(--accent/--bg-elevated 等)来自 app.css。
+   布局:内容区内全屏居中卡片 + 顶部步骤指示器 + 底部上一步/下一步/跳过。
+   ========================================================================== */
+
+.setup-page {
+  min-height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 28px 12px 24px;
+}
+
+.setup-card {
+  width: min(660px, 100%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 26px 28px 20px;
+  display: grid;
+  gap: 18px;
+}
+
+.setup-head { display: grid; gap: 14px; }
+
+.setup-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.setup-brand-logo {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  color: var(--accent-fg);
+  background: linear-gradient(135deg, var(--accent-solid), var(--accent-solid-hover));
+  box-shadow: var(--shadow-sm);
+}
+
+.setup-brand-name {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+/* 步骤指示器 */
+.setup-steps {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.setup-step-item {
+  flex: 1;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  position: relative;
+  color: var(--fg-muted);
+}
+
+.setup-step-item::before,
+.setup-step-item::after {
+  content: '';
+  position: absolute;
+  top: 13px;
+  width: 50%;
+  height: 2px;
+  background: var(--border);
+}
+
+.setup-step-item::before { left: 0; }
+.setup-step-item::after { right: 0; }
+.setup-step-item:first-child::before,
+.setup-step-item:last-child::after { display: none; }
+
+.setup-step-dot {
+  position: relative;
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--fg-muted);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.setup-step-label {
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.setup-step-item.active { color: var(--accent-text); }
+.setup-step-item.active .setup-step-dot {
+  border-color: var(--accent-solid);
+  background: var(--accent-solid);
+  color: var(--accent-fg);
+}
+
+.setup-step-item.done { color: var(--fg-secondary); }
+.setup-step-item.done .setup-step-dot {
+  border-color: var(--accent);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+.setup-step-item.done::before,
+.setup-step-item.done::after,
+.setup-step-item.active::before { background: var(--accent); }
+
+/* 步骤正文 */
+.setup-body { display: grid; gap: 14px; min-height: 300px; align-content: start; }
+
+.setup-title { font-size: 19px; font-weight: 650; }
+.setup-desc {
+  font-size: 13px;
+  color: var(--fg-secondary);
+  line-height: 1.7;
+}
+
+.setup-section { display: grid; gap: 8px; }
+.setup-section-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--fg);
+}
+
+.setup-form { display: grid; gap: 12px; }
+.setup-field { display: grid; gap: 0; }
+.setup-field-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: end;
+}
+.setup-field-row .btn { margin-bottom: 0; }
+
+textarea.input.setup-key-input {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  min-height: 92px;
+  resize: vertical;
+}
+
+.input.invalid, .select.invalid { border-color: var(--danger); }
+
+/* 账号单选列表 */
+.setup-account-list { display: grid; gap: 8px; }
+
+.setup-account-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  text-align: left;
+  transition: border-color var(--transition), background var(--transition);
+}
+
+.setup-account-option:not(:disabled):hover { border-color: var(--border-strong); background: var(--bg-hover); }
+.setup-account-option.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.setup-account-avatar {
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.setup-account-meta { flex: 1; min-width: 0; display: grid; line-height: 1.4; }
+.setup-account-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.setup-account-sub {
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.setup-account-check {
+  flex: 0 0 auto;
+  color: var(--accent-text);
+  visibility: hidden;
+}
+.setup-account-option.selected .setup-account-check { visibility: visible; }
+
+/* 状态行(成功/警告/错误/进行中) */
+.setup-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  font-size: 12.5px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+.setup-status:empty { display: none; }
+.setup-status-ok {
+  background: var(--accent-soft);
+  border-color: rgba(7, 193, 96, 0.35);
+  color: var(--fg);
+}
+.setup-status-ok .setup-status-icon { color: var(--accent-text); }
+.setup-status-warn {
+  background: var(--warn-soft);
+  border-color: rgba(217, 135, 13, 0.35);
+  color: var(--fg);
+}
+.setup-status-warn .setup-status-icon { color: var(--warn-text); }
+.setup-status-err {
+  background: var(--danger-soft);
+  border-color: rgba(227, 77, 89, 0.35);
+  color: var(--fg);
+}
+.setup-status-err .setup-status-icon { color: var(--danger-text); }
+.setup-status-info {
+  background: rgba(58, 122, 254, 0.1);
+  border-color: rgba(58, 122, 254, 0.3);
+  color: var(--fg);
+}
+.setup-status-info .setup-status-icon { color: var(--info-text); }
+.setup-status-icon { flex: 0 0 auto; font-weight: 700; }
+.setup-status-text { flex: 1; min-width: 0; }
+.setup-status .link-btn { flex: 0 0 auto; }
+
+.setup-progress-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--fg-secondary);
+}
+.setup-progress-line:empty { display: none; }
+.setup-progress-detail { color: var(--fg-muted); font-size: 12px; }
+
+/* 群预览 */
+.setup-group-preview { display: grid; gap: 6px; }
+.setup-group-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  background: var(--bg-sunken);
+}
+.setup-group-item .muted { margin-left: auto; flex: 0 0 auto; }
+
+.setup-whitelist-list {
+  display: grid;
+  gap: 6px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 2px;
+}
+.setup-whitelist-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  font-size: 12.5px;
+}
+.setup-whitelist-row:hover { border-color: var(--border-strong); }
+
+.setup-facts {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  font-size: 12.5px;
+  color: var(--fg-secondary);
+}
+.setup-facts li { margin-left: 18px; }
+
+/* 底部操作条 */
+.setup-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.setup-foot-spacer { flex: 1; }
+
+/* 链接式小按钮(状态行内/辅助动作) */
+.link-btn {
+  border: 0;
+  background: transparent;
+  color: var(--accent-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+.link-btn:not(:disabled):hover { background: var(--accent-soft); }
+
+.setup-subtle-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+@media (max-width: 640px) {
+  .setup-card { padding: 20px 16px 16px; }
+  .setup-step-label { display: none; }
+  .setup-foot { gap: 6px; }
+  .setup-foot .btn {
+    flex: 0 0 auto;
+    padding-inline: 10px;
+    white-space: nowrap;
+  }
+}

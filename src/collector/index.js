@@ -15,6 +15,7 @@ let WEIXIN_ENV_CACHE_GENERATION = 0;
 let VERIFIED_RAW_KEY_CACHE = new Map();
 let VERIFIED_AUTO_RAW_KEY_CACHE = new Map();
 let FAILED_AUTO_RAW_KEY_SCAN_CACHE = new Map();
+const VERIFIED_RAW_KEY_WRITE_QUEUES = new Map();
 let DB_KEY_RUNTIME_STATE_VERSION = 0;
 const CLEARED_MIRROR_RUNTIME_RESULTS = new WeakSet();
 const DB_KEY_CANDIDATE_CACHE_MS = 2 * 60 * 1000;
@@ -63,6 +64,25 @@ function getBoundedMapEntry(map, key) {
   map.delete(key);
   map.set(key, value);
   return value;
+}
+
+async function withVerifiedRawKeyWriteLock(cacheKey, action) {
+  const key = String(cacheKey || '').trim();
+  if (!key) return action();
+  const previous = VERIFIED_RAW_KEY_WRITE_QUEUES.get(key) || Promise.resolve();
+  let release;
+  const turn = new Promise(resolve => { release = resolve; });
+  const queued = previous.catch(() => {}).then(() => turn);
+  VERIFIED_RAW_KEY_WRITE_QUEUES.set(key, queued);
+  await previous.catch(() => {});
+  try {
+    return await action();
+  } finally {
+    release();
+    if (VERIFIED_RAW_KEY_WRITE_QUEUES.get(key) === queued) {
+      VERIFIED_RAW_KEY_WRITE_QUEUES.delete(key);
+    }
+  }
 }
 
 function dbKeyRuntimeCacheState() {
@@ -196,6 +216,7 @@ function accountListProjection(account = {}, env = {}) {
     db_storage: account.db_storage,
     source_account_root: account.source_account_root || '',
     source_db_storage: account.source_db_storage || '',
+    account_root: account.account_root || '',
     mirror: account.mirror || null,
     mirror_index_status: account.mirror_index_status || '',
     mirror_index_backup_relative_path: account.mirror_index_backup_relative_path || '',
@@ -506,6 +527,7 @@ async function listGroupsOnce({ account_id = '', signal = null, onProgress = nul
       const verifiedCacheStatus = await rememberVerifiedRawKeys(selectedAccountId, verifiedRawKeys, {
         account: verifiedAccount,
         expected_state_version: keyRuntimeStateVersionAtStart,
+        signal,
       });
       if (verifiedCacheStatus?.persistence?.skipped === 'stale_runtime_state') {
         assertDbKeyRuntimeStateVersion(keyRuntimeStateVersionAtStart, '群列表读取');
@@ -925,6 +947,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
       const verifiedCacheStatus = await rememberVerifiedRawKeys(selectedAccountId, verifiedRawKeys, {
         account: real.account,
         expected_state_version: keyRuntimeStateVersionAtStart,
+        signal,
       });
       if (verifiedCacheStatus?.persistence?.skipped === 'stale_runtime_state') {
         assertDbKeyRuntimeStateVersion(keyRuntimeStateVersionAtStart, '消息读取');
@@ -935,6 +958,7 @@ export async function collectMessages({ account_id = '', group_id, group_name, s
           expected_state_version: keyRuntimeStateVersionAtStart,
           verified_scope: 'message_sample',
           account: real.account,
+          signal,
         });
         if (!rememberedCurrentKey) assertDbKeyRuntimeStateVersion(keyRuntimeStateVersionAtStart, '消息读取');
       }
@@ -2172,15 +2196,15 @@ async function legacyManualKeyBindingAfterVerifiedUse(bundle = null, result = nu
   if (!binding) {
     notifyProgress(onProgress, {
       phase: 'fetch_key_legacy_migrate_skipped',
-      label: keyProgressLabel(progress_context, '旧版密钥未自动绑定'),
-      detail: '本次读取已成功，但项目副本中的当前账号身份已变化或暂不可确认；已保留旧版候选且未写入错误账号',
+      label: keyProgressLabel(progress_context, '密钥未自动绑定'),
+      detail: '本次读取已成功，但项目副本中的当前账号身份已变化或暂不可确认；已保留未绑定候选且未写入错误账号',
     });
     return null;
   }
   notifyProgress(onProgress, {
     phase: 'fetch_key_legacy_binding_ready',
-    label: keyProgressLabel(progress_context, '旧版密钥已验证'),
-    detail: '旧版全局手动密钥已通过当前账号本地工作数据验证；本批输出收尾后会自动绑定到当前账号',
+    label: keyProgressLabel(progress_context, '待绑定密钥已验证'),
+    detail: '未绑定的全局手动密钥已通过当前账号本地工作数据验证；本批输出收尾后会自动绑定到当前账号',
   });
   return {
     account_id: binding.account_id,
@@ -2355,7 +2379,7 @@ function legacyManualKeysForPolicy({
   const normalizedPolicy = normalizeLegacyManualKeyPolicy(policy);
   const requested = splitManualKeys(requestedText);
   if (normalizedPolicy === LEGACY_MANUAL_KEY_POLICY.DENY && requested.length) {
-    throw Object.assign(new Error('当前服务端读取路径不允许使用未绑定账号的旧版全局数据库密钥。'), {
+    throw Object.assign(new Error('当前服务端读取路径不允许使用未绑定账号的全局数据库密钥。'), {
       status: 400,
       code: 'legacy_manual_key_policy_forbidden',
       public_code: 'legacy_manual_key_policy_forbidden',
@@ -2832,6 +2856,8 @@ export async function dbRawKeyCandidateBundle({ memoryScan = true, memoryScanFal
 export async function rememberVerifiedRawKeys(accountId = '', keys = [], options = {}) {
   const verified = uniqueStrings(keys).filter(isPersistableManualKey);
   if (!verified.length) return { memory_key_count: 0, persistence: { ok: true, changed: false, key_count: 0, skipped: 'no_verified_keys' } };
+  const signal = options?.signal || null;
+  throwIfAborted(signal);
   const expectedVersion = expectedDbKeyRuntimeStateVersion(options?.expected_state_version);
   if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) {
     return { memory_key_count: 0, persistence: { ok: true, changed: false, key_count: 0, skipped: 'stale_runtime_state' } };
@@ -2867,75 +2893,84 @@ export async function rememberVerifiedRawKeys(accountId = '', keys = [], options
       },
     };
   }
+  throwIfAborted(signal);
   const accountFingerprint = binding.account_fingerprint;
   const accountSignature = binding.account_signature;
   const cacheKey = accountSignature;
-  const current = verifiedRawKeyCacheForAccount(cacheKey);
-  const next = uniqueStrings([...verified, ...current])
-    .filter(isPersistableManualKey)
-    .slice(0, 50);
-  if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) {
-    return { memory_key_count: 0, persistence: { ok: true, changed: false, key_count: 0, skipped: 'stale_runtime_state' } };
-  }
-  setBoundedMapEntry(VERIFIED_RAW_KEY_CACHE, cacheKey, next, MAX_DB_KEY_ACCOUNT_RUNTIME_CACHE_ENTRIES);
-  let persistence = { ok: true, changed: false, key_count: 0, skipped: '' };
-  if (!accountFingerprint) {
-    persistence = { ok: false, changed: false, key_count: 0, skipped: 'account_identity_unverified', error: '当前微信账号身份尚未通过消息库验证' };
-  } else {
-    try {
-      persistence = {
-        ok: true,
-        ...(await rememberVerifiedWxdbKeysForAccount({
-          account_id: binding.account_id,
-          account_fingerprint: accountFingerprint,
-          keys: verified,
-          write_if: () => dbKeyRuntimeStateVersionMatches(expectedVersion),
-        })),
-      };
-    } catch (error) {
-      persistence = {
-        ok: false,
-        changed: false,
-        key_count: 0,
-        skipped: 'write_failed',
-        error: redactSecrets(error?.message || String(error)).slice(0, 180),
-      };
+  return withVerifiedRawKeyWriteLock(cacheKey, async () => {
+    throwIfAborted(signal);
+    if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) {
+      return { memory_key_count: 0, persistence: { ok: true, changed: false, key_count: 0, skipped: 'stale_runtime_state' } };
     }
-  }
-  if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) {
-    return { memory_key_count: 0, persistence: { ok: true, changed: false, key_count: 0, skipped: 'stale_runtime_state' } };
-  }
-  if (!DB_KEY_CANDIDATE_CACHE) {
-    DB_KEY_CANDIDATE_CACHE = {
-      key: `verified:${cacheKey}:${Date.now()}`,
-      accountSignature: cacheKey,
-      at: Date.now(),
-      rawKeys: next,
-      diagnostics: {
-        cache_hit: false,
-        account_scoped_cache: !!accountSignature,
-        memory_scan_attempted: false,
-        manual_key_count: 0,
-        local_candidate_count: next.length,
-        verified_key_count: next.length,
-        total_candidate_count: next.length,
-      },
+    const current = verifiedRawKeyCacheForAccount(cacheKey);
+    const next = uniqueStrings([...verified, ...current])
+      .filter(isPersistableManualKey)
+      .slice(0, 50);
+    if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) {
+      return { memory_key_count: 0, persistence: { ok: true, changed: false, key_count: 0, skipped: 'stale_runtime_state' } };
+    }
+    throwIfAborted(signal);
+    let persistence = { ok: true, changed: false, key_count: 0, skipped: '' };
+    if (!accountFingerprint) {
+      persistence = { ok: false, changed: false, key_count: 0, skipped: 'account_identity_unverified', error: '当前微信账号身份尚未通过消息库验证' };
+    } else {
+      try {
+        persistence = {
+          ok: true,
+          ...(await rememberVerifiedWxdbKeysForAccount({
+            account_id: binding.account_id,
+            account_fingerprint: accountFingerprint,
+            keys: verified,
+            write_if: () => dbKeyRuntimeStateVersionMatches(expectedVersion) && !signal?.aborted,
+          })),
+        };
+      } catch (error) {
+        persistence = {
+          ok: false,
+          changed: false,
+          key_count: 0,
+          skipped: 'write_failed',
+          error: redactSecrets(error?.message || String(error)).slice(0, 180),
+        };
+      }
+    }
+    throwIfAborted(signal);
+    if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) {
+      return { memory_key_count: 0, persistence: { ok: true, changed: false, key_count: 0, skipped: 'stale_runtime_state' } };
+    }
+    setBoundedMapEntry(VERIFIED_RAW_KEY_CACHE, cacheKey, next, MAX_DB_KEY_ACCOUNT_RUNTIME_CACHE_ENTRIES);
+    if (!DB_KEY_CANDIDATE_CACHE) {
+      DB_KEY_CANDIDATE_CACHE = {
+        key: `verified:${cacheKey}:${Date.now()}`,
+        accountSignature: cacheKey,
+        at: Date.now(),
+        rawKeys: next,
+        diagnostics: {
+          cache_hit: false,
+          account_scoped_cache: !!accountSignature,
+          memory_scan_attempted: false,
+          manual_key_count: 0,
+          local_candidate_count: next.length,
+          verified_key_count: next.length,
+          total_candidate_count: next.length,
+        },
+      };
+      return { memory_key_count: next.length, persistence };
+    }
+    if (DB_KEY_CANDIDATE_CACHE.accountSignature && DB_KEY_CANDIDATE_CACHE.accountSignature !== cacheKey) {
+      return { memory_key_count: next.length, persistence };
+    }
+    DB_KEY_CANDIDATE_CACHE.rawKeys = uniqueStrings([...next, ...(DB_KEY_CANDIDATE_CACHE.rawKeys || [])])
+      .filter(isPersistableManualKey)
+      .slice(0, 50);
+    DB_KEY_CANDIDATE_CACHE.at = Date.now();
+    DB_KEY_CANDIDATE_CACHE.diagnostics = {
+      ...(DB_KEY_CANDIDATE_CACHE.diagnostics || {}),
+      verified_key_count: next.length,
+      total_candidate_count: Math.max(Number(DB_KEY_CANDIDATE_CACHE.diagnostics?.total_candidate_count || 0), DB_KEY_CANDIDATE_CACHE.rawKeys.length),
     };
     return { memory_key_count: next.length, persistence };
-  }
-  if (DB_KEY_CANDIDATE_CACHE.accountSignature && DB_KEY_CANDIDATE_CACHE.accountSignature !== cacheKey) {
-    return { memory_key_count: next.length, persistence };
-  }
-  DB_KEY_CANDIDATE_CACHE.rawKeys = uniqueStrings([...next, ...(DB_KEY_CANDIDATE_CACHE.rawKeys || [])])
-    .filter(isPersistableManualKey)
-    .slice(0, 50);
-  DB_KEY_CANDIDATE_CACHE.at = Date.now();
-  DB_KEY_CANDIDATE_CACHE.diagnostics = {
-    ...(DB_KEY_CANDIDATE_CACHE.diagnostics || {}),
-    verified_key_count: next.length,
-    total_candidate_count: Math.max(Number(DB_KEY_CANDIDATE_CACHE.diagnostics?.total_candidate_count || 0), DB_KEY_CANDIDATE_CACHE.rawKeys.length),
-  };
-  return { memory_key_count: next.length, persistence };
+  });
 }
 
 function verifiedKeyCachePersistenceNotice(status = null, contextLabel = '读取数据库') {
@@ -2966,10 +3001,11 @@ function verifiedRawKeyCacheForAccount(accountSignature = '') {
   return getBoundedMapEntry(VERIFIED_RAW_KEY_CACHE, key) || [];
 }
 
-function rememberVerifiedAutoRawKeysForBinding(binding = null, keys = [], { expected_state_version = null, verified_scope = '' } = {}) {
+function rememberVerifiedAutoRawKeysForBinding(binding = null, keys = [], { expected_state_version = null, verified_scope = '', signal = null } = {}) {
   if (String(verified_scope || '').trim().toLowerCase() !== 'message_sample') return false;
   const verified = uniqueStrings(keys).filter(isPersistableManualKey);
   if (!verified.length) return false;
+  throwIfAborted(signal);
   const expectedVersion = expectedDbKeyRuntimeStateVersion(expected_state_version);
   if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) return false;
   const cacheKey = String(binding?.account_signature || '').trim();
@@ -2987,7 +3023,12 @@ export async function rememberVerifiedAutoRawKeys(accountId = '', keys = [], { e
   if (!dbKeyRuntimeStateVersionMatches(expectedVersion)) return false;
   const binding = await authoritativeVerifiedKeyAccountBinding(accountId, account, signal).catch(() => null);
   if (!dbKeyRuntimeStateVersionMatches(expectedVersion) || !binding) return false;
-  return rememberVerifiedAutoRawKeysForBinding(binding, keys, { expected_state_version: expectedVersion, verified_scope });
+  throwIfAborted(signal);
+  return rememberVerifiedAutoRawKeysForBinding(binding, keys, {
+    expected_state_version: expectedVersion,
+    verified_scope,
+    signal,
+  });
 }
 
 export async function clearFailedAutoRawKeyScan(accountId = '', signal = null, { expected_state_version = null } = {}) {

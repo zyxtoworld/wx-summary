@@ -3,44 +3,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
-const appSource = fs.readFileSync(path.join(projectRoot, 'src', 'web', 'public', 'js', 'app.js'), 'utf8');
-const retryUiSource = appSource.slice(
-  appSource.indexOf('function ensureRenderStateRetryUi'),
-  appSource.indexOf('statePromise.then(result =>'),
-);
-const retryActionSource = retryUiSource.slice(
-  retryUiSource.indexOf('async function retryRenderSettingsState'),
-);
+const settingsSource = fs.readFileSync(path.join(projectRoot, 'src', 'web', 'public', 'js', 'pages', 'settings', 'index.js'), 'utf8');
+const runtimeSource = fs.readFileSync(path.join(projectRoot, 'src', 'web', 'public', 'js', 'shared', 'settings-runtime-sync.js'), 'utf8');
 
-assert.ok(
-  retryUiSource.includes('function ensureRenderStateRetryUi'),
-  'render-state retry must keep a stable message and button DOM instead of rebuilding the focused button',
-);
-assert.ok(
-  retryActionSource.includes('retryHadFocus')
-    && retryActionSource.includes("'[data-render-state-retry]'"),
-  'retry must remember whether its existing button owned keyboard focus',
-);
-assert.ok(
-  retryActionSource.includes('paintRenderStateRetryStatus(status,')
-    && !retryActionSource.includes("status.textContent = '正在重新读取本机状态...'"),
-  'retry progress and failure must update the stable retry UI instead of replacing it through textContent',
-);
-assert.ok(
-  retryActionSource.includes('retryButton.focus({ preventScroll: true })'),
-  'a failed retry must restore focus to the same retry button for immediate keyboard retry',
-);
-assert.ok(
-  appSource.includes('let renderStateRetryInFlight = false')
-    && retryActionSource.includes('if (renderStateRetryInFlight) return')
-    && retryActionSource.includes('renderStateRetryInFlight = true')
-    && retryActionSource.includes('renderStateRetryInFlight = false'),
-  'render-state retry must be single-flight even when form input repaints the warning while the request is pending',
-);
-assert.ok(
-  retryUiSource.includes("retryState: renderStateRetryInFlight ? 'busy' : 'ready'")
-    && retryUiSource.includes("text: renderStateRetryInFlight ? '正在重新读取本机状态...' : settingsStateFailureMessage()"),
-  'warning repaints during a retry must preserve the busy state and stable button instead of re-enabling a duplicate request',
-);
+assert.match(settingsSource, /function ensureNoticeBar\(\)[\s\S]*?重新载入设置[\s\S]*?保存全部草稿并刷新[\s\S]*?暂不[\s\S]*?settings-notice/, '设置更新通知必须复用稳定通知条并提供载入、保存刷新和暂不操作');
+assert.match(settingsSource, /async function confirmReloadDiscardingDrafts\(trigger = null\)[\s\S]*?hasUnsavedDrafts\(\)[\s\S]*?confirmDialog[\s\S]*?refreshFromServer/, '普通草稿或账号级草稿存在时重新载入必须先确认,然后从服务端刷新');
+assert.match(settingsSource, /function markStale\([\s\S]*?hasUnsavedDrafts\(\)[\s\S]*?showNotice\(/, '检测到设置版本变化时必须通过统一草稿状态保留草稿提示并显示稳定通知条');
+assert.match(settingsSource, /const focusProbe = createLatestSettingsRevisionProbe\(/, '设置页必须使用单飞版本探测器');
+assert.match(settingsSource, /const onFocus = \(\)[\s\S]*?focusProbe\.request\(\)[\s\S]*?window\.addEventListener\('focus', onFocus\)/, '窗口重新获得焦点时必须探测最新设置版本');
+assert.match(settingsSource, /focusProbe\.dispose\(\)/, '设置页卸载时必须停止版本探测器');
+assert.match(settingsSource, /const focusProbe = createLatestSettingsRevisionProbe\(\{[\s\S]*?onError:[\s\S]*?设置版本探测失败/, '后台版本探测失败必须被受控处理,不得形成未处理 Promise rejection');
+
+assert.match(runtimeSource, /let activePromise = null;\s*let rerunRequested = false;/, '版本探测器必须维护单飞请求与重跑标记');
+assert.match(runtimeSource, /if \(activePromise\) \{[\s\S]*?rerunRequested = true;[\s\S]*?return activePromise;/, '探测请求并发时必须合并为一次请求并安排重跑');
+assert.match(runtimeSource, /do \{[\s\S]*?rerunRequested = false;[\s\S]*?\} while \(rerunRequested && active\(\)\)/, '版本探测器必须在并发请求期间发生变化后再跑一轮');
+assert.match(runtimeSource, /dispose\(\) \{[\s\S]*?disposed = true;[\s\S]*?rerunRequested = false;/, '版本探测器销毁时必须停止后续重跑');
+assert.match(runtimeSource, /catch \(error\) \{[\s\S]*?onError\(error\)[\s\S]*?\} while \(rerunRequested && active\(\)\)/, '探测失败必须上报并继续兑现已经排队的最后一次探测');
 
 console.log('settings state retry focus contract passed');

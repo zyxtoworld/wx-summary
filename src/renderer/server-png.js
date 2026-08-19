@@ -7,11 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { createAbortableWorkRegistry } from '../lib/abortable-work-registry.js';
 import { TMP_DIR, assertSafeTmpPath, ensureOrdinaryTmpDir } from '../lib/paths.js';
 import { readFileHandleBounded } from '../lib/bounded-read.js';
+import { createFileHandleCloser } from '../lib/bounded-read.js';
 import {
   DIGEST_RENDERER_ENGINE_SERVER,
   DIGEST_RENDERER_VERSION,
   normalizeDigestForRender,
-} from '../web/public/js/digest-view-model.js';
+} from '../web/public/js/shared/digest-view-model.js';
 import {
   RENDERED_PNG_MAX_BYTES,
   RENDERED_PNG_MAX_RGBA_BYTES,
@@ -19,7 +20,7 @@ import {
   formatPngByteSize,
   validatePngFileHandle,
 } from './png-validate.js';
-import { attachWindowsProcessCleanup, terminateWindowsProcessTree, windowsProcessCleanupForError } from './windows-process-tree.js';
+import { attachWindowsProcessCleanup, terminateWindowsProcessTree, windowsProcessCleanupForError } from '../lib/windows-process-tree.js';
 
 const SCRIPT_PATH = fileURLToPath(new URL('./render-digest.ps1', import.meta.url));
 const SERVER_RENDER_TIMEOUT_MS = 60_000;
@@ -88,9 +89,9 @@ async function renderDigestPngBufferOwned(digest, renderOptions = {}, { signal =
     throwIfRenderAborted(signal);
     const safeInput = await assertSafeTmpPath(inputJson, { label: 'server render input', ensureParent: true });
     const safeOutputTarget = await assertSafeTmpPath(outputPng, { label: 'server render output', ensureParent: true });
-    await fsp.writeFile(safeInput.resolved, JSON.stringify(payload, null, 2), 'utf-8');
     let deferredProcessCleanup = null;
     try {
+      await fsp.writeFile(safeInput.resolved, JSON.stringify(payload, null, 2), 'utf-8');
       await runPowerShell([
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
@@ -205,8 +206,10 @@ function serverRenderOutputChangedError() {
 
 async function readServerRenderOutput(safeOutput, { signal = null } = {}) {
   let handle = null;
+  let closeHandle = null;
   try {
     handle = await fsp.open(safeOutput.resolved, 'r');
+    closeHandle = createFileHandleCloser(handle);
     const stat = await handle.stat();
     if (!stat?.isFile?.()) {
       throw serverRenderFailedError('服务端长图渲染没有生成可用 PNG。请缩短时间范围后重试，或改用「生成文本预览」。', 'server_render_invalid_png', 500);
@@ -214,10 +217,12 @@ async function readServerRenderOutput(safeOutput, { signal = null } = {}) {
     const outputBytes = Math.max(0, Number(stat.size || 0) || 0);
     if (outputBytes > SERVER_RENDER_OUTPUT_MAX_PNG_BYTES) throw serverRenderOutputTooLargeError(outputBytes);
     try {
-      await validatePngFileHandle(handle, serverRenderPngValidationOptions({ signal }));
+      await validatePngFileHandle(handle, serverRenderPngValidationOptions({ signal, closeHandle }));
       throwIfRenderAborted(signal);
       const buffer = await readFileHandleBounded(handle, SERVER_RENDER_OUTPUT_MAX_PNG_BYTES, {
         checkAbort: () => throwIfRenderAborted(signal),
+        signal,
+        closeHandle,
         createTooLargeError: bytes => serverRenderOutputTooLargeError(bytes),
       });
       return buffer;
@@ -226,7 +231,7 @@ async function readServerRenderOutput(safeOutput, { signal = null } = {}) {
       throw error;
     }
   } finally {
-    await handle?.close?.().catch(() => {});
+    await closeHandle?.().catch(() => {});
   }
 }
 
@@ -245,9 +250,10 @@ function windowsPowerShellExecutablePath() {
   }) || '';
 }
 
-function serverRenderPngValidationOptions({ signal = null } = {}) {
+function serverRenderPngValidationOptions({ signal = null, closeHandle = null } = {}) {
   return {
     signal,
+    closeHandle,
     maxBytes: SERVER_RENDER_OUTPUT_MAX_PNG_BYTES,
     maxRgbaBytes: SERVER_RENDER_OUTPUT_MAX_RGBA_BYTES,
     maxSide: SERVER_RENDER_MAX_PNG_SIDE,
@@ -482,42 +488,44 @@ function runPowerShell(args, { signal = null, timeoutMs = SERVER_RENDER_TIMEOUT_
       killFor(renderTimeoutError(timeout));
     }, timeout);
     timer.unref?.();
-    signal?.addEventListener?.('abort', onAbort, { once: true });
-    child.stdout.setEncoding('utf-8');
-    child.stderr.setEncoding('utf-8');
-    child.stdout.on('data', chunk => {
-      stdout = appendBoundedOutputTail(stdout, chunk, SERVER_RENDER_OUTPUT_TAIL_MAX_CHARS);
-    });
-    child.stderr.on('data', chunk => {
-      stderr = appendBoundedOutputTail(stderr, chunk, SERVER_RENDER_OUTPUT_TAIL_MAX_CHARS);
-    });
-    child.on('error', err => {
-      if (pendingKillError) return;
-      const processError = serverRenderProcessError(err);
-      if (Number.isSafeInteger(child.pid) && child.pid > 0) killFor(processError);
-      else finish(reject, processError);
-    });
-    child.on('close', code => {
-      childClosed = true;
-      if (pendingKillError) {
-        return;
-      }
-      if (code === 0) finish(resolve, { stdout, stderr });
-      else {
-        const detail = (stderr || stdout || '').trim();
-        const failure = formatPowerShellRenderFailure(detail, code);
-        const err = serverRenderFailedError(failure.message, failure.code, failure.status);
-        if (Number.isSafeInteger(failure.expected_height_px) && failure.expected_height_px > 0) {
-          err.expected_height_px = failure.expected_height_px;
+    try {
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+      child.stdout.setEncoding('utf-8');
+      child.stderr.setEncoding('utf-8');
+      child.stdout.on('data', chunk => {
+        stdout = appendBoundedOutputTail(stdout, chunk, SERVER_RENDER_OUTPUT_TAIL_MAX_CHARS);
+      });
+      child.stderr.on('data', chunk => {
+        stderr = appendBoundedOutputTail(stderr, chunk, SERVER_RENDER_OUTPUT_TAIL_MAX_CHARS);
+      });
+      child.on('error', err => {
+        if (pendingKillError || settled) return;
+        const processError = serverRenderProcessError(err);
+        if (Number.isSafeInteger(child.pid) && child.pid > 0) killFor(processError);
+        else finish(reject, processError);
+      });
+      child.on('close', code => {
+        childClosed = true;
+        if (pendingKillError || settled) return;
+        if (code === 0) finish(resolve, { stdout, stderr });
+        else {
+          const detail = (stderr || stdout || '').trim();
+          const failure = formatPowerShellRenderFailure(detail, code);
+          const err = serverRenderFailedError(failure.message, failure.code, failure.status);
+          if (Number.isSafeInteger(failure.expected_height_px) && failure.expected_height_px > 0) {
+            err.expected_height_px = failure.expected_height_px;
+          }
+          if (Number.isSafeInteger(failure.max_height_px) && failure.max_height_px > 0) {
+            err.max_height_px = failure.max_height_px;
+          }
+          if (detail) err.raw_detail = detail;
+          finish(reject, err);
         }
-        if (Number.isSafeInteger(failure.max_height_px) && failure.max_height_px > 0) {
-          err.max_height_px = failure.max_height_px;
-        }
-        if (detail) err.raw_detail = detail;
-        finish(reject, err);
-      }
-    });
-    if (signal?.aborted) onAbort();
+      });
+      if (signal?.aborted) onAbort();
+    } catch (error) {
+      killFor(error);
+    }
   });
 }
 

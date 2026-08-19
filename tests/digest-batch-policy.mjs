@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {
   digestBatchCanAutomaticMirrorRetry,
   digestFailureStopsRemainingBatchPolicy,
-} from '../src/web/public/js/digest-batch-policy.js';
+} from '../src/web/public/js/shared/digest-batch-policy.js';
 
 function policy(error, recoveryKind = 'local_service', aiRecoveryGroup = '') {
   return digestFailureStopsRemainingBatchPolicy(error, { recoveryKind, aiRecoveryGroup });

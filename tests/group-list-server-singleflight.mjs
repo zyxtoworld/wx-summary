@@ -1,10 +1,21 @@
 import assert from 'node:assert/strict';
+import fsp from 'node:fs/promises';
 import { __mainInternals } from '../src/main.js';
 
 const {
   groupListReadInFlightKey,
   joinGroupListReadOperation,
 } = __mainInternals;
+
+const mainSource = await fsp.readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+const groupsRouteStart = mainSource.indexOf("if (pathname === '/api/groups'");
+const groupsRouteEnd = mainSource.indexOf("if (pathname === '/api/recent-groups'", groupsRouteStart);
+assert.ok(groupsRouteStart >= 0 && groupsRouteEnd > groupsRouteStart, '必须找到真实 /api/groups caller');
+const groupsRouteSource = mainSource.slice(groupsRouteStart, groupsRouteEnd);
+assert.ok(
+  groupsRouteSource.includes('mirror: requestAccountContext.account?.mirror || null'),
+  '真实 /api/groups caller 必须把账号镜像快照传给共享读取 owner',
+);
 
 function deferred() {
   let resolve;
@@ -47,6 +58,111 @@ assert.notEqual(key, groupListReadInFlightKey({
   accountFingerprint,
   allowStaleAccount: true,
 }), '允许旧账号数据的请求不能与严格账号请求共享读取结果');
+
+const mirrorA = {
+  source_snapshot_meta_hash: '1'.repeat(64),
+  published_manifest_hash: '2'.repeat(64),
+  refreshed_at: '2026-08-18T10:00:00.000Z',
+};
+const mirrorB = {
+  source_snapshot_meta_hash: '3'.repeat(64),
+  published_manifest_hash: '4'.repeat(64),
+  refreshed_at: '2026-08-18T10:01:00.000Z',
+};
+const snapshotKeyA = groupListReadInFlightKey({
+  accountId: 'wxid_singleflight',
+  accountFingerprint,
+  mirror: mirrorA,
+  allowStaleAccount: false,
+});
+const snapshotKeyB = groupListReadInFlightKey({
+  accountId: 'wxid_singleflight',
+  accountFingerprint,
+  mirror: mirrorB,
+  allowStaleAccount: false,
+});
+assert.notEqual(
+  snapshotKeyA,
+  snapshotKeyB,
+  '同一账号指纹的不同本地工作副本必须使用不同共享读取 owner，不能让新快照加入旧读取',
+);
+
+const snapshotGateA = deferred();
+const snapshotGateB = deferred();
+let snapshotRunCount = 0;
+const snapshotReadA = joinGroupListReadOperation(snapshotKeyA, {
+  run: async () => {
+    snapshotRunCount += 1;
+    return snapshotGateA.promise;
+  },
+});
+const snapshotReadB = joinGroupListReadOperation(snapshotKeyB, {
+  run: async () => {
+    snapshotRunCount += 1;
+    return snapshotGateB.promise;
+  },
+});
+assert.equal(snapshotReadA.shared, false, '旧镜像快照必须创建自己的共享读取');
+assert.equal(snapshotReadB.shared, false, '新镜像快照不得加入旧镜像读取');
+await Promise.resolve();
+assert.equal(snapshotRunCount, 2, '镜像快照换代时 A/B 必须各自执行一次读取');
+snapshotGateA.resolve({ snapshot: 'A', groups: [{ id: 'group-a' }] });
+snapshotGateB.resolve({ snapshot: 'B', groups: [{ id: 'group-b' }] });
+assert.equal((await snapshotReadA.promise).snapshot, 'A', 'A 只能收到自己的镜像快照结果');
+assert.equal((await snapshotReadB.promise).snapshot, 'B', 'B 只能收到新镜像快照结果');
+snapshotReadA.detach();
+snapshotReadB.detach();
+
+const cancelledSnapshotKey = `${snapshotKeyA}\ncancel-late`;
+const lateSnapshotGate = deferred();
+const lateSnapshotProgress = [];
+let lateSnapshotSignal = null;
+let lateSnapshotOnProgress = null;
+const cancelledSnapshot = joinGroupListReadOperation(cancelledSnapshotKey, {
+  reporter: progress => lateSnapshotProgress.push(progress.phase),
+  run: async ({ signal, onProgress }) => {
+    lateSnapshotSignal = signal;
+    lateSnapshotOnProgress = onProgress;
+    return lateSnapshotGate.promise;
+  },
+});
+await Promise.resolve();
+assert.equal(lateSnapshotSignal?.aborted, false, '旧镜像读取开始时应仍持有自己的取消信号');
+cancelledSnapshot.detach();
+assert.equal(lateSnapshotSignal?.aborted, true, '最后一个调用者离开后必须只取消自己的镜像读取');
+
+const replacementSnapshotGate = deferred();
+const replacementProgress = [];
+const replacementSnapshot = joinGroupListReadOperation(snapshotKeyB, {
+  reporter: progress => replacementProgress.push(progress.phase),
+  run: async ({ onProgress }) => {
+    onProgress({ phase: 'replacement_snapshot_running' });
+    return replacementSnapshotGate.promise;
+  },
+});
+assert.equal(replacementSnapshot.shared, false, '新镜像快照不能加入已取消的旧读取');
+await Promise.resolve();
+replacementSnapshotGate.resolve({ snapshot: 'B-current', groups: [{ id: 'group-b-current' }] });
+assert.equal((await replacementSnapshot.promise).snapshot, 'B-current', '新镜像读取必须独立完成');
+lateSnapshotOnProgress?.({ phase: 'old_snapshot_late_progress' });
+lateSnapshotGate.resolve({ snapshot: 'A-late', groups: [{ id: 'group-a-late' }] });
+assert.equal((await cancelledSnapshot.promise).snapshot, 'A-late', '底层忽略取消时旧读取也只能完成自己的 promise');
+assert.deepEqual(replacementProgress, ['replacement_snapshot_running'], '旧读取迟到进度不得投影到新镜像 owner');
+assert.deepEqual(lateSnapshotProgress, [], '取消后的旧 reporter 必须立即脱离，迟到结果不得回写调用者');
+replacementSnapshot.detach();
+
+const failedSnapshotKey = `${snapshotKeyB}\nfailed-retry`;
+const failedSnapshot = joinGroupListReadOperation(failedSnapshotKey, {
+  run: async () => { throw new Error('snapshot failed'); },
+});
+await assert.rejects(failedSnapshot.promise, /snapshot failed/, '镜像读取失败必须传递原错误');
+failedSnapshot.detach();
+const retrySnapshot = joinGroupListReadOperation(failedSnapshotKey, {
+  run: async () => ({ snapshot: 'retry', groups: [] }),
+});
+assert.equal(retrySnapshot.shared, false, '失败读取完成后同一镜像 owner 必须允许重试');
+assert.equal((await retrySnapshot.promise).snapshot, 'retry');
+retrySnapshot.detach();
 
 const gate = deferred();
 const strongerGate = deferred();

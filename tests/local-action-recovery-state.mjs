@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-const { classifyLocalActionRecovery } = await import('../src/web/public/js/local-action-recovery-state.js');
+const { classifyLocalActionRecovery } = await import('../src/web/public/js/shared/local-action-recovery-state.js');
 
 assert.equal(classifyLocalActionRecovery({ local_action_recovery_failed: true }), 'failed');
 assert.equal(classifyLocalActionRecovery({ action_state: 'prepared', local_action_committed: false }), 'pending');

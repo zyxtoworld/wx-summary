@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import {
   DIGEST_DRAFT_MAX_AGE_MS,
   digestDraftHasMeaningfulInput,
   readDigestDraftSnapshot,
   writeDigestDraftSnapshot,
-} from '../src/web/public/js/digest-draft-store.js';
+} from '../src/web/public/js/shared/digest-draft-store.js';
 
 class MemoryStorage {
   #values = new Map();
@@ -42,6 +40,10 @@ const draftA = {
     pending_keywords: '回归 测试',
   },
   min_messages: 8,
+  render_options: {
+    theme: 'dark',
+    font_size: 'large',
+  },
 };
 
 assert.equal(writeDigestDraftSnapshot(storage, storageKey, scopeA, draftA, {
@@ -52,6 +54,10 @@ assert.equal(writeDigestDraftSnapshot(storage, storageKey, scopeB, {
   selected_group_ids: ['group-c'],
   range_key: 'today',
   min_messages: 2,
+  render_options: {
+    theme: 'light',
+    font_size: 'normal',
+  },
 }, {
   accountFingerprint: 'fingerprint-b',
   now: now + 1,
@@ -71,6 +77,10 @@ assert.deepEqual(restoredA.draft.filters.exclude_types, ['image', 'file']);
 assert.equal(restoredA.draft.filters.pending_senders, '王五');
 assert.equal(restoredA.draft.filters.pending_keywords, '回归 测试');
 assert.equal(restoredA.draft.min_messages, 8);
+assert.deepEqual(restoredA.draft.render_options, {
+  theme: 'dark',
+  font_size: 'large',
+}, 'render choices must persist with the account-scoped digest draft');
 
 const restoredB = readDigestDraftSnapshot(storage, storageKey, scopeB, {
   accountFingerprint: 'fingerprint-b',
@@ -79,6 +89,20 @@ const restoredB = readDigestDraftSnapshot(storage, storageKey, scopeB, {
 assert.deepEqual(restoredB.draft.selected_group_ids, ['group-c'], 'drafts must stay isolated by account scope');
 assert.equal(restoredB.draft.range_key, 'today');
 assert.equal(restoredB.draft.min_messages, 2);
+assert.deepEqual(restoredB.draft.render_options, {
+  theme: 'light',
+  font_size: 'normal',
+}, 'switching accounts must restore the target account render choices');
+
+const invalidRenderScope = 'project-a\naccount-invalid-render';
+assert.equal(writeDigestDraftSnapshot(storage, storageKey, invalidRenderScope, {
+  render_options: { theme: 'system', font_size: 'huge' },
+}, { now }), true);
+assert.deepEqual(
+  readDigestDraftSnapshot(storage, storageKey, invalidRenderScope, { now }).draft.render_options,
+  { theme: 'auto', font_size: 'normal' },
+  'unsupported render choices must normalize to the safe defaults',
+);
 
 const sameTimestampStorage = new MemoryStorage();
 assert.equal(writeDigestDraftSnapshot(sameTimestampStorage, storageKey, scopeA, { min_messages: 2 }, { now }), true);
@@ -95,6 +119,27 @@ const mismatchedIdentity = readDigestDraftSnapshot(storage, storageKey, scopeA, 
 });
 assert.equal(mismatchedIdentity.ok, true);
 assert.equal(mismatchedIdentity.draft, null, 'a confirmed account fingerprint mismatch must not restore another account draft');
+
+const missingFingerprintScope = 'project-a\naccount-missing-fingerprint';
+assert.equal(writeDigestDraftSnapshot(storage, storageKey, missingFingerprintScope, {
+  selected_group_ids: ['legacy-no-fingerprint'],
+}, { now }), true);
+const missingFingerprintForCurrent = readDigestDraftSnapshot(storage, storageKey, missingFingerprintScope, {
+  accountFingerprint: 'fingerprint-b',
+  now: now + 1,
+});
+assert.equal(missingFingerprintForCurrent.draft, null,
+  '缺少 fingerprint 的旧草稿不得在精确账号上下文变化后跨账号恢复');
+const fingerprintForUnbound = `${missingFingerprintScope}-nonempty`;
+assert.equal(writeDigestDraftSnapshot(storage, storageKey, fingerprintForUnbound, {
+  selected_group_ids: ['bound-fingerprint'],
+}, { accountFingerprint: 'fingerprint-b', now }), true);
+const nonemptyForEmpty = readDigestDraftSnapshot(storage, storageKey, fingerprintForUnbound, {
+  accountFingerprint: '',
+  now: now + 1,
+});
+assert.equal(nonemptyForEmpty.draft, null,
+  '有 fingerprint 的草稿不得恢复到 fingerprint 为空的账号上下文');
 
 const expired = readDigestDraftSnapshot(storage, storageKey, scopeA, {
   accountFingerprint: 'fingerprint-a',
@@ -135,6 +180,13 @@ assert.equal(digestDraftHasMeaningfulInput({
   filters: { pending_keywords: '尚未按回车的关键词' },
   min_messages: 1,
 }), true, 'uncommitted chip text must count as meaningful draft input');
+assert.equal(digestDraftHasMeaningfulInput({
+  selected_group_ids: [],
+  range_key: 'yesterdayToday',
+  filters: {},
+  min_messages: 1,
+  render_options: { theme: 'dark', font_size: 'normal' },
+}), true, 'a non-default render choice must count as meaningful draft input');
 
 const throwingStorage = {
   getItem() { throw new Error('storage unavailable'); },
@@ -143,23 +195,5 @@ const throwingStorage = {
 };
 assert.equal(writeDigestDraftSnapshot(throwingStorage, storageKey, scopeA, draftA, { now }), false, 'storage failures must be reported to the page so unload protection can activate');
 assert.deepEqual(readDigestDraftSnapshot(throwingStorage, storageKey, scopeA, { now }), { ok: false, draft: null }, 'storage read failures must not look like an empty successful restore');
-
-const projectRoot = path.resolve(import.meta.dirname, '..');
-const appSource = fs.readFileSync(path.join(projectRoot, 'src', 'web', 'public', 'js', 'app.js'), 'utf8');
-const renderDigestSource = appSource.slice(appSource.indexOf('async function renderDigest()'), appSource.indexOf('function syncDigestControlsFromState'));
-const inputChangedSource = appSource.slice(appSource.indexOf('function markDigestResultInputChanged'), appSource.indexOf('function digestRenderSelectionFromSaved'));
-const pruneSelectionSource = appSource.slice(appSource.indexOf('function pruneDigestSelectionToGroups'), appSource.indexOf('function rememberDigestCurrentGroups'));
-const beforeUnloadSource = appSource.slice(appSource.indexOf("window.addEventListener('beforeunload'"), appSource.indexOf('function setupKeyboardShortcuts'));
-assert.ok(appSource.includes("from './digest-draft-store.js'"), 'the digest page must use the bounded versioned draft store');
-assert.ok(
-  renderDigestSource.indexOf('restorePersistedDigestDraftState') >= 0
-    && renderDigestSource.indexOf('restorePersistedDigestDraftState') < renderDigestSource.indexOf('syncDigestControlsFromState()'),
-  'the digest draft must restore before the initial controls are synchronized',
-);
-assert.ok(inputChangedSource.includes('persistDigestDraftInput()'), 'every digest input mutation should pass through one persistence point');
-assert.ok(pruneSelectionSource.includes('persistDigestDraftState()'), 'group-list validation must persist removal of stale restored group ids');
-assert.ok(beforeUnloadSource.includes('digestDraftPersistenceRisk()'), 'a meaningful draft must activate unload protection when browser storage failed');
-assert.ok(appSource.includes("_state_digest.pendingFilters[name] = inp.value"), 'uncommitted sender and keyword text must be included in the draft');
-assert.ok(appSource.includes('resetDigestDraftInputState()'), 'account changes must reset the in-memory draft before another account is rendered');
 
 console.log('digest draft persistence tests passed');

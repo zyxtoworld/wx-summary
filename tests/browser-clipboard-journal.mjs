@@ -4,7 +4,7 @@ import createBrowserClipboardJournal, {
   BROWSER_CLIPBOARD_JOURNAL_MAX_ENTRIES,
   BROWSER_CLIPBOARD_JOURNAL_STORAGE_KEY,
   BROWSER_CLIPBOARD_JOURNAL_TTL_MS,
-} from '../src/web/public/js/browser-clipboard-journal.js';
+} from '../src/web/public/js/shared/browser-clipboard-journal.js';
 
 class MemoryStorage {
   constructor() {

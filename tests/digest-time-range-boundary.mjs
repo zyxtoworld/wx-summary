@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
-import { parseLocalDateTime } from '../src/web/public/js/local-date-time.js';
+import { rangeSummaryText } from '../src/web/public/js/pages/digest/ranges.js';
+import { parseLocalDateTime } from '../src/web/public/js/shared/local-date-time.js';
 import { validateMessageTimeRange } from '../src/collector/index.js';
 import { __wxdbInternals } from '../src/wxdb/index.js';
 
 const startText = '2026-07-29 00:00:00';
 const endText = '2026-07-29 23:59:59';
+
+assert.equal(
+  rangeSummaryText('custom', { customSince: '2026-07-29 00:00', customUntil: '' }),
+  '自定义:2026-07-29 00:00 ~ 现在',
+  '自定义结束时间留空时,范围摘要必须显示现在',
+);
 
 const defaultEnd = parseLocalDateTime(endText);
 assert.equal(defaultEnd?.getMilliseconds(), 0, 'default local date parsing must retain an exact second');

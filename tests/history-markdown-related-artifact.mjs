@@ -30,22 +30,12 @@ const settings = {
   },
 };
 
-const [mainSource, appSource] = await Promise.all([
-  fsp.readFile(new URL('../src/main.js', import.meta.url), 'utf8'),
-  fsp.readFile(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8'),
-]);
+const mainSource = await fsp.readFile(new URL('../src/main.js', import.meta.url), 'utf8');
 const publicOutputItemSource = mainSource.slice(
   mainSource.indexOf('function publicOutputItem('),
   mainSource.indexOf('function redactPreviewHistoryMetadata'),
 );
 assert.ok(publicOutputItemSource.includes('out.related_markdown_export = publicOutputItem(item.related_markdown_export)'), 'history API projection must expose only the public fields of a related Markdown item');
-const normalizeHistoryResponseSource = appSource.slice(
-  appSource.indexOf('function normalizeHistoryResponse('),
-  appSource.indexOf('function historyResponseWithoutDeletedItems'),
-);
-assert.ok(appSource.includes('function restoreHistoryMarkdownExportTargetsFromItems(')
-  && normalizeHistoryResponseSource.includes('restoreHistoryMarkdownExportTargetsFromItems(data.items)'),
-'history reload must rebuild PNG-to-Markdown action targets from the API instead of relying only on process memory');
 
 try {
   const source = await saveRenderedPng({

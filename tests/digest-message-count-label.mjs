@@ -6,7 +6,7 @@ import {
   digestMessageCountLabel,
   digestMessageCountRow,
   normalizeDigestForRender,
-} from '../src/web/public/js/digest-view-model.js';
+} from '../src/web/public/js/shared/digest-view-model.js';
 
 const known = { message_count: 1369 };
 const legacyUnknown = {
@@ -29,16 +29,8 @@ assert.match(digestMarkdown(legacyUnknown), /消息数未记录/);
 assert.doesNotMatch(digestMarkdown(legacyUnknown), /0 条消息/);
 assert.equal(normalizeDigestForRender(legacyUnknown).__message_count_label, '消息数未记录');
 
-const [appSource, powershellSource] = await Promise.all([
-  fsp.readFile(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8'),
-  fsp.readFile(new URL('../src/renderer/render-digest.ps1', import.meta.url), 'utf8'),
-]);
+const powershellSource = await fsp.readFile(new URL('../src/renderer/render-digest.ps1', import.meta.url), 'utf8');
 
-assert.ok(
-  appSource.includes('DigestView.digestMessageCountLabel(d)')
-    && appSource.includes('DigestView.digestMessageCountLabel(item, \'条\')'),
-  'browser Canvas and history cards should use the shared unknown-count formatter',
-);
 assert.ok(
   powershellSource.includes('$digest.__message_count_label')
     && powershellSource.includes('$messageCountLabel'),

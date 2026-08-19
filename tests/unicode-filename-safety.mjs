@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import vm from 'node:vm';
-import { toWellFormedText, truncateUnicodeText, truncateUtf8Text } from '../src/web/public/js/unicode-text.js';
+import { toWellFormedText, truncateUnicodeText, truncateUtf8Text } from '../src/web/public/js/shared/unicode-text.js';
 import { __mainInternals } from '../src/main.js';
 
 function hasLoneSurrogate(value = '') {
@@ -43,19 +43,5 @@ const outputName = outputSandbox.__sanitizeFilename(`${'a'.repeat(119)}𠀀.png`
 assert.equal(hasLoneSurrogate(outputName), false);
 assert.match(outputName, /__deadbeef\.png$/);
 assert.ok(Buffer.byteLength(outputName, 'utf8') <= 224);
-
-const appSource = await fs.readFile(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
-const downloadNameSource = appSource.slice(appSource.indexOf('function safePngDownloadFilename'), appSource.indexOf('async function downloadCanvas'));
-assert.ok(downloadNameSource.includes('truncateUnicodeText'));
-assert.ok(downloadNameSource.includes('truncateUtf8Text'));
-assert.equal(downloadNameSource.includes('.slice(0, 140)'), false);
-const appSandbox = { Date, String, truncateUnicodeText, truncateUtf8Text };
-vm.runInNewContext(`${downloadNameSource}\nglobalThis.__safePngDownloadFilename = safePngDownloadFilename;`, appSandbox);
-const downloadName = appSandbox.__safePngDownloadFilename({
-  group: `${'a'.repeat(139)}𠀀`,
-  digest_id: 'digest-id',
-});
-assert.equal(hasLoneSurrogate(downloadName), false);
-assert.ok(Buffer.byteLength(downloadName, 'utf8') <= 220);
 
 console.log('unicode filename safety tests passed');

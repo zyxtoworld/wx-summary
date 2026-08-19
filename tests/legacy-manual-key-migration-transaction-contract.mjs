@@ -4,10 +4,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { saveLegacyManualKeyForAccount } from '../src/config/settings.js';
+import { createBrowserModuleLoader } from './helpers/import-browser-module.mjs';
+
+globalThis.location = new URL('http://wx-summary.test/#/setup');
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+const { manualKeyInvalidMessage, normalizeManualKeysText } = await createBrowserModuleLoader().load('js/pages/setup/state.js');
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
-const mainSource = fs.readFileSync(path.join(projectRoot, 'src', 'main.js'), 'utf8');
-const appSource = fs.readFileSync(path.join(projectRoot, 'src', 'web', 'public', 'js', 'app.js'), 'utf8');
+const mainSource = fs.readFileSync(path.join(projectRoot, 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
 
 const migrationStart = mainSource.indexOf('} else if (legacyManualCandidateVerified && !savedManualCandidateVerified) {');
 const fullCoverageStart = mainSource.indexOf('if (messageDbVerified) {', migrationStart);
@@ -19,11 +24,10 @@ assert.ok(migrationBranch.includes('if (!messageDbVerified)'), 'legacy key migra
 assert.ok(migrationBranch.includes('manual_key_legacy_migration_deferred'), 'sample-only validation should report that migration was deliberately deferred');
 assert.ok(!sampleOnlyBranch.includes('saveLegacyManualKeyForAccount'), 'the sample-only branch must not persist or scope the legacy key');
 assert.ok(mainSource.includes('if (messageDbVerified) {\n              verifiedManualKeySettings = await saveLegacyManualKeyForAccount({'), 'the settings mutation must only run inside the full-coverage branch');
-assert.ok(appSource.includes("manual_key_verified_candidate_source === 'legacy'")
-  && appSource.includes("legacyManualKey ? '旧版全局候选'")
-  && appSource.includes('只能打开当前账号消息库样本')
-  && appSource.includes('未修改本机密钥设置，也未绑定到当前账号'),
-'the UI should identify the unchanged legacy candidate instead of calling a failed migration an already-saved account key');
+const normalized = normalizeManualKeysText(`无效候选\n${'b'.repeat(64)}`);
+assert.deepEqual(normalized.keys, ['b'.repeat(64)]);
+assert.match(manualKeyInvalidMessage({ invalid: ['无效候选'] }), /不会回显原文/,
+  'the setup UI must report invalid manual-key fragments without leaking their contents');
 
 const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'wx-summary-legacy-key-transaction-'));
 try {

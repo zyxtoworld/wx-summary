@@ -70,7 +70,11 @@ assert.ok(cancelActiveDigestWorkStart >= 0 && cancelActiveDigestWorkEnd > cancel
 const cancelActiveDigestWorkSource = source.slice(cancelActiveDigestWorkStart, cancelActiveDigestWorkEnd);
 assert.match(cancelActiveDigestWorkSource, /clearDigestBatchSettings\(cleanReason, \{ preserveTerminalResults \}\);/, 'global digest cancellation must release batch-owned mirror recovery controllers while honoring shutdown-only terminal-result preservation');
 assert.doesNotMatch(cancelActiveDigestWorkSource, /DIGEST_BATCH_SETTINGS\.clear\(\);/, 'global digest cancellation must not bypass batch cleanup hooks');
-assert.match(cancelActiveDigestWorkSource, /const cachedBatchSettings = clearDigestBatchSettings\(cleanReason, \{ preserveTerminalResults \}\);[\s\S]*?cached_batch_settings: cachedBatchSettings/, 'global digest cancellation should report the snapshots it cleared without a second cleanup pass');
+assert.match(
+  cancelActiveDigestWorkSource,
+  /const cachedBatchSettings = cleanAccountId[\s\S]*?\? clearDigestBatchSettingsForAccount\(cleanAccountId, cleanReason, \{ preserveTerminalResults \}\)[\s\S]*?: clearDigestBatchSettings\(cleanReason, \{ preserveTerminalResults \}\);[\s\S]*?cached_batch_settings: cachedBatchSettings/,
+  'digest cancellation should clear only the active account snapshots when scoped, preserve the global fallback, and report the single cleanup result',
+);
 assert.match(cancelActiveDigestWorkSource, /ACTIVE_DIGEST_BATCH_START_CONTROLLERS\.keys\(\)/, 'global digest cancellation must include batch-start requests that have not yet registered a group request');
 assert.match(cancelActiveDigestWorkSource, /const controller = ACTIVE_DIGEST_BATCH_START_CONTROLLERS\.get\(id\);[\s\S]*?abortControllerQuietly\(controller, message\)/, 'settings changes must abort an in-flight batch-start preflight instead of only marking its lease cancelled');
 assert.match(cancelActiveDigestWorkSource, /return \{ requests, saves, starts, leases, batches: batches\.size, aborted, cached_batch_settings: cachedBatchSettings \};/, 'batch-start cancellation must be reported alongside active generation and save work');

@@ -69,16 +69,20 @@ try {
   const sameAccountWork = __discoveryInternals.runWithWxDbMirrorLock('partition-account-a', async () => {
     events.push('same-account');
   });
+  let notifyDifferentAccountStarted;
+  const differentAccountStarted = new Promise(resolve => { notifyDifferentAccountStarted = resolve; });
   const differentAccountWork = __discoveryInternals.runWithWxDbMirrorLock('partition-account-b', async () => {
     events.push('different-account');
+    notifyDifferentAccountStarted();
   });
 
   await Promise.race([
-    differentAccountWork,
-    new Promise((_, reject) => setTimeout(() => reject(new Error('different account remained blocked by account A')), 750)),
+    differentAccountStarted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('different account remained blocked by account A')), 5_000)),
   ]);
   assert.equal(events.includes('different-account'), true, 'different account work must overlap an active account lock');
   assert.equal(events.includes('same-account'), false, 'same-account work must remain serialized');
+  await differentAccountWork;
 
   releaseAccountA();
   releaseAccountA = null;

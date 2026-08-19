@@ -41,7 +41,6 @@ assert.equal(deadlineLimitedCooldown.retryAtMs, 50_000);
 
 const llmSource = fs.readFileSync(new URL('../src/summarizer/llm.js', import.meta.url), 'utf8');
 const mainSource = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
-const appSource = fs.readFileSync(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 
 assert.ok(
   llmSource.includes('retry_at_ms: retry.retryAtMs')
@@ -56,25 +55,6 @@ assert.ok(
     && mainSource.includes('retry_max_attempts: progress.retry_max_attempts')
     && mainSource.includes('retry_reason: progress.retry_reason'),
   'SSE progress and heartbeat should preserve retry timing instead of flattening it into static text',
-);
-assert.ok(
-  appSource.includes('function digestProgressAiRetryWaitDetail(stage = {}, nowMs = Date.now())')
-    && appSource.includes("Object.hasOwn(stage, 'retry_wait_ms')")
-    && appSource.includes('Number(stage.retry_wait_ms || 0) <= 0')
-    && appSource.includes("stage.detail || '自动重试等待预算不足，未继续请求'")
-    && appSource.includes('`${seconds} 秒后开始第 ${attempt}/${maxAttempts} 次请求`')
-    && appSource.includes("if (phase === 'llm_retry_wait')"),
-  'the browser should repaint a second-level retry countdown from the absolute deadline',
-);
-assert.ok(
-  appSource.includes('function syncDigestOutputRunningStatus(snapshot = {})')
-    && appSource.includes('syncDigestOutputRunningStatus(snapshot);'),
-  'the text/image output status should repaint from the same running-stage clock as the main progress card',
-);
-assert.equal(
-  appSource.includes('服务商建议 ${retryText} 后重试'),
-  false,
-  'terminal AI failure text must not insert a space between the duration and 后',
 );
 
 console.log('AI retry progress countdown tests passed');

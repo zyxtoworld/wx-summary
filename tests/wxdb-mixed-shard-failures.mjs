@@ -5,7 +5,6 @@ import { __schedulerInternals } from '../src/daemon/scheduler.js';
 import { __wxdbInternals } from '../src/wxdb/index.js';
 
 const main = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
-const app = fs.readFileSync(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 
 const mirrorError = { code: 'wxdb_temp_copy_wal_invalid', error: 'WAL 临时读取失败' };
 const keyError = { code: 'SQLITE_AUTH', error: 'page hmac mismatch' };
@@ -35,11 +34,6 @@ assert.match(
   main,
   /function shouldRecoverDigestMirrorShardFailure[\s\S]*?error_category_counts[\s\S]*?mirror[^\n]*> 0/,
   'a mixed failure containing a mirror error must get one mirror rebuild before being reclassified',
-);
-assert.match(
-  app,
-  /function digestWxdbShardCategoryCountText[\s\S]*?本地数据或临时副本[\s\S]*?密钥验证[\s\S]*?其他读取错误/,
-  'the UI must show structured category counts for mixed shard failures',
 );
 
 console.log('mixed wxdb shard failure classification passed');

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { selectFullyCoveredRecoverySupersessions } from '../src/web/public/js/digest-recovery-supersession.js';
+import { selectFullyCoveredRecoverySupersessions } from '../src/web/public/js/shared/digest-recovery-supersession.js';
 
 const accountId = 'wxacc-retry-policy';
 const accountFingerprint = 'a'.repeat(64);

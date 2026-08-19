@@ -1,5 +1,6 @@
 import fsp from 'node:fs/promises';
 import * as zlib from 'node:zlib';
+import { createFileHandleCloser } from '../lib/bounded-read.js';
 
 const { createInflate, inflateSync } = zlib;
 
@@ -19,6 +20,42 @@ const PNG_ADAM7_PASSES = [
   [1, 0, 2, 2],
   [0, 1, 1, 2],
 ];
+
+function createPngValidationLifecycle(options = {}) {
+  const signal = options?.signal || null;
+  const closeHandle = typeof options?.closeHandle === 'function' ? options.closeHandle : null;
+  if (!signal || !closeHandle) return null;
+  let closePromise = null;
+  const requestClose = () => {
+    if (!closePromise) {
+      closePromise = Promise.resolve().then(() => closeHandle());
+      closePromise.catch(() => {});
+    }
+    return closePromise;
+  };
+  const onAbort = () => { void requestClose().catch(() => {}); };
+  signal.addEventListener?.('abort', onAbort, { once: true });
+  return {
+    close: requestClose,
+    dispose: () => signal.removeEventListener?.('abort', onAbort),
+  };
+}
+
+async function finishPngValidationLifecycle(lifecycle, options = {}) {
+  if (!lifecycle) return;
+  let closeError = null;
+  try {
+    if (options?.signal?.aborted) await lifecycle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  try {
+    if (options?.signal?.aborted) throwIfPngValidationAborted(options);
+  } finally {
+    lifecycle.dispose();
+  }
+  if (closeError) throw closeError;
+}
 
 export function pngBufferFromDataUrl(pngDataUrl, options = {}) {
   const limits = pngLimits(options);
@@ -123,6 +160,8 @@ export function validatePngHeader(buffer, options = {}) {
 }
 
 export async function validatePngFileHeaderHandle(handle, options = {}) {
+  const lifecycle = createPngValidationLifecycle(options);
+  try {
   const limits = pngLimits(options);
   throwIfPngValidationAborted(options);
   const stat = await handle.stat();
@@ -142,20 +181,32 @@ export async function validatePngFileHeaderHandle(handle, options = {}) {
   }
   const header = await readPngFileExact(handle, 33, 0, options);
   return { ...validatePngHeader(header, options), bytes: stat.size };
+  } finally {
+    await finishPngValidationLifecycle(lifecycle, options);
+  }
 }
 
 export async function validatePngFile(filePath, options = {}) {
   throwIfPngValidationAborted(options);
   let handle = null;
+  let closeHandle = null;
   try {
     handle = await fsp.open(filePath, 'r');
-    return await validatePngFileHandle(handle, options);
+    closeHandle = createFileHandleCloser(handle);
+    return await validatePngFileHandle(handle, { ...options, closeHandle });
   } finally {
-    await handle?.close?.().catch(() => {});
+    try {
+      await closeHandle?.();
+    } catch {
+      if (options?.signal?.aborted) throwIfPngValidationAborted(options);
+    }
+    if (options?.signal?.aborted) throwIfPngValidationAborted(options);
   }
 }
 
 export async function validatePngFileHandle(handle, options = {}) {
+  const lifecycle = createPngValidationLifecycle(options);
+  try {
   const limits = pngLimits(options);
   throwIfPngValidationAborted(options);
   const stat = await handle.stat();
@@ -247,6 +298,9 @@ export async function validatePngFileHandle(handle, options = {}) {
     await validatePngFileInflatedPayload(handle, idatRanges, layout, options, limits);
   }
   return { ...chunkState.dimensions, bytes: stat.size };
+  } finally {
+    await finishPngValidationLifecycle(lifecycle, options);
+  }
 }
 
 async function readPngFileExact(handle, length, position, options = {}) {

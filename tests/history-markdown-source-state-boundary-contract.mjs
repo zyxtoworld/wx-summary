@@ -5,7 +5,6 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { OUTPUTS_DIR, toProjectRelative } from '../src/lib/paths.js';
 
-const projectRoot = path.resolve(import.meta.dirname, '..');
 const testRoot = path.join(OUTPUTS_DIR, `history-md-source-boundary-${process.pid}-${Date.now()}-${crypto.randomUUID()}`);
 process.env.WX_SUMMARY_HISTORY_DISCOVERY_TEST_SCOPE = testRoot;
 process.env.WX_SUMMARY_INCLUDE_ACCEPTANCE_HISTORY_FIXTURE_ROOTS = testRoot;
@@ -18,6 +17,10 @@ const {
   savePreviewMarkdown,
   saveRenderedPng,
 } = await import('../src/renderer/output.js');
+const {
+  mdFileActionCheck,
+  markdownSourceCheck,
+} = await import('../src/web/public/js/pages/history/format.js');
 
 const settings = {
   settings_revision: 'history-md-source-boundary-v1',
@@ -150,50 +153,23 @@ try {
   });
   assert.ok(!issues.items.some(candidate => candidate.digest_id === markdown.digest_id), 'source provenance drift alone must not move a usable Markdown file into the issue filter');
 
-  const appSource = fs.readFileSync(path.join(projectRoot, 'src', 'web', 'public', 'js', 'app.js'), 'utf8');
-  const mainSource = fs.readFileSync(path.join(projectRoot, 'src', 'main.js'), 'utf8');
-  const targetUsableSource = appSource.slice(appSource.indexOf('function markdownOutputTargetUsable'), appSource.indexOf('function markdownOutputUnusableReasonText'));
-  const historyBoundSource = appSource.slice(appSource.indexOf('function outputItemHistoryBound'), appSource.indexOf('function outputFileDownloadPath'));
-  const cardActionsSource = appSource.slice(appSource.indexOf('function historyCardActionsHtml'), appSource.indexOf('function historyThumbnailIssue'));
-  const modalSource = appSource.slice(appSource.indexOf('function showHistoryMarkdownModal'), appSource.indexOf('function showHistoryModal'));
-  const exportCacheSource = appSource.slice(appSource.indexOf('function historyMarkdownExportCacheKey'), appSource.indexOf('function invalidateHistoryMarkdownExportTargets'));
-  const historyPngModalSource = appSource.slice(appSource.indexOf('function showHistoryModal'), appSource.indexOf('function historyImagePath'));
-  const serverResolverSource = mainSource.slice(mainSource.indexOf('async function resolveMarkdownOutputFile'), mainSource.indexOf('function markdownOutputChangedBeforeResponseError'));
-
-  assert.ok(!targetUsableSource.includes('markdownOutputSourceStale'), 'source status must not disable saved Markdown file actions');
-  assert.ok(!historyBoundSource.includes('markdownOutputSourceStale'), 'source status must not make an indexed Markdown history item look unbound');
-  assert.ok(!cardActionsSource.match(/const disabled\s*=\s*[^;]*sourceStale/), 'history cards must keep valid Markdown details available when only the source changed');
-  assert.ok(!modalSource.match(/const fileUnavailable\s*=\s*[^;]*sourceStale/), 'the Markdown modal must still read the saved file when only the source changed');
-  assert.ok(!exportCacheSource.includes('if (markdownOutputSourceStale(exportItem || {})) return false'), 'an exported Markdown cache entry must remain usable after its source changes');
-  assert.ok(!historyPngModalSource.includes('if (markdownOutputSourceStale(historyMarkdownExportItem))'), 'download, reveal, and copy-path actions for a newly exported Markdown file must not clear that file on source drift');
-  assert.ok(
-    !historyPngModalSource.match(/code\s*\|\|\s*''\)\.trim\(\)\s*===\s*'history_md_source_changed'[\s\S]{0,240}clearHistoryMarkdownExportItem/),
-    'a failed re-export caused by source drift must not delete an older successfully exported Markdown target',
-  );
-  assert.ok(
-    historyPngModalSource.includes('changed: versionChanged || superseded || serverContextChanged')
-      && historyPngModalSource.includes('withHistoryMarkdownSourceWarning')
-      && historyPngModalSource.includes('现有 MD 保留导出时内容'),
-    'source drift during export completion must preserve the written file and attach a warning instead of reporting it as unbound',
-  );
-  assert.ok(!serverResolverSource.includes('assertHistoryMarkdownSourceCurrent'), 'server file resolution must validate the saved file and export policy, not current source contents');
-  assert.ok(
-    appSource.includes('function historyMarkdownSourceWarningText(item = {})')
-      && appSource.includes('显示和下载的是导出时内容')
-      && appSource.includes('data-history-md-source-warning'),
-    'the UI must explain that source drift changes re-export provenance without changing the saved file',
-  );
-  assert.ok(
-    mainSource.includes('const assertHistorySourceStillCurrent = async settingsForCheck')
-      && mainSource.includes('await assertHistorySourceStillCurrent(latest)'),
-    're-export must continue validating the current source even though existing-file operations do not',
-  );
-  assert.ok(
-    mainSource.includes("'source_stale'")
-      && mainSource.includes("'source_stale_reason'")
-      && mainSource.includes("'source_stale_error'"),
-    'the public history API must preserve dedicated source-drift status even when another post-commit reason exists',
-  );
+  const markdownItem = {
+    artifact_type: 'text_preview_md',
+    digest_id: 'markdown-source-boundary',
+    history_item_key: 'history-key-markdown-source-boundary',
+    file_exists: true,
+    file_version: 'sha256-md',
+    export_policy_revision: 'policy-v1',
+    source_stale: true,
+    source_stale_reason: 'history_source_changed_after_commit',
+  };
+  assert.equal(mdFileActionCheck(markdownItem).ok, true,
+    'a saved Markdown file remains usable when its source digest changes later');
+  assert.equal(markdownSourceCheck(markdownItem).ok, true,
+    'source lookup uses the saved Markdown identity and file version');
+  const missingMarkdown = { ...markdownItem, file_exists: false, file_version: 'missing:v1' };
+  assert.equal(mdFileActionCheck(missingMarkdown).ok, false);
+  assert.match(mdFileActionCheck(missingMarkdown).reason, /重新导出/);
 } finally {
   await fsp.rm(testRoot, { recursive: true, force: true });
 }

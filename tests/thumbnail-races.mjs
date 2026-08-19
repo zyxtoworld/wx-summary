@@ -112,6 +112,51 @@ async function verifyThumbnailLimitError() {
   }
 }
 
+async function verifyCancellationDuringSnapshotTailRead() {
+  const source = samplePng(12, 34, 56);
+  const controller = new AbortController();
+  const tailReadStarted = deferred();
+  const tailRead = deferred();
+  let readCalls = 0;
+  const sourceHandle = {
+    async stat() {
+      return fileStat({ size: source.length, mtimeMs: 1, ctimeMs: 1 });
+    },
+    async read(buffer, offset, length, position) {
+      readCalls += 1;
+      if (position >= source.length) {
+        tailReadStarted.resolve();
+        await tailRead.promise;
+        return { bytesRead: 1 };
+      }
+      const chunk = source.subarray(position, position + length);
+      chunk.copy(buffer, offset);
+      return { bytesRead: chunk.length };
+    },
+  };
+  const snapshotPath = path.join(TEST_DIR, 'cancel-tail-read.snapshot.png');
+  const cancellation = Object.assign(new Error('thumbnail tail read cancelled'), {
+    name: 'AbortError',
+    status: 499,
+  });
+  const pending = __thumbnailInternals.createThumbnailSourceSnapshotFromHandle(
+    sourceHandle,
+    snapshotPath,
+    { signal: controller.signal },
+  );
+  await tailReadStarted.promise;
+  controller.abort(cancellation);
+  tailRead.resolve();
+  await assert.rejects(
+    pending,
+    error => error === cancellation,
+    'cancellation during the snapshot tail read must preserve the caller reason',
+  );
+  assert.equal(readCalls, 2, 'tail validation must perform exactly one extra read');
+  assert.equal(await fsp.access(snapshotPath).then(() => true, () => false), false,
+    'cancelled snapshot must be cleaned up');
+}
+
 async function verifySingleFlightAndWaiterCancellation() {
   const gate = deferred();
   let producerCalls = 0;
@@ -168,6 +213,54 @@ async function verifySingleFlightAndWaiterCancellation() {
   ]);
   assert.equal(allProducerSignal.aborted, true, 'the producer must abort after every waiter cancels');
   await waitFor(() => __thumbnailInternals.thumbnailFlightCount() === 0, 'cancelled flight was not removed');
+}
+
+async function verifyRejoinDoesNotUseAbortedFlight() {
+  const staleGate = deferred();
+  const firstController = new AbortController();
+  const staleCancellation = Object.assign(new Error('all thumbnail waiters cancelled'), {
+    name: 'AbortError',
+    status: 499,
+  });
+  let producerSignal = null;
+  let producerCalls = 0;
+  const first = __thumbnailInternals.joinThumbnailFlight(
+    'rejoin-after-abort',
+    firstController.signal,
+    async signal => {
+      producerSignal = signal;
+      // 模拟底层 worker 忽略 abort,旧 producer 仍然会晚到。
+      return await staleGate.promise;
+    },
+  ).promise;
+  await waitFor(() => producerSignal !== null, 'aborted-flight producer did not start');
+  firstController.abort(staleCancellation);
+  await assert.rejects(first, error => error === staleCancellation);
+  assert.equal(producerSignal.aborted, true, '最后一个 waiter 取消后 producer 必须已失效');
+
+  let rejoined = null;
+  const rejoinController = new AbortController();
+  try {
+    const rejoinedFlight = __thumbnailInternals.joinThumbnailFlight(
+      'rejoin-after-abort',
+      rejoinController.signal,
+      async () => {
+        producerCalls += 1;
+        return 'fresh-thumbnail';
+      },
+    );
+    rejoined = rejoinedFlight.promise;
+    assert.equal(rejoinedFlight.created, true,
+      '新请求不得加入 producer signal 已 aborted 的旧 flight');
+    assert.equal(await rejoined, 'fresh-thumbnail',
+      '新请求必须得到自己 owner 产生的缩略图结果');
+  } finally {
+    staleGate.resolve('stale-thumbnail');
+    rejoinController.abort(Object.assign(new Error('cleanup'), { name: 'AbortError' }));
+    await Promise.allSettled([first, rejoined]);
+    await waitFor(() => __thumbnailInternals.thumbnailFlightCount() === 0,
+      'rejoin race left a stale flight behind');
+  }
 }
 
 async function verifyVersionedRenderCreatesOneSnapshot() {
@@ -351,7 +444,9 @@ async function main() {
   try {
     await verifyImmutableSnapshotAcrossPathReplacement();
     await verifyThumbnailLimitError();
+    await verifyCancellationDuringSnapshotTailRead();
     await verifySingleFlightAndWaiterCancellation();
+    await verifyRejoinDoesNotUseAbortedFlight();
     await verifyVersionedRenderCreatesOneSnapshot();
     await verifyPortableWorkerExitBarrier();
     await verifyWorkerExitBlocksSlotReleaseAndCleanup();

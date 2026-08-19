@@ -405,7 +405,10 @@ function normalizeWeixinV4ScanPages(values = []) {
 
 function weixinV4ScanPageCoverage(values = [], rawKeys = [], verifiedSalts = []) {
   const pages = normalizeWeixinV4ScanPages(values);
-  const verified = new Set((verifiedSalts || [])
+  const verifiedValues = Array.isArray(verifiedSalts)
+    ? verifiedSalts
+    : (verifiedSalts instanceof Set ? verifiedSalts : []);
+  const verified = new Set([...verifiedValues]
     .map(value => String(value || '').trim().toLowerCase())
     .filter(value => /^[a-f0-9]{32}$/.test(value)));
   const matchedSalts = [];
@@ -448,9 +451,10 @@ async function readProjectMirrorMessageFirstPagesForKeyScan(account = {}, dbFile
         });
       }
       const handle = await fsp.open(source, 'r');
-      try {
+      const page = await withAbortableFileHandle(handle, signal, async () => {
         const page = Buffer.alloc(WEIXIN_V4_PAGE_SIZE);
         const read = await handle.read(page, 0, page.length, 0);
+        throwIfAborted(signal);
         if (read.bytesRead < WEIXIN_V4_PAGE_SIZE) {
           throw dbTempCopyError('wxdb_mirror_first_page_incomplete', '项目内微信消息工作副本的数据库第一页读取不完整，已停止密钥验证并自动重新检查工作副本。', {
             source,
@@ -458,10 +462,9 @@ async function readProjectMirrorMessageFirstPagesForKeyScan(account = {}, dbFile
             cause: 'first_page_short_read',
           });
         }
-        pages.push({ page, name: String(file.name || '').trim() });
-      } finally {
-        await handle.close();
-      }
+        return page;
+      });
+      pages.push({ page, name: String(file.name || '').trim() });
     }
     await assertProjectMirrorPublishedManifest(account, scope, { signal, onProgress });
     return normalizeWeixinV4ScanPages(pages);
@@ -692,6 +695,15 @@ function isWxdbAbort(error, signal = null) {
     || error?.status === 499
     || error?.name === 'AbortError'
     || error?.code === 'ABORT_ERR';
+}
+
+async function readMediaFileWithSignal(file, signal = null) {
+  try {
+    return await fsp.readFile(file, signal ? { signal } : undefined);
+  } catch (error) {
+    if (signal?.aborted) throwIfAborted(signal);
+    throw error;
+  }
 }
 
 function notifyProgress(onProgress, data) {
@@ -1063,6 +1075,7 @@ export async function probeWxDb(input = '') {
         delete copy.target_path;
       }
     }
+    throwIfAborted(signal);
     const groupProbeSatisfied = groupsOnlyProbe && validation?.ok;
     const hasNextProbeSample = sampleIndex + 1 < probeFiles.length;
     notifyProgress(onProgress, {
@@ -1728,21 +1741,20 @@ async function sha256FileContents(file, { signal = null, bufferSize = 4 * 1024 *
   throwIfAborted(signal);
   const handle = await fsp.open(file, 'r');
   const hash = crypto.createHash('sha256');
-  try {
+  return withAbortableFileHandle(handle, signal, async () => {
     const size = Math.max(64 * 1024, Number(bufferSize || 0) || 4 * 1024 * 1024);
     const buf = Buffer.alloc(size);
     let position = 0;
     while (true) {
       throwIfAborted(signal);
       const res = await handle.read(buf, 0, buf.length, position);
+      throwIfAborted(signal);
       if (!res.bytesRead) break;
       hash.update(buf.subarray(0, res.bytesRead));
       position += res.bytesRead;
     }
-  } finally {
-    await handle.close();
-  }
-  return hash.digest('hex');
+    return hash.digest('hex');
+  });
 }
 
 async function sha256CopiedMediaFile(file = '', { signal = null } = {}) {
@@ -5702,11 +5714,22 @@ function senderHydrationFailureResult(usernames = [], errorCode = 'sender_hydrat
 
 function senderHydrationFailureCacheScope(account = {}) {
   const mirror = account?.mirror || {};
+  const digestScope = accountMirrorScopeMetadata(account, 'digest');
+  const identityScope = accountMirrorScopeMetadata(account, 'identity');
   return crypto.createHash('sha256').update(JSON.stringify([
     account.account_id || account.id || account.wxid || '',
     account.db_storage || '',
-    mirror.source_snapshot_hash || mirror.source_snapshot_meta_hash || '',
+    account.identity_id || mirror.identity_id || '',
+    account.source_generation_hash || mirror.source_generation_hash || '',
+    account.identity_source_generation_hash || mirror.identity_source_generation_hash || '',
+    mirror.source_snapshot_hash || '',
+    mirror.source_snapshot_meta_hash || '',
+    mirror.published_manifest_hash || '',
     mirror.refreshed_at || mirror.mirror_refreshed_at || '',
+    digestScope.source_snapshot_meta_hash || '',
+    digestScope.refreshed_at || '',
+    identityScope.source_snapshot_meta_hash || '',
+    identityScope.refreshed_at || '',
   ])).digest('hex');
 }
 
@@ -5856,6 +5879,17 @@ function normalizeSearchToken(value) {
   return String(value || '').normalize('NFKC').replace(/[^a-z0-9]/gi, '').toLowerCase();
 }
 
+async function settleMediaEnrichmentCleanup(hardlink, copiedMediaRoots, { signal = null } = {}) {
+  const cleanupPromises = [
+    Promise.resolve().then(() => closeCopiedDbHandle(hardlink)),
+    Promise.resolve().then(() => removeCopiedMediaRoots([...copiedMediaRoots])),
+  ];
+  const settled = await Promise.allSettled(cleanupPromises);
+  const failure = settled.find(item => item.status === 'rejected');
+  if (signal?.aborted) throwIfAborted(signal);
+  if (failure) throw failure.reason;
+}
+
 async function enrichMessageMedia(account, rawKeys, messages, { signal = null, onProgress = null, maxMs = MEDIA_ENRICHMENT_MAX_MS, allow_stale_account = false } = {}) {
   throwIfAborted(signal);
   const mediaMessages = messages.filter(m => m.media && (m.media.md5 || m.media.file_key || m.media.file_name || ['voice', 'video'].includes(m.type)));
@@ -5980,9 +6014,11 @@ async function enrichMessageMedia(account, rawKeys, messages, { signal = null, o
             if (msg.media.local_available) {
               const copiedImage = await copyMediaFileForRead(account, localPath, { signal, include_image_siblings: true });
               const copiedImagePath = rememberCopiedMedia(copiedImage);
+              throwIfAborted(signal);
               imageJobs.push({ msg, localPath: copiedImagePath, sourcePath: localPath });
               try {
                 imageSamples.push(...await readImageValidationSamples(copiedImagePath, { signal }));
+                throwIfAborted(signal);
               } catch (e) {
                 if (e?.status === 499 || signal?.aborted) throw e;
                 markMediaEnrichmentFailure(msg, e, '图片解密样本读取失败');
@@ -6100,6 +6136,7 @@ async function enrichMessageMedia(account, rawKeys, messages, { signal = null, o
       if (imageSamples.length && !overBudget()) {
         notifyMedia('fetch_media_image_key', `扫描图片解密 key 样本 ${Math.min(imageSamples.length, 32)} 个`);
         imageKeys = await getImageKeyCandidatesForSamples(imageSamples, { signal, maxMs: Math.min(IMAGE_KEY_SCAN_MAX_MS, remainingMs()) });
+        throwIfAborted(signal);
         notifyMedia('fetch_media_image_key_done', imageKeys.length ? `命中图片 key ${imageKeys.length} 条` : '未命中图片 key，保留可读图片元信息');
       }
     } catch (e) {
@@ -6118,6 +6155,7 @@ async function enrichMessageMedia(account, rawKeys, messages, { signal = null, o
       }
       try {
         const data = await readImageDataUrlIfUsable(job.localPath, imageKeys, { signal });
+        throwIfAborted(signal);
         if (data) {
           Object.assign(job.msg.media, data);
           decodedImages += 1;
@@ -6143,7 +6181,9 @@ async function enrichMessageMedia(account, rawKeys, messages, { signal = null, o
       try {
         notifyMedia('fetch_media_copy', '正在准备视频临时读取数据用于抽帧');
         const copiedVideoPath = rememberCopiedMedia(await copyMediaFileForRead(account, job.localPath, { signal }));
+        throwIfAborted(signal);
         const frame = await readVideoFrameDataUrlIfUsable(copiedVideoPath, { signal });
+        throwIfAborted(signal);
         if (frame) {
           Object.assign(job.msg.media, { frame_data_url: frame.data_url, frame_mime: frame.mime });
           decodedVideos += 1;
@@ -6169,7 +6209,9 @@ async function enrichMessageMedia(account, rawKeys, messages, { signal = null, o
       try {
         notifyMedia('fetch_media_copy', '正在准备音频临时读取数据用于转码');
         const copiedAudioPath = rememberCopiedMedia(await copyMediaFileForRead(account, job.localPath, { signal }));
+        throwIfAborted(signal);
         const audio = await readAudioDataUrlIfUsable(copiedAudioPath, { signal });
+        throwIfAborted(signal);
         if (audio) {
           Object.assign(job.msg.media, audio);
           decodedAudios += 1;
@@ -6186,8 +6228,8 @@ async function enrichMessageMedia(account, rawKeys, messages, { signal = null, o
     if (e?.status === 499 || signal?.aborted) throw e;
     for (const msg of mediaMessages) markMediaEnrichmentFailure(msg, e, '媒体解析流程失败');
   } finally {
-    await closeCopiedDbHandle(hardlink);
-    await removeCopiedMediaRoots([...copiedMediaRoots]);
+    await settleMediaEnrichmentCleanup(hardlink, copiedMediaRoots, { signal });
+    throwIfAborted(signal);
   }
 }
 
@@ -6364,17 +6406,89 @@ function redactAccount(account) {
   };
 }
 
+function createAbortableFileHandleLifecycle(handle, signal = null) {
+  let closePromise = null;
+  const close = () => {
+    if (!closePromise) {
+      closePromise = Promise.resolve()
+        .then(() => handle.close());
+      closePromise.catch(() => {});
+    }
+    return closePromise;
+  };
+  const onAbort = () => { void close().catch(() => {}); };
+  signal?.addEventListener?.('abort', onAbort, { once: true });
+  return {
+    close,
+    dispose: () => signal?.removeEventListener?.('abort', onAbort),
+  };
+}
+
+async function withAbortableFileHandle(handle, signal, operation) {
+  const lifecycle = createAbortableFileHandleLifecycle(handle, signal);
+  let operationResult;
+  let operationError = null;
+  let operationFailed = false;
+  try {
+    throwIfAborted(signal);
+    operationResult = await operation();
+  } catch (error) {
+    operationFailed = true;
+    operationError = signal?.aborted ? signal.reason : error;
+  }
+  let closeError = null;
+  try {
+    await finishAbortableFileHandleLifecycle(lifecycle, signal);
+  } catch (error) {
+    closeError = error;
+  }
+  if (signal?.aborted) throwIfAborted(signal);
+  if (operationFailed) {
+    attachAbortableFileHandleCleanupError(operationError, closeError);
+    throw operationError;
+  }
+  if (closeError) throw closeError;
+  return operationResult;
+}
+
+function attachAbortableFileHandleCleanupError(error, cleanupError) {
+  if (!error || !cleanupError || (typeof error !== 'object' && typeof error !== 'function')) return;
+  try {
+    if (!Object.isExtensible(error)) return;
+    if (!error.cleanup_cause) {
+      error.cleanup_cause = cleanupError;
+      return;
+    }
+    if (!Array.isArray(error.cleanup_errors)) error.cleanup_errors = [error.cleanup_cause];
+    if (!error.cleanup_errors.includes(cleanupError)) error.cleanup_errors.push(cleanupError);
+  } catch {
+    // Cleanup diagnostics are best-effort; never replace the operation error.
+  }
+}
+
+async function finishAbortableFileHandleLifecycle(lifecycle, signal = null) {
+  if (!lifecycle) return;
+  let closeError = null;
+  try {
+    await lifecycle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  lifecycle.dispose();
+  if (signal?.aborted) throwIfAborted(signal);
+  if (closeError) throw closeError;
+}
+
 async function readHeader(file, { signal = null, allow_external_test_db = false } = {}) {
   await assertCopiedDbRealPath(file, { allow_external_test_db, signal });
   throwIfAborted(signal);
   const handle = await fsp.open(file, 'r');
-  try {
+  return withAbortableFileHandle(handle, signal, async () => {
     const buf = Buffer.alloc(16);
     await handle.read(buf, 0, buf.length, 0);
+    throwIfAborted(signal);
     return buf;
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 async function sha256Prefix(file, { signal = null } = {}) {
@@ -6383,20 +6497,19 @@ async function sha256Prefix(file, { signal = null } = {}) {
   throwIfAborted(signal);
   const handle = await fsp.open(file, 'r');
   const hash = crypto.createHash('sha256');
-  try {
+  return withAbortableFileHandle(handle, signal, async () => {
     const buf = Buffer.alloc(1024 * 1024);
     let read = 0;
     while (read < 4 * 1024 * 1024) {
       throwIfAborted(signal);
       const res = await handle.read(buf, 0, Math.min(buf.length, 4 * 1024 * 1024 - read), read);
+      throwIfAborted(signal);
       if (!res.bytesRead) break;
       hash.update(buf.subarray(0, res.bytesRead));
       read += res.bytesRead;
     }
-  } finally {
-    await handle.close();
-  }
-  return hash.digest('hex').slice(0, 16);
+    return hash.digest('hex').slice(0, 16);
+  });
 }
 
 async function sha256CopiedFile(file, { signal = null } = {}) {
@@ -6474,8 +6587,8 @@ function isSqlCipherProfileProbeError(error = null, { fallback_profiles = false 
 async function openCopiedSqlCipherDb(account, source, rawKeys, { signal = null, onProgress = null, allow_key_scan = true, allow_stale_account = false } = {}) {
   throwIfAborted(signal);
   const copied = await copyDbFile(account, source, { signal, allow_stale_account, onProgress });
-  await assertCopiedDbRealPath(copied.target_path, { signal });
   let handedOff = false;
+  let cleanupClaimed = false;
   const sourceName = path.basename(source || copied.target_path || 'database');
   let keyScanDiagnostics = {
     source_name: sourceName,
@@ -6484,7 +6597,23 @@ async function openCopiedSqlCipherDb(account, source, rawKeys, { signal = null, 
     page_hmac_candidate_matched: false,
     targeted_scan_attempted: false,
   };
+  const discardOpenedDbAfterAbort = async opened => {
+    if (!signal?.aborted) return;
+    if (opened?.db) {
+      cleanupClaimed = true;
+      try {
+        await closeCopiedDb(copied.target_path, opened.db, opened.plain_path, {
+          keepPlain: opened.plain_cached,
+          plainLease: opened.plain_lease,
+        });
+      } catch {
+        await removeCopiedDb(copied.target_path).catch(() => {});
+      }
+    }
+    throwIfAborted(signal);
+  };
   try {
+    await assertCopiedDbRealPath(copied.target_path, { signal });
     const Database = await loadSqlCipher();
     const initialCandidates = uniqueStrings(Array.isArray(rawKeys) ? rawKeys : []);
     const preferPageHmac = initialCandidates.length > 0;
@@ -6501,6 +6630,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys, { signal = null, 
         copied,
         maxPassphraseDeriveCandidates: WEIXIN_V4_PASSPHRASE_DERIVE_CANDIDATE_LIMIT,
       });
+      await discardOpenedDbAfterAbort(pageHmac);
       if (pageHmac?.db) {
         keyScanDiagnostics.page_hmac_candidate_matched = true;
         handedOff = true;
@@ -6518,8 +6648,8 @@ async function openCopiedSqlCipherDb(account, source, rawKeys, { signal = null, 
     }
     notifyProgress(onProgress, {
       phase: 'fetch_shard_sqlcipher_compat',
-      label: '拉取消息 · 检查旧式数据库兼容',
-      detail: `${sourceName}：第一页完整性校验未命中，限量检查高优先级候选的旧式 SQLCipher 格式`,
+      label: '拉取消息 · 兼容消息库格式',
+      detail: `${sourceName}：第一页完整性校验未命中，限量检查高优先级候选的消息库兼容格式`,
     });
     const found = await findRawKeyForCopiedDb(copied.target_path, initialCandidates, { signal });
     keyScanDiagnostics = {
@@ -6605,6 +6735,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys, { signal = null, 
         detail: `${sourceName}：正在用候选密钥打开消息库`,
       });
       const manual = await openWeixinV4DecryptedDb(copied.target_path, [...verified.raw_keys, ...rawKeys], Database, { signal, onProgress, sourceName, copied });
+      await discardOpenedDbAfterAbort(manual);
       if (manual?.db) {
         handedOff = true;
         return {
@@ -6625,6 +6756,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys, { signal = null, 
       detail: `${sourceName}：继续用已保存密钥打开消息库`,
     });
     const manual = await openWeixinV4DecryptedDb(copied.target_path, rawKeys, Database, { signal, onProgress, sourceName, copied });
+    await discardOpenedDbAfterAbort(manual);
     if (manual?.db) {
       handedOff = true;
       return {
@@ -6645,7 +6777,7 @@ async function openCopiedSqlCipherDb(account, source, rawKeys, { signal = null, 
     if (e && typeof e === 'object' && keyScanDiagnostics && !e.key_scan_diagnostics) {
       e.key_scan_diagnostics = keyScanDiagnostics;
     }
-    if (!handedOff) await removeCopiedDb(copied.target_path).catch(() => {});
+    if (!handedOff && !cleanupClaimed) await removeCopiedDb(copied.target_path).catch(() => {});
     throw e;
   }
 }
@@ -6842,8 +6974,8 @@ async function scanVerifiedWeixinV4KeysForCopiedDb(dbPath, {
     && scanDeadline - Date.now() >= 1_000) {
     notifyProgress(onProgress, {
       phase: 'fetch_shard_codec_key_scan',
-      label: '拉取消息 · 兼容新版消息库',
-      detail: `${sourceLabel}：常规密钥未命中，继续尝试新版微信数据库的兼容验证`,
+      label: '拉取消息 · 兼容消息库格式',
+      detail: `${sourceLabel}：常规密钥未命中，继续尝试微信消息库格式的兼容验证`,
     });
     for (const [index, process] of targets.entries()) {
       throwIfAborted(signal);
@@ -6854,7 +6986,7 @@ async function scanVerifiedWeixinV4KeysForCopiedDb(dbPath, {
       }
       notifyProgress(onProgress, {
         phase: 'fetch_shard_codec_key_scan_process',
-        label: '拉取消息 · 兼容新版消息库',
+        label: '拉取消息 · 兼容消息库格式',
         detail: `${sourceLabel}：检查兼容密钥结构 ${index + 1}/${targets.length}${weixinProcessProgressRole(process)}`,
       });
       const result = await scanProcessForCodecContextKeyCandidates(process.pid, {
@@ -6873,7 +7005,7 @@ async function scanVerifiedWeixinV4KeysForCopiedDb(dbPath, {
           const limitLabel = limit ? (formatBytes(limit) || `${limit}B`) : '';
           notifyProgress(onProgress, {
             phase: 'fetch_shard_codec_key_scan_progress',
-            label: '拉取消息 · 兼容新版消息库',
+            label: '拉取消息 · 兼容消息库格式',
             detail: `${sourceLabel}：已检查 ${scannedLabel}${limitLabel ? `/${limitLabel}` : ''}，正在确认兼容访问方式`,
           });
         },
@@ -6920,7 +7052,7 @@ async function scanVerifiedWeixinV4KeysForCopiedDb(dbPath, {
       });
       notifyProgress(onProgress, {
         phase: 'fetch_shard_codec_key_scan_process_done',
-        label: '拉取消息 · 兼容新版消息库',
+        label: '拉取消息 · 兼容消息库格式',
         detail: [
           `${sourceLabel}：兼容检查 ${index + 1}/${targets.length} 已完成`,
           `候选 ${Number(result.unique_candidate_count || 0) || 0}`,
@@ -7242,7 +7374,7 @@ async function openUsableCachedPlaintextDb(Database, plainPath, { signal = null,
     return { db, lease_path: leasePath };
   } catch (e) {
     try { db?.close(); } catch {}
-    await releaseWeixinV4PlaintextCache(plainPath, leasePath);
+    await releaseWeixinV4PlaintextCache(plainPath, leasePath, { signal });
     throw e;
   }
 }
@@ -7518,7 +7650,7 @@ async function settlePlaintextCacheRelease(file, releasingPath, { signal = null 
   return true;
 }
 
-async function releaseWeixinV4PlaintextCache(file, leasePath = '', { retainForWorkerSession = false } = {}) {
+async function releaseWeixinV4PlaintextCache(file, leasePath = '', { retainForWorkerSession = false, signal = null } = {}) {
   if (!file || !leasePath) return;
   const refKey = plaintextCacheRefKey(file);
   if (retainForWorkerSession
@@ -7556,7 +7688,7 @@ async function releaseWeixinV4PlaintextCache(file, leasePath = '', { retainForWo
   }
   // The durable marker closes the crash window between giving up the final
   // reader lease and deleting the readable database.
-  await settlePlaintextCacheRelease(file, releasingPath).catch(() => {});
+  await settlePlaintextCacheRelease(file, releasingPath, { signal }).catch(() => {});
 }
 
 export async function releaseWxDbWorkerSessionPlaintextCaches() {
@@ -8231,13 +8363,12 @@ async function readFirstPage(file, { signal = null, allow_external_test_db = fal
   await assertCopiedDbRealPath(file, { allow_external_test_db, signal });
   throwIfAborted(signal);
   const handle = await fsp.open(file, 'r');
-  try {
+  return withAbortableFileHandle(handle, signal, async () => {
     const buf = Buffer.alloc(WEIXIN_V4_PAGE_SIZE);
     const res = await handle.read(buf, 0, buf.length, 0);
+    throwIfAborted(signal);
     return buf.subarray(0, res.bytesRead);
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 function validateWeixinV4PageHmac(page, keyHex, pageNumber) {
@@ -8301,6 +8432,15 @@ async function decryptWeixinV4DbToPlaintext(dbPath, keyHex, { signal = null, all
   const salt = firstPage.subarray(0, WEIXIN_V4_SALT_BYTES);
   const material = deriveWeixinV4PageKeys(keyHex, salt);
   const target = targetPath ? path.resolve(targetPath) : `${dbPath}.weixin-v4-plain.db`;
+  const removePlaintextTarget = async () => {
+    if (allow_external_test_db) {
+      await fsp.rm(target, { force: true }).catch(() => {});
+      return;
+    }
+    await assertCopiedDbRealPath(target)
+      .then(() => fsp.rm(target, { force: true }))
+      .catch(() => {});
+  };
   if (!allow_external_test_db) {
     assertCopiedDbPath(target);
     await assertSafeTmpPath(target, { label: 'plaintext database temp', ensureParent: true });
@@ -8308,6 +8448,7 @@ async function decryptWeixinV4DbToPlaintext(dbPath, keyHex, { signal = null, all
     await ensureDir(path.dirname(target));
   }
   let input = null;
+  let inputLifecycle = null;
   let output = null;
   const encryptedChunk = Buffer.allocUnsafe(WEIXIN_V4_DECRYPT_CHUNK_BYTES);
   const plaintextChunk = Buffer.allocUnsafe(WEIXIN_V4_DECRYPT_CHUNK_BYTES);
@@ -8327,6 +8468,8 @@ async function decryptWeixinV4DbToPlaintext(dbPath, keyHex, { signal = null, all
   let position = 0;
   let pageNumber = 1;
   let plaintextWritten = false;
+  let operationError = null;
+  let outputCloseError = null;
   notifyProgress(onProgress, {
     phase: 'fetch_shard_decrypt_plain_start',
     label: '拉取消息 · 兼容读取消息库',
@@ -8334,12 +8477,14 @@ async function decryptWeixinV4DbToPlaintext(dbPath, keyHex, { signal = null, all
   });
   try {
     input = await fsp.open(dbPath, 'r');
+    inputLifecycle = createAbortableFileHandleLifecycle(input, signal);
     output = await fsp.open(target, 'wx', 0o600);
     const fullPageBytes = Math.floor(st.size / WEIXIN_V4_PAGE_SIZE) * WEIXIN_V4_PAGE_SIZE;
     while (position < fullPageBytes) {
       throwIfAborted(signal);
       const chunkBytes = Math.min(WEIXIN_V4_DECRYPT_CHUNK_BYTES, fullPageBytes - position);
-      const bytesRead = await readExactly(input, encryptedChunk, 0, chunkBytes, position);
+      const bytesRead = await readExactly(input, encryptedChunk, 0, chunkBytes, position, signal);
+      throwIfAborted(signal);
       if (bytesRead !== chunkBytes) throw new Error('database file changed while decrypting');
       for (let chunkOffset = 0; chunkOffset < chunkBytes; chunkOffset += WEIXIN_V4_PAGE_SIZE) {
         const encryptedPage = encryptedChunk.subarray(chunkOffset, chunkOffset + WEIXIN_V4_PAGE_SIZE);
@@ -8363,7 +8508,8 @@ async function decryptWeixinV4DbToPlaintext(dbPath, keyHex, { signal = null, all
     if (remainderBytes > 0) {
       throwIfAborted(signal);
       const remainder = Buffer.allocUnsafe(remainderBytes);
-      const bytesRead = await readExactly(input, remainder, 0, remainderBytes, position);
+      const bytesRead = await readExactly(input, remainder, 0, remainderBytes, position, signal);
+      throwIfAborted(signal);
       if (bytesRead !== remainderBytes) throw new Error('database file changed while decrypting');
       const bytesWritten = await writeExactly(output, remainder, 0, remainder.length, position);
       if (bytesWritten !== remainder.length) throw new Error('failed to write decrypted database remainder');
@@ -8371,36 +8517,48 @@ async function decryptWeixinV4DbToPlaintext(dbPath, keyHex, { signal = null, all
     }
     plaintextWritten = true;
   } catch (e) {
-    if (isDiskSpaceError(e)) throw dbTempCopyDiskSpaceError(e, dbPath, path.basename(path.dirname(dbPath)));
-    if (page_hmac_prevalidated && isWeixinV4PageHmacMismatch(e)) {
-      throw dbTempCopyError('wxdb_temp_copy_page_integrity_failed', '微信数据库临时读取数据在密钥已通过第一页验证后仍有后续页面完整性校验失败；这表示副本不完整或代次不一致，不是密钥错误。已停止读取，请重新检查本地数据后重试。', {
-        source: dbPath,
-        category: path.basename(path.dirname(dbPath)),
-        cause: `page_${Math.max(1, Number(e?.page_number || pageNumber || 1) || 1)}_hmac_mismatch_after_key_prevalidation`,
-      });
-    }
-    throw e;
-  } finally {
-    await input?.close().catch(() => {});
-    await output?.close().catch(() => {});
-    if (!plaintextWritten) {
-      if (allow_external_test_db) await fsp.rm(target, { force: true }).catch(() => {});
-      else await assertCopiedDbRealPath(target).then(() => fsp.rm(target, { force: true })).catch(() => {});
+    try {
+      if (signal?.aborted) throwIfAborted(signal);
+      if (isDiskSpaceError(e)) throw dbTempCopyDiskSpaceError(e, dbPath, path.basename(path.dirname(dbPath)));
+      if (page_hmac_prevalidated && isWeixinV4PageHmacMismatch(e)) {
+        throw dbTempCopyError('wxdb_temp_copy_page_integrity_failed', '微信数据库临时读取数据在密钥已通过第一页验证后仍有后续页面完整性校验失败；这表示副本不完整或代次不一致，不是密钥错误。已停止读取，请重新检查本地数据后重试。', {
+          source: dbPath,
+          category: path.basename(path.dirname(dbPath)),
+          cause: `page_${Math.max(1, Number(e?.page_number || pageNumber || 1) || 1)}_hmac_mismatch_after_key_prevalidation`,
+        });
+      }
+      throw e;
+    } catch (normalizedError) {
+      operationError = normalizedError;
     }
   }
+  await finishAbortableFileHandleLifecycle(inputLifecycle, signal).catch(() => {});
+  try {
+    await output?.close();
+  } catch (error) {
+    outputCloseError = error;
+  }
+  if (!plaintextWritten || operationError || outputCloseError || signal?.aborted) await removePlaintextTarget();
+  if (signal?.aborted) throwIfAborted(signal);
+  if (operationError) {
+    attachAbortableFileHandleCleanupError(operationError, outputCloseError);
+    throw operationError;
+  }
+  if (outputCloseError) throw outputCloseError;
   try {
     await mergeWeixinV4WalIntoPlaintext(dbPath, target, material, { signal, allow_external_test_db });
+    throwIfAborted(signal);
+    notifyProgress(onProgress, {
+      phase: 'fetch_shard_decrypt_plain_done',
+      label: '拉取消息 · 消息库已准备好',
+      detail: `${sourceLabel}：已处理 ${formatBytes(position) || `${position}B`}/${totalSizeLabel}（100%）`,
+    });
+    throwIfAborted(signal);
+    return target;
   } catch (e) {
-    if (allow_external_test_db) await fsp.rm(target, { force: true }).catch(() => {});
-    else await assertCopiedDbRealPath(target, { signal }).then(() => fsp.rm(target, { force: true })).catch(() => {});
+    await removePlaintextTarget();
     throw e;
   }
-  notifyProgress(onProgress, {
-    phase: 'fetch_shard_decrypt_plain_done',
-    label: '拉取消息 · 消息库已准备好',
-    detail: `${sourceLabel}：已处理 ${formatBytes(position) || `${position}B`}/${totalSizeLabel}（100%）`,
-  });
-  return target;
 }
 
 async function assertNoHotCopiedRollbackJournal(dbPath, { signal = null, allow_external_test_db = false } = {}) {
@@ -8427,15 +8585,15 @@ async function assertNoHotCopiedRollbackJournal(dbPath, { signal = null, allow_e
   if (st.size < SQLITE_ROLLBACK_JOURNAL_MIN_HOT_BYTES) return;
   await assertCopiedDbRealPath(journalPath, { allow_external_test_db, signal });
   const handle = await fsp.open(journalPath, 'r');
-  const header = Buffer.alloc(SQLITE_ROLLBACK_JOURNAL_MAGIC.length);
-  try {
+  const header = await withAbortableFileHandle(handle, signal, async () => {
+    const header = Buffer.alloc(SQLITE_ROLLBACK_JOURNAL_MAGIC.length);
     const { bytesRead } = await handle.read(header, 0, header.length, 0);
+    throwIfAborted(signal);
     if (bytesRead !== header.length) return;
-  } finally {
-    await handle.close().catch(() => {});
-  }
+    return header;
+  });
   throwIfAborted(signal);
-  if (!header.equals(SQLITE_ROLLBACK_JOURNAL_MAGIC)) return;
+  if (!header?.equals?.(SQLITE_ROLLBACK_JOURNAL_MAGIC)) return;
   throw dbTempCopyError('wxdb_temp_copy_hot_rollback_journal', '微信数据库副本包含尚未完成恢复的回滚日志；为避免读取未提交或不一致的数据，本次已停止。请等待微信同步完成后重试自动准备本地工作数据。', {
     source: journalPath,
     category: path.basename(path.dirname(dbPath)),
@@ -8443,10 +8601,12 @@ async function assertNoHotCopiedRollbackJournal(dbPath, { signal = null, allow_e
   });
 }
 
-async function readExactly(handle, buffer, offset, length, position) {
+async function readExactly(handle, buffer, offset, length, position, signal = null) {
   let total = 0;
   while (total < length) {
+    throwIfAborted(signal);
     const res = await handle.read(buffer, offset + total, length - total, position + total);
+    throwIfAborted(signal);
     if (!res.bytesRead) break;
     total += res.bytesRead;
   }
@@ -8501,10 +8661,14 @@ async function mergeWeixinV4WalIntoPlaintext(dbPath, plainPath, material, { sign
   if (st.size < 32) return null;
 
   const input = await fsp.open(walPath, 'r');
+  const inputLifecycle = createAbortableFileHandleLifecycle(input, signal);
   let output = null;
+  let mergeResult = null;
+  let operationError = null;
+  let outputCloseError = null;
   try {
     const header = Buffer.alloc(32);
-    const headerBytes = await readExactly(input, header, 0, header.length, 0);
+    const headerBytes = await readExactly(input, header, 0, header.length, 0, signal);
     if (headerBytes !== header.length) throw invalidWal('wal_header_short_read', '头部读取不完整');
     const magic = header.readUInt32BE(0);
     if (magic !== 0x377f0682 && magic !== 0x377f0683) throw invalidWal('wal_magic_invalid', '格式无效');
@@ -8524,75 +8688,90 @@ async function mergeWeixinV4WalIntoPlaintext(dbPath, plainPath, material, { sign
     const frameBytes = st.size - header.length;
     const trailingBytes = frameBytes % frameSize;
     const frameCount = Math.floor(frameBytes / frameSize);
-    if (frameCount <= 0) return null;
-
-    const frameHeader = Buffer.alloc(24);
-    const encryptedPage = Buffer.allocUnsafe(pageSize);
-    const frames = [];
-    let lastCommitIndex = -1;
-    let lastCommitDbPages = 0;
-    for (let i = 0; i < frameCount; i++) {
-      throwIfAborted(signal);
-      const frameOffset = header.length + i * frameSize;
-      const read = await readExactly(input, frameHeader, 0, frameHeader.length, frameOffset);
-      if (read !== frameHeader.length) throw invalidWal('wal_frame_header_short_read', '帧头读取不完整');
-      const pageNumber = frameHeader.readUInt32BE(0);
-      const commitDbPages = frameHeader.readUInt32BE(4);
-      if (frameHeader.readUInt32BE(8) !== salt1 || frameHeader.readUInt32BE(12) !== salt2) break;
-      const pageRead = await readExactly(input, encryptedPage, 0, pageSize, frameOffset + frameHeader.length);
-      if (pageRead !== pageSize) throw invalidWal('wal_frame_page_short_read', '帧页面读取不完整');
-      const nextChecksum = walChecksum(frameHeader.subarray(0, 8), checksumLittleEndian, [...checksum]);
-      walChecksum(encryptedPage, checksumLittleEndian, nextChecksum);
-      if (frameHeader.readUInt32BE(16) !== nextChecksum[0] || frameHeader.readUInt32BE(20) !== nextChecksum[1]) break;
-      checksum = nextChecksum;
-      if (pageNumber < 1) throw invalidWal('wal_page_number_invalid', '包含非法页号');
-      frames.push({
-        pageNumber,
-        commitDbPages,
-        pageOffset: frameOffset + frameHeader.length,
-      });
-      if (commitDbPages > 0) {
-        lastCommitIndex = frames.length - 1;
-        lastCommitDbPages = commitDbPages;
-      }
-    }
-    if (lastCommitIndex < 0) return null;
-
-    output = await fsp.open(plainPath, 'r+');
-    for (const frame of frames.slice(0, lastCommitIndex + 1)) {
-      throwIfAborted(signal);
-      const read = await readExactly(input, encryptedPage, 0, pageSize, frame.pageOffset);
-      if (read !== pageSize) throw invalidWal('wal_committed_page_short_read', '已提交帧读取不完整');
-      let plainPage;
-      try {
-        plainPage = decryptWeixinV4Page(encryptedPage, material, frame.pageNumber);
-      } catch (e) {
-        if (isWeixinV4PageHmacMismatch(e)) {
-          throw invalidWal('wal_committed_page_hmac_mismatch', `已提交帧第 ${frame.pageNumber} 页完整性校验失败`);
+    if (frameCount > 0) {
+      const frameHeader = Buffer.alloc(24);
+      const encryptedPage = Buffer.allocUnsafe(pageSize);
+      const frames = [];
+      let lastCommitIndex = -1;
+      let lastCommitDbPages = 0;
+      for (let i = 0; i < frameCount; i++) {
+        throwIfAborted(signal);
+        const frameOffset = header.length + i * frameSize;
+        const read = await readExactly(input, frameHeader, 0, frameHeader.length, frameOffset, signal);
+        if (read !== frameHeader.length) throw invalidWal('wal_frame_header_short_read', '帧头读取不完整');
+        const pageNumber = frameHeader.readUInt32BE(0);
+        const commitDbPages = frameHeader.readUInt32BE(4);
+        if (frameHeader.readUInt32BE(8) !== salt1 || frameHeader.readUInt32BE(12) !== salt2) break;
+        const pageRead = await readExactly(input, encryptedPage, 0, pageSize, frameOffset + frameHeader.length, signal);
+        if (pageRead !== pageSize) throw invalidWal('wal_frame_page_short_read', '帧页面读取不完整');
+        const nextChecksum = walChecksum(frameHeader.subarray(0, 8), checksumLittleEndian, [...checksum]);
+        walChecksum(encryptedPage, checksumLittleEndian, nextChecksum);
+        if (frameHeader.readUInt32BE(16) !== nextChecksum[0] || frameHeader.readUInt32BE(20) !== nextChecksum[1]) break;
+        checksum = nextChecksum;
+        if (pageNumber < 1) throw invalidWal('wal_page_number_invalid', '包含非法页号');
+        frames.push({
+          pageNumber,
+          commitDbPages,
+          pageOffset: frameOffset + frameHeader.length,
+        });
+        if (commitDbPages > 0) {
+          lastCommitIndex = frames.length - 1;
+          lastCommitDbPages = commitDbPages;
         }
-        throw e;
       }
-      const written = await writeExactly(output, plainPage, 0, plainPage.length, (frame.pageNumber - 1) * pageSize);
-      if (written !== plainPage.length) throw invalidWal('wal_committed_page_short_write', '已提交帧写入不完整');
+      if (lastCommitIndex >= 0) {
+        output = await fsp.open(plainPath, 'r+');
+        for (const frame of frames.slice(0, lastCommitIndex + 1)) {
+          throwIfAborted(signal);
+          const read = await readExactly(input, encryptedPage, 0, pageSize, frame.pageOffset, signal);
+          if (read !== pageSize) throw invalidWal('wal_committed_page_short_read', '已提交帧读取不完整');
+          let plainPage;
+          try {
+            plainPage = decryptWeixinV4Page(encryptedPage, material, frame.pageNumber);
+          } catch (e) {
+            if (isWeixinV4PageHmacMismatch(e)) {
+              throw invalidWal('wal_committed_page_hmac_mismatch', `已提交帧第 ${frame.pageNumber} 页完整性校验失败`);
+            }
+            throw e;
+          }
+          const written = await writeExactly(output, plainPage, 0, plainPage.length, (frame.pageNumber - 1) * pageSize);
+          if (written !== plainPage.length) throw invalidWal('wal_committed_page_short_write', '已提交帧写入不完整');
+        }
+        if (lastCommitDbPages > 0) {
+          await output.truncate(lastCommitDbPages * pageSize);
+        }
+        mergeResult = {
+          frame_count: frameCount,
+          committed_frame_count: lastCommitIndex + 1,
+          commit_db_pages: lastCommitDbPages,
+          trailing_bytes_ignored: trailingBytes,
+        };
+      }
     }
-    if (lastCommitDbPages > 0) {
-      await output.truncate(lastCommitDbPages * pageSize);
-    }
-    return {
-      frame_count: frameCount,
-      committed_frame_count: lastCommitIndex + 1,
-      commit_db_pages: lastCommitDbPages,
-      trailing_bytes_ignored: trailingBytes,
-    };
   } catch (e) {
-    if (e?.status === 499 || signal?.aborted) throw e;
-    if (String(e?.code || '').startsWith('wxdb_temp_copy_wal_')) throw e;
-    if (isDiskSpaceError(e)) throw dbTempCopyDiskSpaceError(e, dbPath, path.basename(path.dirname(dbPath)));
-    throw new Error(`合并微信数据库 WAL 增量失败：${e?.message || e}`);
-  } finally {
-    await input.close().catch(() => {});
-    await output?.close().catch(() => {});
+    try {
+      if (signal?.aborted) throwIfAborted(signal);
+      if (e?.status === 499) throw e;
+      if (String(e?.code || '').startsWith('wxdb_temp_copy_wal_')) throw e;
+      if (isDiskSpaceError(e)) throw dbTempCopyDiskSpaceError(e, dbPath, path.basename(path.dirname(dbPath)));
+      throw new Error(`合并微信数据库 WAL 增量失败：${e?.message || e}`);
+    } catch (normalizedError) {
+      operationError = normalizedError;
+    }
   }
+  await finishAbortableFileHandleLifecycle(inputLifecycle, signal).catch(() => {});
+  try {
+    await output?.close();
+  } catch (error) {
+    outputCloseError = error;
+  }
+  if (signal?.aborted) throwIfAborted(signal);
+  if (operationError) {
+    attachAbortableFileHandleCleanupError(operationError, outputCloseError);
+    throw operationError;
+  }
+  if (outputCloseError) throw outputCloseError;
+  return mergeResult;
 }
 
 function walChecksum(buffer, littleEndian, checksum = [0, 0]) {
@@ -9545,7 +9724,7 @@ async function readImageDataUrlIfUsable(file, imageKeyCandidates = [], { signal 
     });
     throwIfAborted(signal);
     if (!st?.isFile() || st.size > 3 * 1024 * 1024) continue;
-    const raw = await fsp.readFile(candidate);
+    const raw = await readMediaFileWithSignal(candidate, signal);
     throwIfAborted(signal);
     const decoded = await materializeDecodedImage(extractPlainImage(raw, imageKeyCandidates), { signal });
     if (!decoded) continue;
@@ -9566,7 +9745,8 @@ async function readVideoFrameDataUrlIfUsable(file, { signal = null } = {}) {
   throwIfAborted(signal);
   if (!st?.isFile() || st.size > 512 * 1024 * 1024) return null;
   const raw = st.size <= 16 * 1024 * 1024
-    ? await fsp.readFile(file).catch(e => {
+    ? await readMediaFileWithSignal(file, signal).catch(e => {
+        if (isWxdbAbort(e, signal)) throw e;
         throw mediaTempCopyUnreadableError('读取', file, e);
       })
     : null;
@@ -9597,7 +9777,7 @@ async function readAudioDataUrlIfUsable(file, { signal = null } = {}) {
   if (!st?.isFile() || st.size > 8 * 1024 * 1024) return null;
   const mime = audioMimeFromPath(file);
   if (mime === 'audio/mpeg' || mime === 'audio/wav') {
-    const raw = await fsp.readFile(file);
+    const raw = await readMediaFileWithSignal(file, signal);
     throwIfAborted(signal);
     return {
       mime,
@@ -9614,7 +9794,7 @@ async function readAudioDataUrlIfUsable(file, { signal = null } = {}) {
     };
   }
   if (!mime) return null;
-  const raw = await fsp.readFile(file);
+  const raw = await readMediaFileWithSignal(file, signal);
   throwIfAborted(signal);
   return {
     mime,
@@ -9764,15 +9944,13 @@ async function readPrefix(file, bytes, { signal = null } = {}) {
     throw mediaTempCopyUnreadableError('读取', file, e);
   });
   if (!handle) return null;
-  try {
+  return withAbortableFileHandle(handle, signal, async () => {
     throwIfAborted(signal);
     const buf = Buffer.alloc(bytes);
     const res = await handle.read(buf, 0, bytes, 0);
     throwIfAborted(signal);
     return buf.subarray(0, res.bytesRead);
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 async function getImageKeyCandidatesForSamples(samples, { signal = null, maxMs = IMAGE_KEY_SCAN_MAX_MS } = {}) {
@@ -10054,6 +10232,8 @@ export const __wxdbInternals = {
   decodeMessagePayload,
   parseChatRoomMemberBuffer,
   readImageDataUrlIfUsable,
+  readVideoFrameDataUrlIfUsable,
+  readAudioDataUrlIfUsable,
   persistableRawKey,
   persistableRawKeyForVerifiedCache,
   portableWeixinV4VerifiedCandidates,
@@ -10067,6 +10247,7 @@ export const __wxdbInternals = {
   isSqliteCorruptionError,
   validateWeixinV4PageHmac,
   decryptWeixinV4DbToPlaintext,
+  mergeWeixinV4WalIntoPlaintext,
   weixinV4KeyCandidates,
   deriveWeixinV4PassphrasePageKey,
   findWeixinV4PageKeyForCopiedDb,

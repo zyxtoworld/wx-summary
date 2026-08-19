@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 const {
   assertBrowserDownloadSupported,
   browserDownloadCapability,
-} = await import('../src/web/public/js/browser-download-capability.js');
+} = await import('../src/web/public/js/shared/browser-download-capability.js');
 
 const supportedDocument = {
   createElement(tag) {

@@ -236,7 +236,10 @@ export async function getWeixinProcesses({ signal = null } = {}) {
     if (!out.trim()) return [];
     return normalizeWindowsWeixinProcesses(JSON.parse(out), { commandLineUnavailable: true });
   } catch (e) {
-    if (isDiscoveryAbort(e, signal)) throw e;
+    if (isDiscoveryAbort(e, signal)) {
+      if (signal?.aborted) throwIfDiscoveryAborted(signal);
+      throw e;
+    }
     const primaryError = e;
     try {
       if (!WINDOWS_POWERSHELL_EXE) return processEnumerationFailure(primaryError);
@@ -250,7 +253,10 @@ export async function getWeixinProcesses({ signal = null } = {}) {
       throwIfDiscoveryAborted(signal);
       return normalizeWindowsWeixinProcesses(out.trim() ? JSON.parse(out) : []);
     } catch (fallbackError) {
-      if (isDiscoveryAbort(fallbackError, signal)) throw fallbackError;
+      if (isDiscoveryAbort(fallbackError, signal)) {
+        if (signal?.aborted) throwIfDiscoveryAborted(signal);
+        throw fallbackError;
+      }
       const combined = new Error(`主进程查询失败；备用进程查询也失败：${String(fallbackError?.message || fallbackError || primaryError?.message || '').replace(/\s+/g, ' ').trim()}`);
       combined.code = 'process_enumeration_failed';
       return processEnumerationFailure(combined);
@@ -300,12 +306,18 @@ async function getMacWeixinProcesses({ signal = null } = {}) {
           main_process_confidence: 'command_line',
         });
       } catch (e) {
-        if (isDiscoveryAbort(e, signal)) throw e;
+        if (isDiscoveryAbort(e, signal)) {
+          if (signal?.aborted) throwIfDiscoveryAborted(signal);
+          throw e;
+        }
       }
     }
     return results.filter(p => p.is_main);
   } catch (e) {
-    if (isDiscoveryAbort(e, signal)) throw e;
+    if (isDiscoveryAbort(e, signal)) {
+      if (signal?.aborted) throwIfDiscoveryAborted(signal);
+      throw e;
+    }
     return processEnumerationFailure(e);
   }
 }
@@ -354,7 +366,10 @@ async function readConfiguredDataRootsResult({ signal = null } = {}) {
   }
   let files = [];
   try {
-    files = await fsp.readdir(XWECHAT_CONFIG_DIR, { withFileTypes: true });
+    files = await withDiscoveryAbort(
+      fsp.readdir(XWECHAT_CONFIG_DIR, { withFileTypes: true }),
+      signal,
+    );
   } catch (e) {
     if (isDiscoveryAbort(e, signal)) throw e;
     if (!['ENOENT', 'ENOTDIR'].includes(String(e?.code || ''))) {
@@ -384,7 +399,7 @@ async function readWindowsConfiguredDataRootEntries(entries = [], {
     const file = path.join(config_dir, entry.name);
     let text = '';
     try {
-      text = await read_file(file, 'utf-8');
+      text = await withDiscoveryAbort(read_file(file, 'utf-8'), signal);
     } catch (e) {
       if (isDiscoveryAbort(e, signal)) throw e;
       if (['ENOENT', 'ENOTDIR'].includes(String(e?.code || ''))) continue;
@@ -477,7 +492,7 @@ async function discoverDataRootsFromCandidates(roots = [], { signal = null } = {
     seen.add(key);
     let st = null;
     try {
-      st = await fsp.stat(root);
+      st = await withDiscoveryAbort(fsp.stat(root), signal);
     } catch (e) {
       if (isDiscoveryAbort(e, signal)) throw e;
       if (['ENOENT', 'ENOTDIR'].includes(String(e?.code || ''))) continue;
@@ -2288,7 +2303,7 @@ async function recoverStalePreviousMirrorDirs({
       notifyMirrorProgress(onProgress, {
         phase: 'mirror_recovery_rebuild',
         label: '检查本地数据 · 准备完整重建',
-        detail: '发现无法由完整发布清单确认的项目内候选；已全部保留，接下来先从微信源库建立完整新版本，发布成功后再清理旧候选',
+        detail: '发现无法由完整发布清单确认的项目内候选；已全部保留，接下来先从微信源库建立完整工作副本，发布成功后再清理未确认候选',
       });
       return { action: 'preserve_ambiguous_project_copies', segment, fresh_copy_required: true };
     }
@@ -2582,8 +2597,7 @@ async function rebindPublishedMirrorTargetMetadataAfterCleanup({
     });
   }
   await runWithWxDbMirrorIndexWriteLock(async () => {
-    throwIfDiscoveryAborted(signal);
-    const indexJson = await readMirrorIndex();
+    const indexJson = await readMirrorIndexForMutation(signal);
     indexJson.accounts = plainObject(indexJson.accounts) ? indexJson.accounts : {};
     const current = indexJson.accounts[id];
     if (!plainObject(current)
@@ -2918,8 +2932,8 @@ async function ensureWxDbMirrorTracked({ account_id = '', signal = null, onProgr
   const accountId = String(sourceResolution?.storage_account_id || source.account_id || accountOpaqueId(source.db_storage)).trim();
   return runWithWxDbMirrorLock(accountId, async () => {
     throwIfDiscoveryAborted(signal);
-    const indexJson = await readMirrorIndex();
-  let existing = indexJson.accounts?.[accountId] || {};
+    const indexJson = await readMirrorIndexForMutation(signal);
+    let existing = indexJson.accounts?.[accountId] || {};
     const mirrorSegment = safeMirrorSegment(accountId);
     const targetRoot = path.join(WXDB_MIRROR_ROOT, mirrorSegment);
     await assertSafeMirrorTargetRoot(targetRoot);
@@ -2945,7 +2959,7 @@ async function ensureWxDbMirrorTracked({ account_id = '', signal = null, onProgr
         notifyMirrorProgress(onProgress, {
           phase: 'mirror_category_recovery_rebuild',
           label: '检查本地数据 · 准备完整重建',
-          detail: '发现旧版本留下的分类备份；已保留原目录，先建立完整新版本并成功发布后再整体替换',
+          detail: '发现先前留下的分类备份；已保留原目录，先建立完整工作副本并成功发布后再整体替换',
         });
       }
     }
@@ -3582,8 +3596,7 @@ function mirrorTargetIdentityMatches(target = {}, file = {}) {
 async function rememberOfflineMirrorContentVerification(accountId = '', scope = {}, snapshot = {}, verifiedFiles = [], verifiedAt = '', { signal = null } = {}) {
   throwIfDiscoveryAborted(signal);
   await runWithWxDbMirrorIndexWriteLock(async () => {
-    throwIfDiscoveryAborted(signal);
-    const indexJson = await readMirrorIndex();
+    const indexJson = await readMirrorIndexForMutation(signal);
     const previous = indexJson.accounts?.[accountId];
     if (!plainObject(previous)) return;
     const candidate = wxDbMirrorScopeRecordsForRead(previous, scope).find(item => item?.record?.source_snapshot === snapshot)
@@ -3607,6 +3620,7 @@ async function rememberOfflineMirrorContentVerification(accountId = '', scope = 
     if (key === 'full') previous.source_snapshot = nextPayload;
     indexJson.accounts[accountId] = previous;
     await writeJsonAtomic(WXDB_MIRROR_INDEX, indexJson);
+    throwIfDiscoveryAborted(signal);
   });
 }
 
@@ -3640,7 +3654,7 @@ export async function recordWxDbMirrorAccountIdentity({ account_id = '', self_wx
     });
   }
   const recorded = await runWithWxDbMirrorLock(storageId, () => runWithWxDbMirrorIndexWriteLock(async () => {
-    const indexJson = await readMirrorIndex();
+    const indexJson = await readMirrorIndexForMutation(signal);
     const previous = indexJson.accounts?.[storageId];
     if (!plainObject(previous)) {
       throw Object.assign(new Error('项目副本索引缺少当前存储账号，无法绑定本人身份。'), {
@@ -3711,6 +3725,7 @@ export async function recordWxDbMirrorAccountIdentity({ account_id = '', self_wx
         identity_generation_snapshot_meta_hash: currentIdentitySnapshotHash,
       };
       await writeJsonAtomic(WXDB_MIRROR_INDEX, indexJson);
+      throwIfDiscoveryAborted(signal);
     }
     return {
       ok: true,
@@ -3728,6 +3743,7 @@ export async function recordWxDbMirrorAccountIdentity({ account_id = '', self_wx
     };
   }), { signal });
   await notifyWxDbMirrorIdentityChanged(recorded);
+  throwIfDiscoveryAborted(signal);
   return recorded;
 }
 
@@ -3749,7 +3765,7 @@ async function recordWxDbMirrorIdentityGenerationContinuity({
   }
   return runWithWxDbMirrorIndexWriteLock(async () => {
     throwIfDiscoveryAborted(signal);
-    const indexJson = await readMirrorIndex();
+    const indexJson = await readMirrorIndexForMutation(signal);
     const previous = indexJson.accounts?.[accountId];
     const expectedIdentityId = String(existing?.identity_id || '').trim().toLowerCase();
     const expectedManifestHash = String(existing?.published_manifest_hash || '').trim().toLowerCase();
@@ -3797,7 +3813,7 @@ async function recordWxDbMirrorReuse({
   throwIfDiscoveryAborted(signal);
   return runWithWxDbMirrorIndexWriteLock(async () => {
     throwIfDiscoveryAborted(signal);
-    const indexJson = await readMirrorIndex();
+    const indexJson = await readMirrorIndexForMutation(signal);
     indexJson.accounts = plainObject(indexJson.accounts) ? indexJson.accounts : {};
     const previous = indexJson.accounts[accountId] || existing || {};
     const checked_at = new Date().toISOString();
@@ -4274,7 +4290,7 @@ async function importWxDbMirrorUnlocked({ source, sourceSnapshot = null, existin
         summary = await summarizeDbStorage(targetDbStorage);
         targetSnapshotPayload = await mirrorSnapshotIndexPayloadForTarget(finalSnapshot, targetDbStorage, { signal, knownHashes: stableContentHashes });
         refreshedAt = await runWithWxDbMirrorIndexWriteLock(async () => {
-          const indexJson = await readMirrorIndex();
+          const indexJson = await readMirrorIndexForMutation(signal);
           indexJson.accounts = plainObject(indexJson.accounts) ? indexJson.accounts : {};
           const previous = indexJson.accounts[accountId] || {};
           const refreshed_at = new Date().toISOString();
@@ -4596,7 +4612,7 @@ async function refreshWxDbMirrorScopeUnlocked({ source, sourceSnapshot = null, e
           knownHashes: stableContentHashes,
         });
         refreshedAt = await runWithWxDbMirrorIndexWriteLock(async () => {
-          const indexJson = await readMirrorIndex();
+          const indexJson = await readMirrorIndexForMutation(signal);
           indexJson.accounts = plainObject(indexJson.accounts) ? indexJson.accounts : {};
           const previous = indexJson.accounts[accountId] || {};
           const refreshed_at = new Date().toISOString();
@@ -7229,6 +7245,13 @@ async function readMirrorIndex() {
   }
 }
 
+async function readMirrorIndexForMutation(signal = null) {
+  throwIfDiscoveryAborted(signal);
+  const index = await readMirrorIndex();
+  throwIfDiscoveryAborted(signal);
+  return index;
+}
+
 function assertMirrorIndexAccountDirectoryBindings(accounts = {}) {
   const usedSegments = new Set();
   for (const [rawAccountId, item] of Object.entries(accounts)) {
@@ -7418,6 +7441,35 @@ function discoveryAbortError() {
   return Object.assign(new Error('请求已取消'), { name: 'AbortError', status: 499 });
 }
 
+function withDiscoveryAbort(promise, signal = null) {
+  if (!signal) return Promise.resolve(promise);
+  if (signal.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : discoveryAbortError());
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener?.('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(
+      reject,
+      signal.reason instanceof Error ? signal.reason : discoveryAbortError(),
+    );
+    signal.addEventListener?.('abort', onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    Promise.resolve(promise).then(
+      value => finish(resolve, value),
+      error => finish(reject, error),
+    );
+  });
+}
+
 function throwIfDiscoveryAborted(signal) {
   if (signal?.aborted) throw (signal.reason instanceof Error ? signal.reason : discoveryAbortError());
 }
@@ -7481,17 +7533,37 @@ async function hashFileSha256(file, { signal = null } = {}) {
   throwIfDiscoveryAborted(signal);
   if (!st.isFile()) throw new Error(`${weixinProcessLabel()} path is not a file`);
   const hash = crypto.createHash('sha256');
-  await new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(file);
-    const onAbort = () => {
-      stream.destroy(signal.reason instanceof Error ? signal.reason : discoveryAbortError());
-    };
-    signal?.addEventListener?.('abort', onAbort, { once: true });
-    stream.on('data', chunk => hash.update(chunk));
-    stream.on('error', reject);
-    stream.on('end', resolve);
-    stream.on('close', () => signal?.removeEventListener?.('abort', onAbort));
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      const stream = fs.createReadStream(file);
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener?.('abort', onAbort);
+        fn(value);
+      };
+      const onAbort = () => {
+        stream.destroy(signal.reason instanceof Error ? signal.reason : discoveryAbortError());
+      };
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+      stream.on('data', chunk => hash.update(chunk));
+      stream.on('error', error => finish(reject, error));
+      stream.on('end', () => finish(resolve));
+      stream.on('close', () => {
+        if (settled) return;
+        finish(
+          reject,
+          signal?.aborted
+            ? (signal.reason instanceof Error ? signal.reason : discoveryAbortError())
+            : Object.assign(new Error('微信程序证据文件流提前关闭。'), { code: 'wxenv_file_stream_closed' }),
+        );
+      });
+    });
+  } catch (error) {
+    if (signal?.aborted) throwIfDiscoveryAborted(signal);
+    throw error;
+  }
   throwIfDiscoveryAborted(signal);
   return {
     bytes: st.size,
@@ -7646,7 +7718,13 @@ async function scanModuleDbStringHits(file, mod = {}, { signal = null } = {}) {
   throwIfDiscoveryAborted(signal);
   if (!st.isFile()) return { total: 0, hits: {} };
   if (st.size > 260 * 1024 * 1024) return { total: 0, hits: {}, error: 'module_too_large' };
-  const buf = await fsp.readFile(file);
+  let buf;
+  try {
+    buf = await fsp.readFile(file, signal ? { signal } : undefined);
+  } catch (error) {
+    if (signal?.aborted) throwIfDiscoveryAborted(signal);
+    throw error;
+  }
   throwIfDiscoveryAborted(signal);
   const pe = readPeSections(buf);
   const baseAddress = Number(mod.base_address || 0);

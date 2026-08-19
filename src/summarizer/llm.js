@@ -2846,6 +2846,15 @@ async function discardResponseBody(res) {
   try { await res?.body?.cancel?.(); } catch {}
 }
 
+function discardResponseBodyBestEffort(res) {
+  try {
+    const result = res?.body?.cancel?.();
+    if (result && typeof result.then === 'function') {
+      void Promise.resolve(result).catch(() => {});
+    }
+  } catch {}
+}
+
 async function fetchLinkPreviewResponse(targetUrl, cfg = {}, signal = null, {
   timeoutMs = cfg.timeout_ms || DEFAULT_LINK_PREVIEW.timeout_ms,
   headers = {},
@@ -2872,6 +2881,11 @@ async function fetchLinkPreviewResponse(targetUrl, cfg = {}, signal = null, {
           headers,
           signal: controller.signal,
         });
+      if (signal?.aborted || controller.signal.aborted) {
+        discardResponseBodyBestEffort(res);
+        throwIfAborted(signal);
+        throwIfAborted(controller.signal);
+      }
       const nextUrl = redirectLocationForResponse(res, url);
       if (!nextUrl) return res;
       await discardResponseBody(res);
@@ -3086,7 +3100,7 @@ async function fetchLinkPreview(targetUrl, cfg, signal = null) {
         content_type: contentType,
       };
     }
-    const limited = await readLimitedResponse(res, cfg.max_bytes);
+    const limited = await readLimitedResponse(res, cfg.max_bytes, controller.signal);
     const inferredBinaryType = !contentType ? binarySignatureContentType(limited) : '';
     if (!contentType && (inferredBinaryType || !looksLikeTextResponseBody(limited))) {
       return {
@@ -3195,7 +3209,7 @@ async function fetchGitHubJson(url, cfg, signal = null) {
         Accept: 'application/vnd.github+json',
       },
     });
-    const limited = await readLimitedResponse(res, cfg.max_bytes || DEFAULT_LINK_PREVIEW.max_bytes);
+    const limited = await readLimitedResponse(res, cfg.max_bytes || DEFAULT_LINK_PREVIEW.max_bytes, controller.signal);
     if (!res.ok) return null;
     try {
       return JSON.parse(new TextDecoder('utf-8', { fatal: false }).decode(limited));
@@ -3717,13 +3731,36 @@ function extractResponsesText(json) {
   return chunks.join('\n').trim();
 }
 
-async function readLimitedResponse(res, maxBytes) {
+function readLlmReaderChunk(reader, signal = null) {
+  if (signal?.aborted) return Promise.reject(aiAbortError(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener?.('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject, aiAbortError(signal));
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    Promise.resolve()
+      .then(() => {
+        if (signal?.aborted) throw aiAbortError(signal);
+        return reader.read();
+      })
+      .then(value => finish(resolve, value), error => finish(reject, error));
+  });
+}
+
+async function readLimitedResponse(res, maxBytes, signal = null) {
+  throwIfAborted(signal);
   const limit = Math.max(1024, Number(maxBytes || DEFAULT_LINK_PREVIEW.max_bytes));
   if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
     const chunks = [];
     let total = 0;
     try {
       for await (const value of res.body) {
+        throwIfAborted(signal);
         const chunk = Buffer.from(value);
         const remaining = limit - total;
         chunks.push(chunk.length > remaining ? chunk.subarray(0, remaining) : chunk);
@@ -3740,28 +3777,48 @@ async function readLimitedResponse(res, maxBytes) {
     } catch (e) {
       if (!/aborted|premature close/i.test(String(e?.message || e))) throw e;
     }
+    throwIfAborted(signal);
     return Buffer.concat(chunks);
   }
   if (!res.body?.getReader) {
     const data = Buffer.from(await res.arrayBuffer());
+    throwIfAborted(signal);
     return data.subarray(0, limit);
   }
   const reader = res.body.getReader();
   const chunks = [];
   let total = 0;
-  while (total < limit) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const chunk = Buffer.from(value);
-    const remaining = limit - total;
-    chunks.push(chunk.length > remaining ? chunk.subarray(0, remaining) : chunk);
-    total += Math.min(chunk.length, remaining);
-    if (chunk.length > remaining) {
-      await reader.cancel().catch(() => {});
-      break;
+  let sourceDone = false;
+  let cancelled = false;
+  const cancelReader = async () => {
+    if (cancelled) return;
+    cancelled = true;
+    try { await reader.cancel?.(); } catch {}
+  };
+  try {
+    while (total < limit) {
+      const { done, value } = await readLlmReaderChunk(reader, signal);
+      throwIfAborted(signal);
+      if (done) {
+        sourceDone = true;
+        break;
+      }
+      const chunk = Buffer.from(value);
+      const remaining = limit - total;
+      chunks.push(chunk.length > remaining ? chunk.subarray(0, remaining) : chunk);
+      total += Math.min(chunk.length, remaining);
+      if (chunk.length > remaining) {
+        await cancelReader();
+        break;
+      }
     }
+    if (!sourceDone) await cancelReader();
+    throwIfAborted(signal);
+    return Buffer.concat(chunks);
+  } finally {
+    if (!sourceDone) await cancelReader();
+    try { reader.releaseLock?.(); } catch {}
   }
-  return Buffer.concat(chunks);
 }
 
 function binarySignatureContentType(data) {
@@ -3839,7 +3896,7 @@ async function fetchRelatedLinkPreviews(finalUrl, html, cfg, signal = null) {
       });
       const contentType = String(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
       if (!res.ok || (contentType && !isTextLikeContent(contentType))) continue;
-      const limited = await readLimitedResponse(res, cfg.max_related_bytes || DEFAULT_LINK_PREVIEW.max_related_bytes);
+      const limited = await readLimitedResponse(res, cfg.max_related_bytes || DEFAULT_LINK_PREVIEW.max_related_bytes, controller.signal);
       if (!contentType && (binarySignatureContentType(limited) || !looksLikeTextResponseBody(limited))) continue;
       const body = new TextDecoder('utf-8', { fatal: false }).decode(limited);
       const preview = normalizeLinkPreview(item.url, res.url || item.url, contentType, body, cfg.max_related_chars || DEFAULT_LINK_PREVIEW.max_related_chars);
@@ -4831,12 +4888,32 @@ function aiResponseTooLargeError(maxBytes = AI_JSON_RESPONSE_MAX_BYTES, actualBy
   );
 }
 
+async function cancelResponseBodyBestEffort(response, reason = null) {
+  const body = response?.body;
+  if (!body) return;
+  try {
+    if (typeof body.cancel === 'function') {
+      await body.cancel(reason);
+      return;
+    }
+    const reader = body.getReader?.();
+    if (!reader) return;
+    try { await reader.cancel?.(reason); } catch {}
+    try { reader.releaseLock?.(); } catch {}
+  } catch {}
+}
+
 async function readResponseTextLimited(response, { maxBytes = AI_JSON_RESPONSE_MAX_BYTES, signal = null } = {}) {
   const limit = Math.max(1, Number(maxBytes || 0) || AI_JSON_RESPONSE_MAX_BYTES);
   const contentLength = Math.max(0, Number(response?.headers?.get?.('content-length') || 0) || 0);
-  if (contentLength > limit) throw aiResponseTooLargeError(limit, contentLength);
+  if (contentLength > limit) {
+    const error = aiResponseTooLargeError(limit, contentLength);
+    await cancelResponseBodyBestEffort(response, error);
+    throw error;
+  }
   if (!response?.body?.getReader) {
     const text = await response.text();
+    throwIfAborted(signal);
     const bytes = Buffer.byteLength(text, 'utf-8');
     if (bytes > limit) throw aiResponseTooLargeError(limit, bytes);
     return text;
@@ -4845,19 +4922,36 @@ async function readResponseTextLimited(response, { maxBytes = AI_JSON_RESPONSE_M
   const decoder = new TextDecoder();
   let text = '';
   let bytes = 0;
-  while (true) {
-    throwIfAborted(signal);
-    const { done, value } = await reader.read();
-    if (done) break;
-    bytes += Number(value?.byteLength || 0) || 0;
-    if (bytes > limit) {
-      await reader.cancel().catch(() => {});
-      throw aiResponseTooLargeError(limit, bytes);
+  let sourceDone = false;
+  let cancelled = false;
+  const cancelReader = async () => {
+    if (cancelled) return;
+    cancelled = true;
+    try { await reader.cancel?.(); } catch {}
+  };
+  try {
+    while (true) {
+      throwIfAborted(signal);
+      const { done, value } = await readLlmReaderChunk(reader, signal);
+      throwIfAborted(signal);
+      if (done) {
+        sourceDone = true;
+        break;
+      }
+      bytes += Number(value?.byteLength || 0) || 0;
+      if (bytes > limit) {
+        await cancelReader();
+        throw aiResponseTooLargeError(limit, bytes);
+      }
+      text += decoder.decode(value, { stream: true });
     }
-    text += decoder.decode(value, { stream: true });
+    if (!sourceDone) await cancelReader();
+    text += decoder.decode();
+    return text;
+  } finally {
+    if (!sourceDone) await cancelReader();
+    try { reader.releaseLock?.(); } catch {}
   }
-  text += decoder.decode();
-  return text;
 }
 
 function providerErrorCategory(json, fallback = '', status = 0) {
@@ -4928,14 +5022,20 @@ function providerErrorSummary(status = 0, headers = null, json = null, fallback 
     provider_error: 'AI 服务请求失败',
   }[category] || 'AI 服务请求失败';
   const requestId = providerRequestId(headers);
-  return {
+  const summary = {
     category,
     code: safeProviderErrorCode(extracted.code),
     detail: providerErrorCanonicalDetail(category, status),
     request_id: requestId,
-    raw_message: extracted.message || fallback,
     message: `${label}（HTTP ${Math.max(0, Number(status || 0) || 0)}）${requestId ? `；请求 ID：${requestId}` : ''}`,
   };
+  // 原始供应商文本只给本模块内部的脱敏日志使用，不能进入公开/可序列化摘要。
+  Object.defineProperty(summary, 'raw_message', {
+    value: extracted.message || fallback,
+    enumerable: false,
+    configurable: true,
+  });
+  return summary;
 }
 
 function extractProviderError(value) {
@@ -5501,6 +5601,7 @@ function sleep(ms, signal = null) {
 export const __llmInternals = {
   createAiCallBudget,
   consumeAiCallBudget,
+  readLimitedResponse,
   aiWebSearchToolCandidates,
   aiWebSearchRuntimeSupport,
   aiWebSearchRuntimeSupportCacheState,

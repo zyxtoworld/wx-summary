@@ -11,9 +11,10 @@ import zlib from 'node:zlib';
 import pngjs from 'pngjs';
 import { createAbortableWorkRegistry } from '../lib/abortable-work-registry.js';
 import { readFileHandleBounded } from '../lib/bounded-read.js';
+import { createFileHandleCloser } from '../lib/bounded-read.js';
 import { TMP_DIR, assertSafeTmpPath } from '../lib/paths.js';
 import { RENDERED_PNG_MAX_BYTES, RENDERED_PNG_MAX_RGBA_BYTES, RENDERED_PNG_MAX_SIDE, validatePngBuffer, validatePngFileHandle, validatePngHeader } from './png-validate.js';
-import { attachWindowsProcessCleanup, terminateWindowsProcessTree, windowsProcessCleanupForError } from './windows-process-tree.js';
+import { attachWindowsProcessCleanup, terminateWindowsProcessTree, windowsProcessCleanupForError } from '../lib/windows-process-tree.js';
 
 const SCRIPT_PATH = fileURLToPath(new URL('./render-thumbnail.ps1', import.meta.url));
 const PORTABLE_THUMBNAIL_WORKER_URL = new URL('./thumbnail-worker.js', import.meta.url);
@@ -270,9 +271,11 @@ async function createThumbnailSourceSnapshotFromHandle(handle, snapshotPath, { e
     throw thumbnailLimitExceededError('缩略图源文件过大；请点开查看原图。');
   }
   let snapshotHandle = null;
+  let snapshotCloseHandle = null;
   let completed = false;
   try {
     snapshotHandle = await fsp.open(snapshotPath, 'wx+');
+    snapshotCloseHandle = createFileHandleCloser(snapshotHandle);
     const copied = await copyThumbnailSourceSnapshot(handle, snapshotHandle, before.size, { signal });
     const after = await handle.stat();
     if (!thumbnailFileContentStatMatches(before, after)) {
@@ -283,6 +286,7 @@ async function createThumbnailSourceSnapshotFromHandle(handle, snapshotPath, { e
     await snapshotHandle.sync();
     await validatePngFileHandle(snapshotHandle, thumbnailSourceValidationOptions({
       signal,
+      closeHandle: snapshotCloseHandle,
       maxBytes: boundedMaxBytes,
       maxRgbaBytes: boundedMaxRgbaBytes,
     }));
@@ -300,7 +304,7 @@ async function createThumbnailSourceSnapshotFromHandle(handle, snapshotPath, { e
     }
     throw thumbnailValidationError('缩略图临时副本准备失败；请稍后重试。', 'thumbnail_failed', 500);
   } finally {
-    await snapshotHandle?.close?.().catch(() => {});
+    await snapshotCloseHandle?.().catch(() => {});
     if (!completed) await cleanupThumbnailTemp(snapshotPath);
   }
 }
@@ -333,15 +337,19 @@ async function copyThumbnailSourceSnapshot(sourceHandle, snapshotHandle, expecte
     position += bytesRead;
   }
   const extra = Buffer.allocUnsafe(1);
-  if ((await sourceHandle.read(extra, 0, 1, position)).bytesRead) {
+  throwIfThumbnailAborted(signal);
+  const extraRead = await sourceHandle.read(extra, 0, 1, position);
+  throwIfThumbnailAborted(signal);
+  if (extraRead.bytesRead) {
     throw thumbnailValidationError('缩略图源文件已变化，请刷新历史后重试。', 'history_file_changed', 409);
   }
   return { bytes: position, sha256: hash.digest('hex') };
 }
 
-function thumbnailSourceValidationOptions({ signal = null, maxBytes = RENDERED_PNG_MAX_BYTES, maxRgbaBytes = RENDERED_PNG_MAX_RGBA_BYTES } = {}) {
+function thumbnailSourceValidationOptions({ signal = null, closeHandle = null, maxBytes = RENDERED_PNG_MAX_BYTES, maxRgbaBytes = RENDERED_PNG_MAX_RGBA_BYTES } = {}) {
   return {
     signal,
+    closeHandle,
     maxBytes,
     maxRgbaBytes,
     maxSide: RENDERED_PNG_MAX_SIDE,
@@ -1024,8 +1032,10 @@ async function readThumbnailFileBounded(file, maxBytes, {
 } = {}) {
   throwIfThumbnailAborted(signal);
   let handle = null;
+  let closeHandle = null;
   try {
     handle = await fsp.open(file, 'r');
+    closeHandle = createFileHandleCloser(handle);
     const before = await handle.stat();
     if (!before?.isFile?.()) throw thumbnailValidationError('缩略图文件不是普通文件。');
     if (expectedStat && !thumbnailFileContentStatMatches(expectedStat, before)) {
@@ -1036,6 +1046,8 @@ async function readThumbnailFileBounded(file, maxBytes, {
     }
     const data = await readFileHandleBounded(handle, maxBytes, {
       checkAbort: () => throwIfThumbnailAborted(signal),
+      signal,
+      closeHandle,
       createTooLargeError: () => (typeof createTooLargeError === 'function' ? createTooLargeError() : thumbnailValidationError('缩略图文件过大。')),
     });
     const after = await handle.stat();
@@ -1045,7 +1057,7 @@ async function readThumbnailFileBounded(file, maxBytes, {
     throwIfThumbnailAborted(signal);
     return { data, stat: after };
   } finally {
-    await handle?.close?.().catch(() => {});
+    await closeHandle?.().catch(() => {});
   }
 }
 
@@ -1206,6 +1218,12 @@ function joinThumbnailFlight(identity, signal, producer) {
   const key = String(identity || '').trim();
   if (!key) throw new TypeError('thumbnail single-flight identity is required');
   let flight = THUMBNAIL_IN_FLIGHT.get(key);
+  // 最后一个 waiter 取消后 producer 已经失去所有权。底层 worker 可能
+  // 忽略 abort 且迟到完成,新请求不能再加入这条已失效的 flight。
+  if (flight?.controller?.signal?.aborted) {
+    if (THUMBNAIL_IN_FLIGHT.get(key) === flight) THUMBNAIL_IN_FLIGHT.delete(key);
+    flight = null;
+  }
   let created = false;
   if (!flight) {
     created = true;

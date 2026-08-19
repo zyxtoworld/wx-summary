@@ -196,7 +196,8 @@ export async function rememberVerifiedWxdbKeysForAccount({
     };
     pruneAccounts(cache.accounts, accountId);
     if (!keyCacheWriteAllowed(write_if)) return { changed: false, key_count: 0, skipped: 'stale_generation' };
-    await saveKeyCacheUnlocked(cache, file);
+    const saved = await saveKeyCacheUnlocked(cache, file, { write_if });
+    if (saved === false) return { changed: false, key_count: 0, skipped: 'stale_generation' };
     return { changed: true, key_count: nextKeys.length };
   });
 }
@@ -267,7 +268,8 @@ export async function rememberWxdbIdentityShardEvidenceForAccount({
     };
     pruneAccounts(cache.accounts, accountId);
     if (!keyCacheWriteAllowed(write_if)) return { changed: false, entry_count: 0, skipped: 'stale_generation' };
-    await saveKeyCacheUnlocked(cache, file);
+    const saved = await saveKeyCacheUnlocked(cache, file, { write_if });
+    if (saved === false) return { changed: false, entry_count: nextEntries.length, skipped: 'stale_generation' };
     return { changed: true, entry_count: nextEntries.length };
   });
 }
@@ -561,7 +563,7 @@ function rememberKeyCacheReadFailure(file, error, { status = 'unreadable', reset
   };
 }
 
-async function saveKeyCacheUnlocked(cache, file) {
+async function saveKeyCacheUnlocked(cache, file, { write_if = null } = {}) {
   const normalized = normalizeCache(cache);
   await ensureDir(path.dirname(file));
   const existing = await fsp.lstat(file).catch(error => {
@@ -571,8 +573,10 @@ async function saveKeyCacheUnlocked(cache, file) {
   if (existing) assertOrdinaryKeyCacheFile(existing);
   const encrypted = await protectText(JSON.stringify(normalized));
   if (encrypted.length > MAX_WXDB_KEY_CACHE_FILE_BYTES) throw keyCacheTooLargeError(encrypted.length);
+  if (!keyCacheWriteAllowed(write_if)) return false;
   await writeFileAtomic(file, encrypted, { mode: PRIVATE_FILE_MODE });
   KEY_CACHE_INVALID_INFO = null;
+  return true;
 }
 
 async function saveOrRemoveKeyCacheUnlocked(cache, file) {

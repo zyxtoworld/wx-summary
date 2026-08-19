@@ -3,6 +3,12 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { __collectorInternals, legacyManualKeyBindingFromResult } from '../src/collector/index.js';
 import { __mainInternals } from '../src/main.js';
+import { createBrowserModuleLoader } from './helpers/import-browser-module.mjs';
+
+globalThis.location = new URL('http://wx-summary.test/#/setup');
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+const { wizardAccountRequestContext } = await createBrowserModuleLoader().load('js/pages/setup/state.js');
 
 const ROOT = process.cwd();
 
@@ -98,15 +104,16 @@ async function main() {
   );
   assert.ok(!sideEffectGetSource.includes("'/api/wechat/status'"));
 
-  const appSource = await fsp.readFile(path.join(ROOT, 'src', 'web', 'public', 'js', 'app.js'), 'utf8');
-  assert.ok(appSource.includes("pathname === '/api/wechat/status' && requestMethod === 'POST'"));
-  assert.ok(!appSource.includes("pathname === '/api/wechat/status' && ['GET', 'POST'].includes(requestMethod)"));
-  const statusCallCount = (appSource.match(/api\(`\/api\/wechat\/status\?\$\{query\.toString\(\)\}`,/g) || []).length;
-  const statusPostCallCount = (appSource.match(/api\(`\/api\/wechat\/status\?\$\{query\.toString\(\)\}`,\s*\{\s*method: 'POST'/g) || []).length;
-  assert.ok(statusCallCount >= 5, 'all automatic, settings, and setup key-verification calls should be covered');
-  assert.equal(statusPostCallCount, statusCallCount, 'every key-verification request must be tracked as a mutation');
-  assert.ok(appSource.includes('验证只在自动准备的项目副本上进行'));
-  assert.ok(!appSource.includes('它不会自动绑定当前账号，当前账号读取依赖自动扫描'));
+  const requestContext = wizardAccountRequestContext({
+    account: { id: 'account_a', account_aliases: ['wxid_a'], manual_key_account_fingerprint: 'f'.repeat(64) },
+  }, { manualKeyValidationRequired: true });
+  assert.deepEqual(requestContext.body._request_context, {
+    account_id: 'account_a',
+    account_aliases: ['account_a', 'wxid_a'],
+    account_fingerprint: 'f'.repeat(64),
+    expected_account_fingerprint: 'f'.repeat(64),
+    manual_key_validation_required: true,
+  }, 'current setup validation must bind the POST request to the confirmed account and fingerprint');
 
   console.log('legacy key batch migration contract tests passed');
 }

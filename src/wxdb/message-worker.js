@@ -70,10 +70,17 @@ function sendWorkerMessage(message, { exitCode = null } = {}) {
     if (exitCode !== null && !persistentWorker) void shutdownWorker(exitCode);
     return;
   }
-  process.send?.(message, error => {
-    if (!error || exitCode === null || persistentWorker) return;
-    void shutdownWorker(exitCode);
-  });
+  let sendFailureHandled = false;
+  const handleSendFailure = error => {
+    if (!error || sendFailureHandled) return;
+    sendFailureHandled = true;
+    void shutdownWorker(exitCode === null ? 1 : exitCode);
+  };
+  try {
+    process.send?.(message, handleSendFailure);
+  } catch (error) {
+    handleSendFailure(error);
+  }
 }
 
 function shutdownWorker(exitCode = 0) {
@@ -90,6 +97,7 @@ process.on('message', async message => {
   if (message?.type === 'cancel') {
     const requestId = String(message.request_id || '').trim();
     if (requestId && requestId !== activeRequestId) return;
+    if (!persistentWorker) shutdownRequested = true;
     activeAbortController?.abort?.(Object.assign(new Error('数据库读取已取消。'), { name: 'AbortError', status: 499 }));
     return;
   }
@@ -108,10 +116,13 @@ process.on('message', async message => {
   const payload = message.payload && typeof message.payload === 'object' ? message.payload : {};
   try {
     const onProgress = progress => {
-      if (!process.connected) return;
+      if (!process.connected || shutdownRequested || abortController.signal.aborted) return;
       const value = progress && typeof progress === 'object' && !Array.isArray(progress) ? progress : {};
       const identityChange = safeIdentityChange(value.identity_change);
-      if (identityChange) sendWorkerMessage({ type: 'identity_change', request_id: requestId, change: identityChange });
+      if (identityChange && !shutdownRequested && !abortController.signal.aborted) {
+        sendWorkerMessage({ type: 'identity_change', request_id: requestId, change: identityChange });
+      }
+      if (shutdownRequested || abortController.signal.aborted) return;
       const { identity_change: _identityChange, ...publicProgress } = value;
       sendWorkerMessage({ type: 'progress', request_id: requestId, progress: publicProgress });
     };
@@ -130,7 +141,7 @@ process.on('message', async message => {
           onProgress,
         });
     }
-    if (!process.connected) return;
+    if (!process.connected || shutdownRequested || abortController.signal.aborted) return;
     sendWorkerMessage({
       type: 'result',
       request_id: requestId,
@@ -142,7 +153,7 @@ process.on('message', async message => {
         : [],
     }, { exitCode: 0 });
   } catch (error) {
-    if (!process.connected) return;
+    if (!process.connected || shutdownRequested || abortController.signal.aborted) return;
     sendWorkerMessage({
       type: 'error',
       request_id: requestId,

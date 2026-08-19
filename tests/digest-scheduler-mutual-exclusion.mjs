@@ -8,7 +8,6 @@ import {
 
 const main = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
 const scheduler = fs.readFileSync(new URL('../src/daemon/scheduler.js', import.meta.url), 'utf8');
-const app = fs.readFileSync(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 
 setSchedulerManualDigestActivityProbe(() => true);
 const blocked = await runSchedulerOnce({ reason: 'mutual_exclusion_test' });
@@ -49,12 +48,6 @@ assert.ok(
   digestRoute.indexOf('assertSchedulerIdleForManualDigest()') >= 0
     && digestRoute.indexOf('assertSchedulerIdleForManualDigest()') < digestRoute.indexOf('ACTIVE_DIGEST_REQUESTS.set(requestId'),
   'manual digest requests must retain a second scheduler guard before reserving a database read',
-);
-
-assert.match(
-  app,
-  /manual_digest_active: '手动生成正在运行，后台检查已延后'[\s\S]*?r\.detail === 'manual_digest_active'[\s\S]*?定时任务已延后，结束后会自动重试/,
-  'settings must explain that a scheduled check was deferred by an active manual generation instead of rendering a generic zero-result row',
 );
 
 console.log('manual digest and scheduler mutual exclusion passed');

@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WXDB_TMP_DIR, assertSafeTmpPath } from '../lib/paths.js';
-import { terminateWindowsProcessTree } from '../renderer/windows-process-tree.js';
+import { terminateWindowsProcessTree } from '../lib/windows-process-tree.js';
 import { logWarn } from '../lib/logger.js';
 import { persistedWxdbIdentityShardEvidence, persistedWxdbIdentityShardEvidenceForAccount, rememberWxdbIdentityShardEvidenceForAccount } from '../config/wxdb-key-cache.js';
 import { cleanupWxDbWorkerPlaintextCaches, normalizeAccountIdentityShardEvidenceCacheEntry } from './index.js';
@@ -172,13 +172,17 @@ function accountIdentityShardEvidenceCacheStatus() {
   };
 }
 
+function isCanonicalWxDbStorageId(value = '') {
+  return /^wxacc_[a-f0-9]{16}$/.test(String(value || '').trim().toLowerCase());
+}
+
 function normalizeWxDbIsolatedIdentityChange(change = null) {
   const value = change && typeof change === 'object' && !Array.isArray(change) ? change : {};
   const storageId = String(value.storage_id || '').trim().toLowerCase();
   const previousIdentityId = String(value.previous_identity_id || '').trim().toLowerCase();
   const identityId = String(value.identity_id || '').trim().toLowerCase();
   if (value.identity_switched !== true
-    || !/^wxacc_[a-f0-9]{16}$/.test(storageId)
+    || !isCanonicalWxDbStorageId(storageId)
     || !/^wxacct_[a-f0-9]{24}$/.test(identityId)
     || (previousIdentityId && !/^wxacct_[a-f0-9]{24}$/.test(previousIdentityId))) {
     return null;
@@ -333,15 +337,14 @@ async function cleanupWorkerCopiesAfterExit(pid, token) {
 function persistentCollectWorkerDescriptor(workerType, payload = {}) {
   if (workerType !== 'collect') return null;
   const batchId = String(payload?.batch_id || '').trim();
-  const accountId = String(payload?.account_id || '').trim();
+  const accountId = String(payload?.account_id || '').trim().toLowerCase();
   const readiness = payload?.mirror_readiness && typeof payload.mirror_readiness === 'object' && !Array.isArray(payload.mirror_readiness)
     ? payload.mirror_readiness
     : null;
   const snapshotHash = String(readiness?.source_snapshot_meta_hash || '').trim().toLowerCase();
   const publishedManifestHash = String(readiness?.published_manifest_hash || '').trim().toLowerCase();
   if (!/^[a-zA-Z0-9_.:-]{8,80}$/.test(batchId)
-    || !accountId
-    || accountId.length > 512
+    || !isCanonicalWxDbStorageId(accountId)
     || !/^[a-f0-9]{64}$/.test(snapshotHash)
     || !/^[a-f0-9]{64}$/.test(publishedManifestHash)) return null;
   return {
@@ -518,6 +521,7 @@ export function closeWxDbIsolatedWorkerAdmission(message = '服务正在关闭�
   for (const record of persistentCollectWorkerRecords()) {
     if (record.closing) continue;
     record.retire_after_request = true;
+    if (typeof record.stop === 'function') record.stop(error);
     void closePersistentCollectWorker(record, 'service_shutdown').catch(closeError => {
       logWarn('wxdb_worker_shutdown_close_failed', {
         worker_pid: record.child?.pid,
@@ -555,6 +559,7 @@ function retirePersistentCollectWorkersForIdentityChange(change, currentRecord =
   if (currentRecord) currentRecord.retire_after_request = true;
   for (const record of PERSISTENT_COLLECT_WORKERS.values()) {
     if (record === currentRecord) continue;
+    if (String(record?.account_id || '').trim().toLowerCase() !== normalized.storage_id) continue;
     void closePersistentCollectWorker(record, 'account_identity_changed').catch(() => {});
   }
   return true;
@@ -642,6 +647,7 @@ function spawnPersistentCollectWorker(descriptor) {
     termination_started: false,
     cleanup_promise: null,
     cleanup_error: null,
+    close_promise: null,
     exit_promise: new Promise(resolve => { resolveExit = resolve; }),
   };
   PERSISTENT_COLLECT_WORKERS.set(record.key, record);
@@ -705,8 +711,28 @@ async function ensurePersistentCollectWorkerCleanup(record) {
 
 async function closePersistentCollectWorker(record, reason = 'batch_finished') {
   if (!record) return false;
-  if (record.closing) {
-    if (await waitForPersistentCollectWorkerExit(record, PERSISTENT_COLLECT_WORKER_FORCE_EXIT_MS)) {
+  if (record.close_promise) return record.close_promise;
+  const closePromise = (async () => {
+    if (record.closing) {
+      if (await waitForPersistentCollectWorkerExit(record, PERSISTENT_COLLECT_WORKER_FORCE_EXIT_MS)) {
+        return ensurePersistentCollectWorkerCleanup(record);
+      }
+      forceStopWxDbChild(record.child);
+      if (await waitForPersistentCollectWorkerExit(record, PERSISTENT_COLLECT_WORKER_FORCE_EXIT_MS)) {
+        return ensurePersistentCollectWorkerCleanup(record);
+      }
+      throw persistentCollectWorkerCloseTimeoutError(record);
+    }
+    if (record.idle_timer) clearTimeout(record.idle_timer);
+    record.idle_timer = null;
+    if (record.child.exitCode !== null) {
+      return ensurePersistentCollectWorkerCleanup(record);
+    }
+    markPersistentCollectWorkerClosing(record);
+    try {
+      if (record.child.connected) record.child.send({ type: 'close', reason }, () => {});
+    } catch {}
+    if (await waitForPersistentCollectWorkerExit(record, PERSISTENT_COLLECT_WORKER_CLOSE_GRACE_MS)) {
       return ensurePersistentCollectWorkerCleanup(record);
     }
     forceStopWxDbChild(record.child);
@@ -714,24 +740,13 @@ async function closePersistentCollectWorker(record, reason = 'batch_finished') {
       return ensurePersistentCollectWorkerCleanup(record);
     }
     throw persistentCollectWorkerCloseTimeoutError(record);
-  }
-  if (record.idle_timer) clearTimeout(record.idle_timer);
-  record.idle_timer = null;
-  if (record.child.exitCode !== null) {
-    return ensurePersistentCollectWorkerCleanup(record);
-  }
-  markPersistentCollectWorkerClosing(record);
-  try {
-    if (record.child.connected) record.child.send({ type: 'close', reason }, () => {});
-  } catch {}
-  if (await waitForPersistentCollectWorkerExit(record, PERSISTENT_COLLECT_WORKER_CLOSE_GRACE_MS)) {
-    return ensurePersistentCollectWorkerCleanup(record);
-  }
-  forceStopWxDbChild(record.child);
-  if (await waitForPersistentCollectWorkerExit(record, PERSISTENT_COLLECT_WORKER_FORCE_EXIT_MS)) {
-    return ensurePersistentCollectWorkerCleanup(record);
-  }
-  throw persistentCollectWorkerCloseTimeoutError(record);
+  })();
+  let sharedClosePromise;
+  sharedClosePromise = closePromise.finally(() => {
+    if (record.close_promise === sharedClosePromise) record.close_promise = null;
+  });
+  record.close_promise = sharedClosePromise;
+  return sharedClosePromise;
 }
 
 export async function releaseWxDbIsolatedBatchSession(batchId) {
@@ -879,6 +894,7 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
         stderr = `${stderr}${String(chunk || '')}`.slice(0, WORKER_STDERR_MAX_BYTES);
       });
     }
+    let persistentStop = null;
     const invalidatePersistentRecord = () => {
       if (!persistentRecord) return;
       persistentRecord.busy = false;
@@ -892,6 +908,7 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
       child.removeListener('message', onMessage);
       child.removeListener('error', onChildError);
       child.removeListener('exit', onChildExit);
+      if (persistentRecord?.stop === persistentStop) persistentRecord.stop = null;
     };
     const stopChild = ({ cooperative = false } = {}) => {
       if (child.exitCode !== null) return;
@@ -939,6 +956,16 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
         stopChild({ cooperative: true });
       };
     }
+    if (persistentRecord) {
+      persistentStop = error => {
+        if (!settled) {
+          finish(reject, error || wxDbIsolatedWorkerShutdownError(), { cooperativeStop: true });
+          return;
+        }
+        stopChild({ cooperative: true });
+      };
+      persistentRecord.stop = persistentStop;
+    }
     const onAbort = () => finish(reject, isolatedAbortError(signal), { cooperativeStop: true });
     signal?.addEventListener?.('abort', onAbort, { once: true });
     if (signal?.aborted) {
@@ -948,16 +975,19 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
     timer = setTimeout(() => finish(reject, isolatedWorkerTimeoutError(workerType, timeoutMs), { cooperativeStop: true }), timeoutMs);
     timer.unref?.();
     let identityChangeChain = Promise.resolve();
+    let identityChangeObserved = false;
     const onMessage = message => {
       if (!message || typeof message !== 'object') return;
       if (String(message.request_id || '').trim() !== requestId) return;
       const terminalMessage = message.type === 'result' || message.type === 'error';
       if (terminalMessage) terminalMessageReceived = true;
       if (message.type === 'progress') {
+        if (settled || terminalMessageReceived) return;
         try { onProgress?.(message.progress || {}); } catch {}
         return;
       }
       if (message.type === 'identity_change') {
+        identityChangeObserved = true;
         retirePersistentCollectWorkersForIdentityChange(message.change, persistentRecord);
         identityChangeChain = identityChangeChain.then(() => notifyWxDbIsolatedIdentityChanged(message.change));
         return;
@@ -966,7 +996,11 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
         void (async () => {
           await identityChangeChain;
           if (settled) return;
-          if (['collect', 'groups', 'identity'].includes(workerType)) {
+          // Evidence carried by this request was produced before the source
+          // identity changed. The identity-change handler has already
+          // retired the old cache; allowing this terminal message to put the
+          // evidence back would resurrect the superseded account generation.
+          if (!identityChangeObserved && ['collect', 'groups', 'identity'].includes(workerType)) {
             rememberWorkerAccountIdentityShardEvidence(payload, message);
             if (Array.isArray(message?.identity_shard_evidence_cache_entries)
               && message.identity_shard_evidence_cache_entries.length) {
@@ -979,6 +1013,7 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
               } catch {}
             }
             await persistWorkerAccountIdentityShardEvidence(payload, message);
+            if (settled) return;
           }
           const result = message.result && typeof message.result === 'object' ? message.result : {};
           Object.defineProperty(result, '__verified_raw_keys', {
@@ -1005,7 +1040,7 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
         void (async () => {
           await identityChangeChain;
           if (settled) return;
-          if (['collect', 'groups', 'identity'].includes(workerType)) {
+          if (!identityChangeObserved && ['collect', 'groups', 'identity'].includes(workerType)) {
             rememberWorkerAccountIdentityShardEvidence(payload, message);
             if (Array.isArray(message?.identity_shard_evidence_cache_entries)
               && message.identity_shard_evidence_cache_entries.length) {
@@ -1018,12 +1053,18 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
               } catch {}
             }
             await persistWorkerAccountIdentityShardEvidence(payload, message);
+            if (settled) return;
           }
           finish(reject, isolatedWorkerError(message.error || {}), { keepPersistentWorker: true });
         })().catch(error => finish(reject, error, { keepPersistentWorker: true }));
       }
     };
-    const onChildError = error => finish(reject, error);
+    const onChildError = error => {
+      // terminal IPC 已经交付结果时,后续 transport error 与 exit 一样不能夺走
+      // 正在完成的结果/身份证据持久化;若持久化最终失败,其自身仍会收口请求。
+      if (terminalMessageReceived) return;
+      finish(reject, error);
+    };
     const onChildExit = (code, exitSignal) => {
       if (settled || terminalMessageReceived) return;
       const detail = String(persistentRecord?.stderr || stderr).trim().split(/\r?\n/).slice(-2).join(' ').slice(0, 300);
@@ -1038,7 +1079,7 @@ function runWxDbIsolatedLocked(workerType, { signal = null, onProgress = null, t
     child.once('exit', onChildExit);
     try {
       child.send({ type: workerType, request_id: requestId, payload }, error => {
-        if (error) finish(reject, error);
+        if (error && !terminalMessageReceived) finish(reject, error);
       });
     } catch (error) {
       finish(reject, error);

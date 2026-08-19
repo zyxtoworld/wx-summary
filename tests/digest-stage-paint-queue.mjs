@@ -1,12 +1,5 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import { createSerializedStagePaintQueue, digestServerWaitPulseShouldYield } from '../src/web/public/js/digest-stage-paint-queue.js';
-
-const appSource = fs.readFileSync(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
-assert.ok(appSource.includes("import { createSerializedStagePaintQueue, digestServerWaitPulseShouldYield } from './digest-stage-paint-queue.js';")
-  && appSource.includes('return createSerializedStagePaintQueue({')
-  && !appSource.includes('let latestDirectStage = Promise.resolve()'),
-  'the digest UI must use the serialized queue instead of a direct same-stage bypass');
+import { createSerializedStagePaintQueue, digestServerWaitPulseShouldYield } from '../src/web/public/js/shared/digest-stage-paint-queue.js';
 
 assert.equal(digestServerWaitPulseShouldYield({ phase: 'llm_retry_wait' }), true,
   'provider Retry-After waits should keep their explicit status instead of being overwritten by a generic model heartbeat');

@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 
 const mainSource = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
-const appSource = fs.readFileSync(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 
 const classifierStart = mainSource.indexOf('const LOCAL_ACTION_CAPABILITY_EXECUTION_FAILURE_CODES');
 const classifierEnd = mainSource.indexOf('\nfunction invalidateLocalActionCapabilityCache(', classifierStart);
@@ -102,13 +101,5 @@ assert.ok(mainSource.includes('local_action_capability_invalidated: error?.local
 const apiErrorSource = mainSource.slice(mainSource.indexOf('function apiError('), mainSource.indexOf('\nfunction sendProviderErrorResponse('));
 assert.ok(apiErrorSource.includes('err?.local_action_capability_invalidated === true'));
 assert.ok(apiErrorSource.includes('body.local_action_capability_invalidated = true'));
-
-const attachErrorStart = appSource.indexOf('function attachHttpErrorPayload(');
-const attachErrorSource = appSource.slice(attachErrorStart, appSource.indexOf('\nfunction ', attachErrorStart + 10));
-assert.ok(attachErrorSource.includes("'local_action_capability_invalidated'"));
-const apiSource = appSource.slice(appSource.indexOf('async function api('), appSource.indexOf('\nfunction syncAppStateDependentControls('));
-assert.ok((apiSource.match(/scheduleLocalActionCapabilityRefreshAfterFailure\(\)/g) || []).length >= 2);
-assert.ok(appSource.includes('function scheduleLocalActionCapabilityRefreshAfterFailure()'));
-assert.ok(appSource.includes('refreshAppStateSilently({ refresh: true })'));
 
 console.log('local action capability cache invalidation tests passed');

@@ -1,0 +1,502 @@
+/* ==========================================================================
+   设置页(#/settings)
+   只放页面级样式;设计变量与通用组件见 app.css。
+   ========================================================================== */
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 20px;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  align-items: start;
+}
+
+/* 左侧分区导航 */
+.settings-nav {
+  position: sticky;
+  top: 0;
+  padding: 8px;
+  display: grid;
+  gap: 2px;
+}
+
+.settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-secondary);
+  font-size: 13.5px;
+  font-weight: 500;
+  text-align: left;
+  transition: background var(--transition), color var(--transition);
+}
+
+.settings-nav-item:hover { background: var(--bg-hover); color: var(--fg); }
+
+.settings-nav-item.active {
+  background: var(--bg-active);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.settings-nav-badge {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex: 0 0 auto;
+}
+
+/* 右侧内容 */
+.settings-main {
+  display: grid;
+  gap: 14px;
+}
+
+.settings-main,
+.settings-section,
+.settings-card,
+.settings-rule-list,
+.settings-rule {
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.settings-page-title {
+  font-size: 20px;
+  line-height: 1.3;
+}
+
+.settings-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.settings-notice .alert-text { flex: 1; min-width: 200px; }
+
+.settings-section { display: grid; gap: 14px; }
+
+.settings-section-head {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-section-title { font-size: 16px; }
+
+.settings-card { display: grid; gap: 14px; }
+
+.settings-card > .card-title { margin-bottom: 0; }
+
+.settings-subtitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-secondary);
+}
+
+/* 表单网格 */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px 16px;
+}
+
+.settings-field { min-width: 0; }
+
+.settings-field-span { grid-column: 1 / -1; }
+
+.settings-hint {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+
+.settings-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.settings-inline .input,
+.settings-inline .select { width: auto; flex: 1; min-width: 140px; }
+
+.settings-inline .input.settings-input-narrow { flex: 0 0 110px; min-width: 0; }
+
+/* 开关行(复用 checkbox + 文案) */
+.settings-check {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.settings-check input {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+.settings-check-list { display: grid; gap: 8px; }
+
+/* 状态行 */
+.settings-status {
+  min-height: 18px;
+  max-height: min(32vh, 160px);
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  overscroll-behavior: contain;
+}
+
+.settings-status.ok { color: var(--accent-text); }
+.settings-status.warn { color: var(--warn-text); }
+.settings-status.err { color: var(--danger-text); }
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.settings-actions .settings-status { flex: 1; min-width: 180px; }
+
+/* 高级折叠 */
+.settings-advanced {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+
+.settings-advanced > summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-secondary);
+  user-select: none;
+}
+
+.settings-advanced > summary:hover { color: var(--fg); }
+
+.settings-advanced[open] > summary { margin-bottom: 12px; }
+
+/* API Key 输入组 */
+.settings-secret-wrap {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.settings-secret-wrap .input { flex: 1; min-width: 0; }
+
+/* 模型测试结果 */
+.settings-test-results { display: grid; gap: 8px; }
+
+.settings-test-model {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.settings-test-model-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.settings-cap-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.settings-cap {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  border: 1px solid var(--border);
+  color: var(--fg-secondary);
+}
+
+.settings-cap.ok { border-color: rgba(7, 193, 96, 0.45); color: var(--accent-text); background: var(--accent-soft); }
+.settings-cap.fail { border-color: rgba(227, 77, 89, 0.4); color: var(--danger-text); background: var(--danger-soft); }
+
+/* 白名单 / 每群规则 */
+.settings-picker {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.settings-picker-list {
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+}
+
+.settings-rule-list { display: grid; gap: 8px; }
+
+.settings-rule {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.settings-rule-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-rule-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-rule-fields {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.settings-rule-fields .settings-field { flex: 1; min-width: 180px; }
+
+.settings-rule-fields .settings-field.settings-field-min { flex: 0 0 170px; min-width: 0; }
+
+/* 时长控件:数值 + 单位 */
+.settings-duration {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-duration .input { flex: 1; min-width: 0; }
+.settings-duration .select { flex: 0 0 92px; }
+
+/* 调度状态 */
+.settings-scheduler-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px 16px;
+}
+
+.settings-kv { display: grid; gap: 2px; min-width: 0; }
+
+.settings-kv-k {
+  font-size: 11.5px;
+  color: var(--fg-muted);
+}
+
+.settings-kv-v {
+  font-size: 13px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-progress {
+  display: grid;
+  gap: 6px;
+}
+
+.settings-progress-text {
+  font-size: 12.5px;
+  color: var(--fg-secondary);
+}
+
+/* 检查清单(本机状态) */
+.settings-checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.settings-check-item {
+  display: flex;
+  min-width: 0;
+  overflow-x: hidden;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.settings-check-icon {
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 1px;
+}
+
+.settings-check-icon.ok { background: var(--accent-soft); color: var(--accent-text); }
+.settings-check-icon.pending { background: var(--warn-soft); color: var(--warn-text); }
+.settings-check-icon.na { background: var(--bg-sunken); color: var(--fg-muted); }
+
+.settings-check-body { flex: 1; min-width: 0; display: grid; gap: 3px; }
+
+.settings-check-title,
+.settings-check-meta {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.settings-check-title { font-size: 13px; font-weight: 600; }
+
+.settings-check-meta { font-size: 12px; color: var(--fg-muted); line-height: 1.55; }
+
+/* 能力徽章 */
+.settings-capability-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 日志面板 */
+.settings-log {
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--bg-sunken);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  display: grid;
+  gap: 2px;
+}
+
+.settings-log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.settings-log-line[data-level="warn"] { color: var(--warn-text); }
+.settings-log-line[data-level="error"] { color: var(--danger-text); }
+
+/* 手动密钥 */
+.settings-key-state {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-key-input {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  border: 1px solid var(--control-border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.settings-key-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.settings-validation {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+  overflow-x: hidden;
+}
+
+.settings-validation .settings-progress-text {
+  min-width: 0;
+  max-height: min(24vh, 120px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overscroll-behavior: contain;
+}
+
+/* 关于 */
+.settings-about-list {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+/* 窄屏:导航收到顶部横排 */
+@media (max-width: 900px) {
+  .settings-layout { grid-template-columns: minmax(0, 1fr); }
+
+  .settings-nav {
+    position: static;
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    scroll-padding-inline: 8px;
+    gap: 4px;
+  }
+
+  .settings-nav::-webkit-scrollbar { display: none; }
+
+  .settings-nav-item { flex: 0 0 auto; }
+}

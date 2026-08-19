@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createSharedRequestLease } from '../src/web/public/js/shared-request-lease.js';
+import { createSharedRequestLease } from '../src/web/public/js/shared/shared-request-lease.js';
 
 function deferred() {
   let resolve;

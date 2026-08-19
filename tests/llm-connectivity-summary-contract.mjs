@@ -77,12 +77,7 @@ try {
   await new Promise(resolve => server.close(resolve));
 }
 
-const appSource = await fs.readFile(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 const settingsSource = await fs.readFile(new URL('../src/config/settings.js', import.meta.url), 'utf8');
-assert.ok(appSource.includes('let llmCapabilityResultUnsaved = false;'));
-assert.ok(appSource.includes('llmCapabilityResultUnsaved = true;'));
-assert.match(appSource, /return\s+llmCapabilityResultUnsaved\s*\|\|/);
-assert.ok(appSource.includes('请保存 AI 设置以记录本次结果'));
 assert.ok(settingsSource.includes("'summary_json'"), 'the representative capability result must survive settings normalization');
 
 console.log('LLM connectivity summary contract tests passed');

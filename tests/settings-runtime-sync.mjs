@@ -2,9 +2,26 @@ import assert from 'node:assert/strict';
 import {
   createLatestManualKeyRuntimeSync,
   createLatestSettingsRevisionProbe,
+  isStaleSettingsProbeResponse,
   mergeManualKeyRuntimeSettings,
   schedulerRuntimeRevisionFromPayload,
-} from '../src/web/public/js/settings-runtime-sync.js';
+} from '../src/web/public/js/shared/settings-runtime-sync.js';
+
+assert.equal(isStaleSettingsProbeResponse({
+  probe: { epoch: 4, baseRevision: 'settings-a' },
+  currentEpoch: 4,
+  responseRevision: 'settings-a',
+}), false, '同一代探测响应不是旧响应');
+assert.equal(isStaleSettingsProbeResponse({
+  probe: { epoch: 4, baseRevision: 'settings-a' },
+  currentEpoch: 5,
+  responseRevision: 'settings-a',
+}), true, '保存前已发出的同一旧 revision 必须丢弃');
+assert.equal(isStaleSettingsProbeResponse({
+  probe: { epoch: 4, baseRevision: 'settings-a' },
+  currentEpoch: 5,
+  responseRevision: 'settings-b',
+}), true, 'revision 是不可排序哈希，owner 换代后不同 revision 的旧响应也必须丢弃');
 
 assert.equal(schedulerRuntimeRevisionFromPayload({ scheduler_runtime_revision: 'runtime-top' }), 'runtime-top');
 assert.equal(schedulerRuntimeRevisionFromPayload({ settings: { scheduler_runtime_revision: 'runtime-settings' } }), 'runtime-settings');
@@ -119,6 +136,27 @@ assert.equal(live.scheduler_runtime_revision, 'runtime-e');
 
 sync.dispose();
 
+const runtimeApplyErrors = [];
+const runtimeApplyFailure = createLatestManualKeyRuntimeSync({
+  getCurrent: () => current,
+  fetchFresh: () => Promise.resolve({
+    ...freshRuntime,
+    scheduler_runtime_revision: 'runtime-apply-failure',
+  }),
+  applyMerged: () => {
+    throw new Error('synthetic runtime repaint failure');
+  },
+  onError: error => runtimeApplyErrors.push(error.message),
+});
+assert.equal(
+  await runtimeApplyFailure.request({ scheduler_runtime_revision: 'runtime-apply-failure' }),
+  false,
+  '运行时字段采用抛错时后台同步必须收敛为失败,不能把 rejected Promise 泄漏给生产调用方',
+);
+assert.deepEqual(runtimeApplyErrors, ['synthetic runtime repaint failure'],
+  '运行时字段采用异常必须交给受控错误回调');
+runtimeApplyFailure.dispose();
+
 const probeResponses = [];
 const probedRevisions = [];
 const revisionProbe = createLatestSettingsRevisionProbe({
@@ -147,5 +185,64 @@ assert.deepEqual(probedRevisions, ['settings-b', 'settings-c']);
 
 revisionProbe.dispose();
 assert.equal(await revisionProbe.request(), false, 'a disposed route probe must not start another request');
+
+const failedProbeResponses = [];
+const probeErrors = [];
+const recoveredProbeRevisions = [];
+const recoveringProbe = createLatestSettingsRevisionProbe({
+  fetchFresh: () => {
+    const response = deferred();
+    failedProbeResponses.push(response);
+    return response.promise;
+  },
+  applyFresh: snapshot => {
+    recoveredProbeRevisions.push(snapshot.settings_revision);
+  },
+  onError: error => {
+    probeErrors.push(error.message);
+  },
+});
+
+const recoveringRequest = recoveringProbe.request();
+assert.equal(recoveringProbe.request(), recoveringRequest, '失败前到达的第二次可见事件必须加入同一探测');
+failedProbeResponses[0].reject(new Error('synthetic probe failure'));
+await Promise.resolve();
+await Promise.resolve();
+assert.equal(failedProbeResponses.length, 2, '在途探测失败后必须兑现期间排队的最后一次探测');
+assert.deepEqual(probeErrors, ['synthetic probe failure'], '后台探测失败必须交给受控错误回调而不是形成未处理拒绝');
+failedProbeResponses[1].resolve({ settings_revision: 'settings-recovered' });
+assert.equal(await recoveringRequest, true, '排队探测成功后原请求必须正常收敛');
+assert.deepEqual(recoveredProbeRevisions, ['settings-recovered']);
+
+const standaloneFailure = recoveringProbe.request();
+failedProbeResponses[2].reject(new Error('standalone probe failure'));
+assert.equal(await standaloneFailure, false, '没有排队事件的后台探测失败必须受控返回 false');
+assert.deepEqual(probeErrors, ['synthetic probe failure', 'standalone probe failure']);
+recoveringProbe.dispose();
+
+// 账号上下文变化只应丢弃旧运行时响应,不能把旧账号的晚到字段合并到新页面。
+const staleRuntimeResponses = [];
+let staleRuntimeApplied = 0;
+const staleRuntimeSync = createLatestManualKeyRuntimeSync({
+  getCurrent: () => current,
+  fetchFresh: () => {
+    const response = deferred();
+    staleRuntimeResponses.push(response);
+    return response.promise;
+  },
+  applyMerged: () => { staleRuntimeApplied += 1; },
+});
+const staleRuntimeRequest = staleRuntimeSync.request({ scheduler_runtime_revision: 'runtime-stale-account' });
+assert.equal(staleRuntimeResponses.length, 1);
+staleRuntimeSync.invalidate();
+staleRuntimeResponses[0].resolve({
+  ...freshRuntime,
+  scheduler_runtime_revision: 'runtime-stale-account',
+});
+assert.equal(await staleRuntimeRequest, false,
+  '账号上下文失效后的旧运行时请求必须收敛为未采用');
+assert.equal(staleRuntimeApplied, 0,
+  '账号上下文失效后的旧运行时响应不得合并到当前设置');
+staleRuntimeSync.dispose();
 
 console.log('settings runtime sync contract passed');

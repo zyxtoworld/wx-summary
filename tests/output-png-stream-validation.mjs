@@ -160,8 +160,9 @@ async function main() {
     serverRenderSource.indexOf('async function readServerRenderOutput'),
     serverRenderSource.indexOf('function windowsPowerShellExecutablePath'),
   );
-  assert.ok(serverOutputSource.includes('await validatePngFileHandle(handle, serverRenderPngValidationOptions({ signal }));'));
-  assert.ok(serverOutputSource.indexOf('await validatePngFileHandle(handle, serverRenderPngValidationOptions({ signal }));') < serverOutputSource.indexOf('await readFileHandleBounded(handle, SERVER_RENDER_OUTPUT_MAX_PNG_BYTES, {'));
+  const validateServerPngCall = 'await validatePngFileHandle(handle, serverRenderPngValidationOptions({ signal, closeHandle }));';
+  assert.ok(serverOutputSource.includes(validateServerPngCall));
+  assert.ok(serverOutputSource.indexOf(validateServerPngCall) < serverOutputSource.indexOf('await readFileHandleBounded(handle, SERVER_RENDER_OUTPUT_MAX_PNG_BYTES, {'));
   assert.ok(!serverOutputSource.includes('validateServerRenderPngBuffer(buffer)'));
 
   console.log('output PNG streaming validation tests passed');

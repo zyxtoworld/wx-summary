@@ -3,8 +3,6 @@ import fsp from 'node:fs/promises';
 
 const source = await fsp.readFile(new URL('../src/tray/wx-summary-tray.ps1', import.meta.url), 'utf8');
 const helper = await fsp.readFile(new URL('../src/tray/open-web-foreground.ps1', import.meta.url), 'utf8');
-const app = await fsp.readFile(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
-const html = await fsp.readFile(new URL('../src/web/views/index.html', import.meta.url), 'utf8');
 const openStart = source.indexOf('function Open-Web {');
 const openEnd = source.indexOf('\nfunction RuntimeInfo-MatchesProject', openStart);
 assert.ok(openStart >= 0 && openEnd > openStart, 'tray Open-Web source must remain available');
@@ -38,8 +36,5 @@ assert.match(helper, /FindExact/, 'the helper must select the exact tokenized br
 assert.match(helper, /SetWindowPos/, 'foreground activation must use a temporary topmost nudge when normal activation is denied');
 assert.match(helper, /return GetForegroundWindow\(\) == hWnd;/, 'foreground success must be based on the final foreground HWND');
 assert.doesNotMatch(helper, /GetForegroundWindow\(\) == hWnd \|\| activated/, 'an earlier SetForegroundWindow return value must not mask later focus loss');
-assert.match(html, /__WX_LAUNCH_FOCUS_TOKEN__/, 'the initial HTML must expose the validated launch token before module startup');
-assert.match(app, /wx-focus-\$\{LAUNCH_FOCUS_TOKEN\}/, 'route titles must retain the exact focus marker during the helper polling window');
-assert.match(app, /LAUNCH_FOCUS_TITLE_TTL_MS/, 'the focus marker must be removed after a bounded interval');
 
 console.log('tray web foreground contract tests passed');

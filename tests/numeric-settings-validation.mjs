@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-const { parseStrictIntegerInput } = await import('../src/web/public/js/numeric-input.js');
+const { parseStrictIntegerInput } = await import('../src/web/public/js/shared/numeric-input.js');
 const { loadSettings, saveSettingsPatch } = await import('../src/config/settings.js');
 
 assert.deepEqual(parseStrictIntegerInput('1e2', { min: 1, max: 8 }), { ok: false, raw: '1e2', reason: 'format' });

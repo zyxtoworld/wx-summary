@@ -145,11 +145,14 @@ outputs/.tmp/             # 临时文件与脱敏日志
 ```bash
 node tests/ai-web-search-compatibility.mjs
 node tests/llm-connectivity-summary-contract.mjs
+node tests/web-frontend-mount.mjs
 node tests/acceptance/static-checks.mjs
 git diff --check
 ```
 
 改动托盘、项目副本、输出校验或设置持久化时，应一并运行对应的 `tests/*.mjs` 专项测试。
+
+前端代码位于 `src/web/`：原生 ES module、零构建步骤，约定见 [src/web/AGENTS.md](src/web/AGENTS.md)。
 
 ## 文档
 

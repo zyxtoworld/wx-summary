@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 
 const traySource = await fsp.readFile(new URL('../src/tray/wx-summary-tray.ps1', import.meta.url), 'utf8');
-const mainStart = traySource.indexOf('try {\n  $createdMutex');
+const mutexCreate = traySource.indexOf('$createdMutex = $false');
+const mainStart = traySource.lastIndexOf('try {', mutexCreate);
 const launcherStart = traySource.indexOf('$launcherProcess = Start-VersionAwareServerLauncher $node', mainStart);
 const ownershipGate = traySource.indexOf('if (-not $createdMutex) {', mainStart);
 const sourceChangeHandoff = traySource.indexOf('Request-ExistingTraySourceChangeShutdown', ownershipGate);

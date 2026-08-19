@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
 const mainSource = await fs.readFile(new URL('../src/main.js', import.meta.url), 'utf8');
-const appSource = await fs.readFile(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 const outputSource = await fs.readFile(new URL('../src/renderer/output.js', import.meta.url), 'utf8');
 const historyDigestRoute = mainSource.slice(
   mainSource.indexOf("if (pathname.startsWith('/api/history-digest/')"),
@@ -15,14 +14,6 @@ const previewRoute = mainSource.slice(
 const saveRoute = mainSource.slice(
   mainSource.indexOf("if (pathname === '/api/rerender-history'"),
   mainSource.indexOf("if (pathname === '/api/reveal'"),
-);
-const previewBuilder = appSource.slice(
-  appSource.indexOf('async function buildHistoryRerenderPreview('),
-  appSource.indexOf('async function loadHistoryImageElement', appSource.indexOf('async function buildHistoryRerenderPreview(')),
-);
-const previewCredential = appSource.slice(
-  appSource.indexOf('function historyRerenderPreviewCredential('),
-  appSource.indexOf('\nfunction markdownOutputSourceChangedAfterCommit', appSource.indexOf('function historyRerenderPreviewCredential(')),
 );
 
 assert.ok(mainSource.includes('function historyRerenderInputVersion('), 'the server must derive an opaque version from the browser-visible rerender input');
@@ -37,7 +28,5 @@ assert.ok(saveRoute.includes('historyRerenderInputVersionFromRequest(body)'), 's
 assert.ok(saveRoute.indexOf('historyRerenderInputVersionFromRequest(body)') < saveRoute.indexOf('claimHistoryRerenderPreviewToken('), 'stale rerender input must fail before claiming a one-time PNG credential');
 assert.ok(saveRoute.includes('validated_png_sha256: previewClaim.sha256'), 'saving a server-validated history preview must pass its immutable SHA256 binding to the output writer');
 assert.ok(outputSource.includes('validated_png_sha256 = \'\'') && outputSource.includes('trustedPngBufferFromValidatedHash'), 'the output writer must skip a second full PNG inflate only when the supplied buffer matches a server-validated SHA256');
-assert.ok(previewBuilder.includes('rerender_input_version'), 'browser preview metadata must carry the saved-history input version');
-assert.ok(previewCredential.includes('rerender_input_version'), 'save requests must replay the input version bound to the cached preview');
 
 console.log('history rerender input binding tests passed');

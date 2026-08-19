@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 
-const source = await fsp.readFile(new URL('../src/daemon/scheduler.js', import.meta.url), 'utf8');
+const source = (await fsp.readFile(new URL('../src/daemon/scheduler.js', import.meta.url), 'utf8'))
+  .replace(/\r\n/g, '\n');
 const executeStart = source.indexOf('async function executeSchedulerTick(');
 const executeEnd = source.indexOf('\nfunction schedulerCollectionRecheckMeta(', executeStart);
 const executeSource = source.slice(executeStart, executeEnd);

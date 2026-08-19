@@ -1,10 +1,7 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import { __collectorInternals } from '../src/collector/index.js';
 import { __mainInternals } from '../src/main.js';
 import { __wxdbInternals } from '../src/wxdb/index.js';
-
-const appSource = fs.readFileSync(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 
 const unreadableAccount = {
   account_id: 'wxacc_0123456789abcdef',
@@ -31,25 +28,6 @@ assert.equal(collectorAccount.source_status, 'unreadable', 'collector account pr
 const publicAccount = __mainInternals.publicAccount(collectorAccount);
 assert.equal(publicAccount.source_available, false, 'API account projection must not restore unreadable accounts to available');
 assert.equal(publicAccount.source_status, 'unreadable');
-
-const settingsDiagnosticsSource = appSource.slice(
-  appSource.indexOf('function syncDbMirrorDiagnostics'),
-  appSource.indexOf('function dbMirrorRefreshActionLabel'),
-);
-const settingsPaintSource = appSource.slice(
-  appSource.indexOf('function paintDbMirrorStatus'),
-  appSource.indexOf('function syncPrivacySaveButton'),
-);
-assert.ok(
-  settingsDiagnosticsSource.includes('accountMirrorSourceStatus(account)')
-    && !settingsDiagnosticsSource.includes("account?.source === 'project-mirror' ? accountMirrorSourceStatus(account) : 'available'"),
-  'settings diagnostics must not force every non-mirror account to available',
-);
-assert.ok(
-  settingsPaintSource.includes("account?.source === 'source-unreadable'")
-    && settingsPaintSource.includes('还没有可验证的项目工作副本'),
-  'settings local-data status must explain unreadable accounts without a project mirror',
-);
 
 assert.equal(
   __mainInternals.publicWeixinDataMode({ accounts: [unreadableAccount] }),

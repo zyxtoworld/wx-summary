@@ -151,17 +151,43 @@ export async function readLogFileTail(file = targetFile, maxLines = 200, { signa
   if (!stat?.size) return [];
   const bytesToRead = Math.min(stat.size, Math.max(8192, Math.min(LOG_TAIL_MAX_BYTES, lineLimit * 2048)));
   let handle = null;
+  let handleClosePromise = null;
+  const closeHandle = () => {
+    if (!handle) return Promise.resolve();
+    if (!handleClosePromise) {
+      handleClosePromise = Promise.resolve()
+        .then(() => handle.close())
+        .catch(() => {});
+    }
+    return handleClosePromise;
+  };
   let text = '';
   try {
     handle = await fsp.open(logFile, 'r').catch(() => null);
     throwIfLogReadAborted(signal);
     if (!handle) return [];
-    const buffer = Buffer.alloc(bytesToRead);
-    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, stat.size - bytesToRead);
-    throwIfLogReadAborted(signal);
-    text = buffer.subarray(0, bytesRead).toString('utf-8');
+    const onAbort = () => { void closeHandle(); };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    try {
+      throwIfLogReadAborted(signal);
+      const buffer = Buffer.alloc(bytesToRead);
+      const { bytesRead } = await handle.read(buffer, 0, bytesToRead, stat.size - bytesToRead);
+      throwIfLogReadAborted(signal);
+      text = buffer.subarray(0, bytesRead).toString('utf-8');
+    } catch (error) {
+      if (signal?.aborted) throwIfLogReadAborted(signal);
+      throw error;
+    } finally {
+      try {
+        await closeHandle();
+        throwIfLogReadAborted(signal);
+      } finally {
+        signal?.removeEventListener?.('abort', onAbort);
+      }
+    }
   } finally {
-    if (handle) await handle.close().catch(() => {});
+    await closeHandle();
+    throwIfLogReadAborted(signal);
   }
   if (stat.size > bytesToRead) text = text.replace(/^[^\r\n]*(?:\r?\n|$)/, '');
   return text.split(/\r?\n/).filter(Boolean).slice(-lineLimit);

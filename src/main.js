@@ -15,19 +15,24 @@ import { DATA_DIR, PROJECT_ROOT, PUBLIC_DIR, TMP_DIR, VIEWS_DIR, assertRealOutpu
 import { configureLogger, logError, logInfo, logWarn, readLogFileTail, readLogTail, waitForLoggerWritesToSettle } from './lib/logger.js';
 import { PRIVATE_FILE_MODE, readJson, writeJsonAtomic } from './lib/json-store.js';
 import { preserveInvalidFileBackup } from './lib/invalid-backup.js';
+import {
+  createHistoryDeleteEvidence,
+  resolveHistoryDeleteEvidence,
+} from './lib/history-delete-evidence.js';
+import { isLoopbackPortUnavailableError } from './lib/loopback-listen.js';
 import { listModels, redactContent, redactStructuredValue, sanitizeText, summarizeDigest, testLlmConnectivity } from './summarizer/llm.js';
 import { HISTORY_RERENDER_SOURCE_MAX_BYTES, OUTPUT_FILE_EXPECTED_MISSING_VERSION, assertExpectedOutputFileVersion, assertRevealable, assertRevealableTarget, bindPreviewMarkdownSourceMetadata, cleanupOldDigests, copyHistoryDigestPngToCurrentOutput, deleteHistoryItem, digestSearchTextForHistory, digestSemanticRevision, findHistoryItem, findHistoryItemWithStatus, historyItemKeyForItem, inspectOutputFileVersion, listHistory, openOutputFileHandleForStableRead, outputFileVersion, outputFileVersionMatches, overwriteRenderedPng, readHistoryDigestResult, readOutputFileBuffer, restoreHistoryDigestToCurrentOutput, savePreviewMarkdown, saveRenderedPng, schedulePendingHistoryRecovery, waitForHistoryWorkToSettle, waitForHistoryWritesToSettle, waitForPendingHistoryRecovery } from './renderer/output.js';
 import { RENDERED_PNG_MAX_BYTES, RENDERED_PNG_MAX_RGBA_BYTES, RENDERED_PNG_MAX_SIDE, validatePngFile } from './renderer/png-validate.js';
 import { cancelServerRenderWork, waitForServerRenderWorkToSettle } from './renderer/server-png.js';
 import { cancelThumbnailRenderWork, readDigestThumbnailPngBuffer, renderDigestThumbnailPng, waitForThumbnailRenderWorkToSettle } from './renderer/thumbnail.js';
-import { terminateWindowsProcessTree } from './renderer/windows-process-tree.js';
-import * as DigestView from './web/public/js/digest-view-model.js';
+import { terminateWindowsProcessTree } from './lib/windows-process-tree.js';
+import * as DigestView from './web/public/js/shared/digest-view-model.js';
 import { clearGroupCursor, getCursorRecoveryInfo, revalidateCursorStore } from './store/cursors.js';
 import { probeWxKey } from './wxkey/index.js';
 import { readDbInventory } from './wxdb/index.js';
 import { activeWxDbIsolatedWorkerStatus, clearWxDbIsolatedIdentityEvidenceCache, closeWxDbIsolatedWorkerAdmission, extractSelfWxidFromProjectCopyIsolated as extractSelfWxidFromProjectCopy, hydrateWxDbIsolatedIdentityEvidenceCache, probeWxDbIsolated as probeWxDb, releaseAllWxDbIsolatedBatchSessions, releaseWxDbIsolatedBatchSession, setWxDbIsolatedIdentityChangeListener } from './wxdb/isolated.js';
 import { probeMediaTools } from './wxdb/wxgf.js';
-import { toWellFormedText } from './web/public/js/unicode-text.js';
+import { toWellFormedText } from './web/public/js/shared/unicode-text.js';
 import { activeWxDbMirrorTaskStatus, closeWxDbMirrorTaskAdmission, cleanupStaleWxDbMirrorWorkDirsTracked, discoverWxAccounts, ensureWxDbMirror, getWeixinBinaryEvidence, getWeixinModuleEvidence, isWxDbMirrorIdentityVerified, pickAccount, processStartIdentity, setWxDbMirrorIdentityChangeListener, setWxDbMirrorRefreshListener, waitForActiveWxDbMirrorTasksToSettle, withWxDbMirrorReadLock, wxDbMirrorScopeRecordsForRead } from './wxenv/discovery.js';
 
 const BOOTSTRAP_TOKEN_FILE = path.join(DATA_DIR, 'bootstrap-token.json');
@@ -166,6 +171,7 @@ const PENDING_MANUAL_KEY_VALIDATION_TTL_MS = 10 * 60 * 1000;
 const MAX_PENDING_MANUAL_KEY_VALIDATIONS = 16;
 const SERVER_AUTHORITATIVE_ACCOUNT_CONTEXT = Symbol('server_authoritative_account_context');
 let WXDB_IDENTITY_CHANGE_GENERATION = 0;
+const WXDB_IDENTITY_CHANGE_GENERATIONS = new Map();
 
 async function clearKeyCachesAfterWxDbMirrorRefresh(mirror = null, reason = 'wxdb_mirror_refreshed') {
   if (!mirror?.refreshed) return;
@@ -195,8 +201,8 @@ async function clearKeyCachesAfterWxDbMirrorRefresh(mirror = null, reason = 'wxd
 }
 
 setWxDbMirrorRefreshListener(async ({ mirror = null } = {}) => {
-  clearGroupListResultCache();
-  clearDigestGroupContexts();
+  clearGroupListResultCacheForAccount(mirror?.account_id);
+  clearDigestGroupContextsForAccount(mirror?.account_id);
   const preservesRuntimeState = mirrorRefreshPreservesDbKeyRuntimeState(mirror);
   const clearedPendingValidations = preservesRuntimeState
     ? 0
@@ -218,9 +224,9 @@ async function handleWxDbMirrorIdentityChanged({ storage_id = '', previous_ident
   const storageId = String(storage_id || '').trim();
   if (!storageId) return;
   const aliases = [storageId, previous_identity_id, identity_id].map(value => String(value || '').trim()).filter(Boolean);
-  const invalidatedDigestState = invalidateDigestStateAfterWxDbIdentityChange();
-  clearGroupListResultCache();
-  clearDigestGroupContexts();
+  const invalidatedDigestState = invalidateDigestStateAfterWxDbIdentityChange(storageId);
+  clearGroupListResultCacheForAccount(storageId);
+  clearDigestGroupContextsForAccount(storageId);
   const clearedPendingValidations = clearPendingManualKeyValidationsForAccount({
     account_id: storageId,
     account_aliases: aliases,
@@ -389,6 +395,15 @@ exit 1
 const WINDOWS_DEFERRED_FOREGROUND_NUDGE_SCRIPT_B64 = Buffer.from(WINDOWS_DEFERRED_FOREGROUND_NUDGE_SCRIPT, 'utf16le').toString('base64');
 const DIGEST_SSE_HEARTBEAT_MS = 2500;
 const DIGEST_SSE_DISCONNECT_GRACE_MS = 45_000;
+
+function digestSseRecoveryDeadlineAt(sseDisconnectedAt = 0, observedRecoveryAt = 0, graceMs = DIGEST_SSE_DISCONNECT_GRACE_MS) {
+  const disconnectedAt = Number(sseDisconnectedAt) || 0;
+  const recoveryAt = Number(observedRecoveryAt) || 0;
+  const grace = Number.isFinite(Number(graceMs))
+    ? Math.max(0, Number(graceMs))
+    : DIGEST_SSE_DISCONNECT_GRACE_MS;
+  return Math.max(disconnectedAt, recoveryAt) + grace;
+}
 const DIGEST_BATCH_RECOVERY_TTL_MS = 2 * 60 * 60 * 1000;
 const DIGEST_BATCH_SETTINGS_TTL_MS = DIGEST_BATCH_RECOVERY_TTL_MS;
 const MAX_DIGEST_BATCH_GROUPS = 200;
@@ -829,7 +844,10 @@ async function runDiagnosticProbe(label, timeoutMs, outerSignal, action) {
   let timedOut = false;
   let outerSettled = null;
   const actionPromise = Promise.resolve()
-    .then(() => action(controller.signal))
+    .then(() => {
+      throwIfRequestSignalAborted(controller.signal, `${label}已取消。`);
+      return action(controller.signal);
+    })
     .then(value => ({ kind: 'value', value }), error => ({ kind: 'error', error }));
   const timeoutPromise = new Promise(resolve => {
     timer = setTimeout(() => {
@@ -1585,13 +1603,19 @@ async function authoritativeAccountContextForRequest({
   };
 }
 
-function wxDbIdentityChangeGeneration() {
+function identityChangeAccountKey(accountId = '') {
+  return String(accountId || '').trim().toLowerCase();
+}
+
+function wxDbIdentityChangeGeneration(accountId = '') {
+  const cleanAccountId = identityChangeAccountKey(accountId);
+  if (cleanAccountId) return Math.max(0, Number(WXDB_IDENTITY_CHANGE_GENERATIONS.get(cleanAccountId) || 0) || 0);
   return Math.max(0, Number(WXDB_IDENTITY_CHANGE_GENERATION || 0) || 0);
 }
 
-function assertWxDbIdentityGenerationCurrent(expectedGeneration, actionLabel = '摘要操作') {
+function assertWxDbIdentityGenerationCurrent(expectedGeneration, actionLabel = '摘要操作', accountId = '') {
   const expected = Math.max(0, Number(expectedGeneration || 0) || 0);
-  const current = wxDbIdentityChangeGeneration();
+  const current = wxDbIdentityChangeGeneration(accountId);
   if (expected === current) return current;
   throw requestValidationError(
     `${actionLabel}期间当前微信账号对应的本地数据身份已变化；已停止继续，避免把旧账号结果带入当前页面或输出目录。请刷新账号列表后重新生成。`,
@@ -1629,7 +1653,7 @@ async function assertDigestSaveTicketAccountContextCurrent(ticket = {}, { signal
     accountId: ticket?.account_id,
     accountFingerprint: ticket?.account_fingerprint,
   }, '保存长图');
-  const identityGeneration = wxDbIdentityChangeGeneration();
+  const identityGeneration = wxDbIdentityChangeGeneration(binding.account_id);
   const context = await authoritativeAccountContextForRequest({
     accountId: binding.account_id,
     expectedFingerprint: binding.account_fingerprint,
@@ -1637,7 +1661,7 @@ async function assertDigestSaveTicketAccountContextCurrent(ticket = {}, { signal
     signal,
   });
   throwIfRequestSignalAborted(signal, '保存长图已取消。');
-  assertWxDbIdentityGenerationCurrent(identityGeneration, '保存长图前复核账号');
+  assertWxDbIdentityGenerationCurrent(identityGeneration, '保存长图前复核账号', binding.account_id);
   return { ...context, identity_generation: identityGeneration };
 }
 
@@ -1927,7 +1951,7 @@ async function instanceLockOwnerMayBeReclaimed(lockInfo = null, options = {}) {
 
 function liveInstanceLockOwnerError(lockInfo = null) {
   const pid = Number(lockInfo?.pid || 0) || 0;
-  return Object.assign(new Error(`检测到持有单实例锁的旧服务进程仍在运行${pid > 0 ? `（PID ${pid}）` : ''}，但健康检查无响应。为避免两个进程同时写入本地数据，已拒绝启动。请等待旧服务恢复，或在任务管理器确认并结束该进程后重试。`), {
+  return Object.assign(new Error(`检测到持有单实例锁的已有服务进程仍在运行${pid > 0 ? `（PID ${pid}）` : ''}，但健康检查无响应。为避免两个进程同时写入本地数据，已拒绝启动。请等待该服务恢复，或在任务管理器确认并结束该进程后重试。`), {
     status: 423,
     code: 'existing_instance_unresponsive',
   });
@@ -2107,14 +2131,14 @@ async function handleExistingRuntime(info, settings, { sourceAssetVersion = '', 
       running_asset_version: runningAssetVersion || 'unknown',
       source_asset_version: currentSourceAssetVersion,
     });
-    console.log('检测到本地代码已更新，正在关闭旧服务并启动新版本...');
+    console.log('检测到本地代码已更新，正在关闭当前服务并启动新实例...');
     const { shutdownAccepted, exited } = await stopExistingRuntimeForSourceChange(info);
     if (exited) {
       logInfo('existing_instance_stopped_for_source_change', { port: info.port, source });
       return 'stopped';
     }
     logWarn('existing_instance_restart_failed', { port: info.port, source, shutdown_accepted: shutdownAccepted });
-    throw Object.assign(new Error(`旧服务未能自动退出，不能继续假装已加载新版本。请关闭旧服务后重新启动：${info.url}`), {
+    throw Object.assign(new Error(`当前服务未能自动退出，无法确认代码已重新加载。请关闭当前服务后重新启动：${info.url}`), {
       status: 503,
       code: 'existing_instance_restart_failed',
     });
@@ -2132,7 +2156,7 @@ async function handleExistingRuntimeInfo(info, settings, options = {}) {
   if (health.shutting_down === true) {
     const exited = await waitForExistingRuntimeExit(info, existingRuntimeShutdownWaitMs(info, health));
     if (exited) return 'stopped';
-    throw Object.assign(new Error('旧服务仍在安全关闭中，且超过了它公布的截止时间。为避免两个进程同时写入本地数据，已拒绝启动；请稍后重试。'), {
+    throw Object.assign(new Error('该进程仍在安全关闭中，且超过了它公布的截止时间。为避免两个进程同时写入本地数据，已拒绝启动；请稍后重试。'), {
       status: 503,
       code: 'existing_instance_shutdown_timeout',
     });
@@ -3001,15 +3025,25 @@ function digestTerminalResultSummariesForBatch({ batchId = '', ownerHash = '', a
   return items.sort((left, right) => left.batch_index - right.batch_index);
 }
 
-function activeDigestRequestForTerminalResult({ batchId = '', batchIndex = -1, accountId = '', groupId = '' } = {}) {
+function activeDigestRequestForTerminalResult({
+  batchId = '',
+  batchIndex = -1,
+  accountId = '',
+  accountFingerprint = '',
+  groupId = '',
+  requests = ACTIVE_DIGEST_REQUESTS,
+} = {}) {
   const id = normalizeDigestBatchId(batchId);
   const index = digestBatchPreviewIndex(batchIndex);
   const cleanAccountId = String(accountId || '').trim();
+  const cleanAccountFingerprint = normalizeExpectedAccountFingerprint(accountFingerprint);
   const cleanGroupId = String(groupId || '').trim();
   if (!id || index < 0) return null;
-  for (const item of ACTIVE_DIGEST_REQUESTS.values()) {
+  for (const item of requests?.values?.() || []) {
     if (item?.batch_id !== id || digestBatchPreviewIndex(item?.batch_index) !== index) continue;
     if (cleanAccountId && item?.account_id && String(item.account_id) !== cleanAccountId) continue;
+    if (cleanAccountFingerprint
+      && normalizeExpectedAccountFingerprint(item?.account_fingerprint) !== cleanAccountFingerprint) continue;
     if (cleanGroupId && item?.group_id && String(item.group_id) !== cleanGroupId) continue;
     return item;
   }
@@ -3078,6 +3112,7 @@ function digestBatchPreviewRecoveryPayload(item = {}, batchId = '') {
     done: digests.length,
     complete: item.total_confirmed !== false && total > 0 && digests.length === total,
     digests,
+    ...digestTerminalRecoveryStatusPayload(item),
   };
 }
 
@@ -3175,6 +3210,9 @@ function recoverDigestBatchPreviewFromTerminalResults(batchId, ownerHash = '', {
     total,
     total_confirmed: !!(storedTotal || cleanExpectedTotal),
     digests,
+    ...(terminals.some(item => item?.recovery_persisted === false)
+      ? { recovery_persisted: false }
+      : {}),
   };
   DIGEST_BATCH_PREVIEWS.set(id, restored);
   cleanupDigestBatchPreviews();
@@ -3557,8 +3595,37 @@ function assertDigestWorkAdmissionOpen() {
   if (DIGEST_WORK_ADMISSION_CLOSED) throw digestWorkShutdownError();
 }
 
-function cancelActiveDigestWork(reason = 'settings_changed', message = '设置已变更，当前任务已取消。', { preserveTerminalResults = false } = {}) {
+function digestBatchAccountId(batchId = '') {
+  const id = normalizeDigestBatchId(batchId);
+  const accountId = id ? DIGEST_BATCH_SETTINGS.get(id)?.account_context?.account_id : '';
+  return identityChangeAccountKey(accountId);
+}
+
+function digestBatchBelongsToAccount(batchId = '', accountId = '') {
+  const cleanAccountId = identityChangeAccountKey(accountId);
+  if (!cleanAccountId) return true;
+  const batchAccountId = digestBatchAccountId(batchId);
+  if (batchAccountId) return batchAccountId === cleanAccountId;
+  for (const item of [...ACTIVE_DIGEST_REQUESTS.values(), ...ACTIVE_DIGEST_SAVES.values()]) {
+    if (normalizeDigestBatchId(item?.batch_id) !== normalizeDigestBatchId(batchId)) continue;
+    const itemAccountId = identityChangeAccountKey(item?.account_id);
+    if (itemAccountId) return itemAccountId === cleanAccountId;
+  }
+  return false;
+}
+
+function digestWorkItemBelongsToAccount(item = {}, accountId = '') {
+  const cleanAccountId = identityChangeAccountKey(accountId);
+  if (!cleanAccountId) return true;
+  const itemAccountId = identityChangeAccountKey(item?.account_id);
+  return itemAccountId
+    ? itemAccountId === cleanAccountId
+    : digestBatchBelongsToAccount(item?.batch_id, cleanAccountId);
+}
+
+function cancelActiveDigestWork(reason = 'settings_changed', message = '设置已变更，当前任务已取消。', { preserveTerminalResults = false, accountId = '' } = {}) {
   const cleanReason = sanitizeText(reason || 'settings_changed').slice(0, 120);
+  const cleanAccountId = identityChangeAccountKey(accountId);
   const batches = new Set();
   let requests = 0;
   let saves = 0;
@@ -3567,6 +3634,7 @@ function cancelActiveDigestWork(reason = 'settings_changed', message = '设置�
   let aborted = 0;
   const visit = (items, kind) => {
     for (const item of items.values()) {
+      if (!digestWorkItemBelongsToAccount(item, cleanAccountId)) continue;
       const batchId = normalizeDigestBatchId(item?.batch_id);
       if (batchId) batches.add(batchId);
       item.abort_reason = cleanReason;
@@ -3584,6 +3652,7 @@ function cancelActiveDigestWork(reason = 'settings_changed', message = '设置�
   for (const batchId of activeBatchStarts) {
     const id = normalizeDigestBatchId(batchId);
     if (!id) continue;
+    if (!digestBatchBelongsToAccount(id, cleanAccountId)) continue;
     batches.add(id);
     starts += 1;
     const controller = ACTIVE_DIGEST_BATCH_START_CONTROLLERS.get(id);
@@ -3591,11 +3660,14 @@ function cancelActiveDigestWork(reason = 'settings_changed', message = '设置�
   }
   cleanupActiveDigestBatchLeases();
   for (const batchId of ACTIVE_DIGEST_BATCH_LEASES.keys()) {
+    if (!digestBatchBelongsToAccount(batchId, cleanAccountId)) continue;
     batches.add(batchId);
     leases += 1;
   }
   for (const batchId of batches) markDigestBatchCancelled(batchId, cleanReason, { preserveTerminalResults });
-  const cachedBatchSettings = clearDigestBatchSettings(cleanReason, { preserveTerminalResults });
+  const cachedBatchSettings = cleanAccountId
+    ? clearDigestBatchSettingsForAccount(cleanAccountId, cleanReason, { preserveTerminalResults })
+    : clearDigestBatchSettings(cleanReason, { preserveTerminalResults });
   return { requests, saves, starts, leases, batches: batches.size, aborted, cached_batch_settings: cachedBatchSettings };
 }
 
@@ -3605,22 +3677,53 @@ function closeDigestWorkAdmission(reason = 'service_shutdown', message = '服务
   return cancelActiveDigestWork(reason, DIGEST_WORK_SHUTDOWN_MESSAGE, { preserveTerminalResults: true });
 }
 
-function invalidateDigestStateAfterWxDbIdentityChange() {
-  WXDB_IDENTITY_CHANGE_GENERATION = wxDbIdentityChangeGeneration() + 1;
+function invalidateDigestStateAfterWxDbIdentityChange(accountId = '') {
+  const cleanAccountId = identityChangeAccountKey(accountId);
+  const message = '当前微信账号对应的本地数据身份已变化，旧账号摘要任务已取消；请刷新账号列表后重新生成。';
+  if (!cleanAccountId) {
+    WXDB_IDENTITY_CHANGE_GENERATION = wxDbIdentityChangeGeneration() + 1;
+  } else {
+    WXDB_IDENTITY_CHANGE_GENERATIONS.set(
+      cleanAccountId,
+      wxDbIdentityChangeGeneration(cleanAccountId) + 1,
+    );
+  }
   const cancelled = cancelActiveDigestWork(
     'wxdb_identity_changed',
-    '当前微信账号对应的本地数据身份已变化，旧账号摘要任务已取消；请刷新账号列表后重新生成。',
+    message,
+    { accountId: cleanAccountId },
   );
-  const saveTickets = DIGEST_SAVE_TICKETS.size;
-  const previews = DIGEST_BATCH_PREVIEWS.size;
-  const terminalResults = DIGEST_TERMINAL_RESULTS.size;
-  DIGEST_SAVE_TICKETS.clear();
-  DIGEST_BATCH_PREVIEWS.clear();
-  DIGEST_TERMINAL_RESULTS.clear();
+  let saveTickets = 0;
+  let previews = 0;
+  let terminalResults = 0;
+  if (!cleanAccountId) {
+    saveTickets = DIGEST_SAVE_TICKETS.size;
+    previews = DIGEST_BATCH_PREVIEWS.size;
+    terminalResults = DIGEST_TERMINAL_RESULTS.size;
+    DIGEST_SAVE_TICKETS.clear();
+    DIGEST_BATCH_PREVIEWS.clear();
+    DIGEST_TERMINAL_RESULTS.clear();
+  } else {
+    for (const [id, ticket] of DIGEST_SAVE_TICKETS.entries()) {
+      if (identityChangeAccountKey(ticket?.account_id) !== cleanAccountId) continue;
+      DIGEST_SAVE_TICKETS.delete(id);
+      saveTickets += 1;
+    }
+    for (const [id, preview] of DIGEST_BATCH_PREVIEWS.entries()) {
+      if (identityChangeAccountKey(preview?.account_id) !== cleanAccountId) continue;
+      DIGEST_BATCH_PREVIEWS.delete(id);
+      previews += 1;
+    }
+    for (const [key, terminal] of DIGEST_TERMINAL_RESULTS.entries()) {
+      if (identityChangeAccountKey(terminal?.account_id) !== cleanAccountId) continue;
+      DIGEST_TERMINAL_RESULTS.delete(key);
+      terminalResults += 1;
+    }
+  }
   if (terminalResults) void queueDigestTerminalRecoveryWrite().catch(() => false);
   return {
     ...cancelled,
-    generation: wxDbIdentityChangeGeneration(),
+    generation: wxDbIdentityChangeGeneration(cleanAccountId),
     save_tickets: saveTickets,
     previews,
     terminal_results: terminalResults,
@@ -4168,7 +4271,7 @@ async function commitDigestBatchLegacyManualKeyBindings(batchId = '') {
       migrated: false,
       failed: true,
       settings_revision: '',
-      error: '旧版数据库密钥本次已验证可用，但自动绑定到当前账号未完成；下次生成会自动重试。',
+      error: '未绑定数据库密钥本次已验证可用，但自动绑定到当前账号未完成；下次生成会自动重试。',
     };
   }
 }
@@ -4256,6 +4359,25 @@ function clearDigestBatchSettings(reason = 'settings_changed', { preserveTermina
   }
   if (count) logInfo('digest_batch_settings_cache_cleared', { reason, count });
   return count;
+}
+
+function clearDigestBatchSettingsForAccount(accountId = '', reason = 'account_identity_changed', { preserveTerminalResults = false } = {}) {
+  const cleanAccountId = identityChangeAccountKey(accountId);
+  if (!cleanAccountId) return 0;
+  const entries = [...DIGEST_BATCH_SETTINGS.entries()]
+    .filter(([id, entry]) => digestBatchAccountId(id) === cleanAccountId
+      || identityChangeAccountKey(entry?.account_context?.account_id) === cleanAccountId);
+  for (const [id, entry] of entries) {
+    abortDigestBatchMirrorRecoveries(entry, '摘要批次账号身份已变化。');
+    DIGEST_BATCH_SETTINGS.delete(id);
+    if (!preserveTerminalResults) releaseDigestTerminalResults(id);
+  }
+  if (entries.length) logInfo('digest_batch_settings_account_cleared', {
+    reason,
+    account_id: '[redacted]',
+    count: entries.length,
+  });
+  return entries.length;
 }
 
 async function readWeixinBaselineFile(file, { relativePath, expectedSources, fallbackSource, freshness = 'service_start' }) {
@@ -5271,6 +5393,17 @@ function localActionCapability(name = '', commandStatus = {}, { supported = null
     enumerable: false,
   });
   return capability;
+}
+
+function localRevealForegroundEvidence(platform = process.platform, { requested = false, verified = false } = {}) {
+  const current = String(platform || '').trim().toLowerCase();
+  const mac = current === 'darwin';
+  return {
+    foreground_requested: mac && requested === true,
+    foreground_verified: mac && verified === true,
+    foreground_label: current === 'linux' ? '在文件管理器中定位' : '在文件夹中显示',
+    foreground_note: current === 'linux' ? '桌面环境可能让文件管理器留在后台。' : '',
+  };
 }
 
 function attachSystemTextClipboardCommandPaths(capability, { writePath = '', readPath = '' } = {}) {
@@ -6689,8 +6822,7 @@ async function revealInFolder(targetPath, { signal = null, capability = null, co
           opener: resolvedPrimary,
           mode: 'finder_reveal_activate',
           selected_target_requested: true,
-          foreground_requested: true,
-          foreground_verified: false,
+          ...localRevealForegroundEvidence('darwin', { requested: true }),
         }, 'finder_reveal_activate_failed');
       } catch (error) {
         if (error?.code === 'local_action_outcome_unknown' || signal?.aborted || !resolvedFallback) throw error;
@@ -6703,8 +6835,7 @@ async function revealInFolder(targetPath, { signal = null, capability = null, co
           opener: resolvedPrimary,
           mode: 'file_manager1_show_items',
           selected_target_requested: true,
-          foreground_requested: false,
-          foreground_verified: false,
+          ...localRevealForegroundEvidence('linux'),
         }, 'file_manager1_show_items_failed');
       } catch (error) {
         if (error?.code === 'local_action_outcome_unknown' || signal?.aborted || !resolvedFallback) throw error;
@@ -6718,8 +6849,7 @@ async function revealInFolder(targetPath, { signal = null, capability = null, co
         opener: fallbackCommand,
         mode: 'reveal',
         selected_target_requested: true,
-        foreground_requested: true,
-        foreground_verified: false,
+        ...localRevealForegroundEvidence('darwin', { requested: true }),
         native_reveal_fallback: !!primaryFailure,
         native_reveal_error: primaryFailure ? sanitizeLocalActionUserError(primaryFailure?.message || String(primaryFailure)) : '',
       });
@@ -6729,8 +6859,7 @@ async function revealInFolder(targetPath, { signal = null, capability = null, co
       opener: fallbackCommand,
       mode: 'open_parent',
       selected_target_requested: false,
-      foreground_requested: false,
-      foreground_verified: false,
+      ...localRevealForegroundEvidence(process.platform),
       native_reveal_fallback: !!primaryFailure,
       native_reveal_error: primaryFailure ? sanitizeLocalActionUserError(primaryFailure?.message || String(primaryFailure)) : '',
     });
@@ -10379,6 +10508,7 @@ function localActionEvidenceTimeMs(evidence = {}) {
     evidence.saved_at,
     evidence.exported_at,
     evidence.rerendered_at,
+    evidence.deleted_at,
     evidence.committed_at,
     evidence.evidence_persisted_at,
     evidence.explorer_selection?.checked_at,
@@ -10751,7 +10881,7 @@ async function reconcileRestoredLocalActionCommitEvidence(evidence = null, { res
         const recoveredAt = committedAt || preparedAt || String(evidence.requested_at || '').trim();
         const recoveredLabel = expectedKind === 'save_render'
           ? '长图'
-          : (expectedKind === 'history_copy_current_output' ? '旧目录 PNG 副本' : '文本预览 MD');
+          : (expectedKind === 'history_copy_current_output' ? '其他输出目录 PNG 副本' : '文本预览 MD');
         Object.assign(evidence, {
           kind: expectedKind,
           ...(expectedKind === 'export_preview'
@@ -11130,6 +11260,18 @@ function prepareHistoryRerenderEvidence(item = {}, { actionId = '', usedCachedPr
     local_action_after_commit_error: '',
     _commit_evidence_path: localActionCommitEvidenceStoredPath(commitEvidencePath),
   });
+}
+
+function prepareHistoryDeleteEvidence(lookup = {}, { actionId = '' } = {}) {
+  return rememberLocalActionEvidence(createHistoryDeleteEvidence({
+    actionId: normalizeLocalActionId(actionId),
+    lookup: {
+      ...lookup,
+      expected_output_dir_identity: normalizeOutputDirRequestIdentity(
+        lookup?.expected_output_dir_identity || lookup?.output_dir_identity || '',
+      ),
+    },
+  }));
 }
 
 function prepareHistoryCopyCurrentOutputEvidence(item = {}, { actionId = '', outputDirIdentity = '', settingsRevision = '', commitEvidencePath = '' } = {}) {
@@ -13216,6 +13358,28 @@ function localActionEvidenceFor(kind = '', actionId = '') {
   return evidence ? publicLocalActionEvidence(evidence) : null;
 }
 
+async function reconcileHistoryDeleteEvidenceForQuery(kind = '', actionId = '') {
+  const evidence = localActionEvidenceRecordFor(kind, actionId);
+  if (!evidence || String(evidence.kind || '').trim() !== 'history_delete') {
+    return evidence ? publicLocalActionEvidence(evidence) : null;
+  }
+  if (evidence.verification_pending !== true || ACTIVE_LOCAL_ACTIONS.has(normalizeLocalActionId(actionId))) {
+    return publicLocalActionEvidence(evidence);
+  }
+  const settings = await loadSettings();
+  await waitForPendingHistoryRecovery(settings);
+  const current = await findHistoryItemWithStatus(settings, evidence.digest_id, {
+    history_item_key: evidence.history_item_key,
+    expected_file_version: evidence.file_version,
+    expected_digest_file_version: evidence.digest_file_version,
+    expected_output_dir_identity: evidence.output_dir_identity,
+  });
+  resolveHistoryDeleteEvidence(evidence, { targetPresent: !!current });
+  rememberLocalActionEvidence(evidence);
+  await persistRecordedLocalActionEvidence(evidence);
+  return publicLocalActionEvidence(evidence);
+}
+
 function localActionEvidenceExpectedTargetFromQuery(parsedUrl) {
   const params = parsedUrl?.searchParams;
   if (!params) return null;
@@ -13326,6 +13490,7 @@ function publicLocalActionEvidence(evidence = null) {
     'saved_at',
     'exported_at',
     'rerendered_at',
+    'deleted_at',
     'digest_id',
     'history_item_key',
     'relative_path',
@@ -13381,6 +13546,10 @@ function publicLocalActionEvidence(evidence = null) {
     'used_cached_preview',
     'cancelled_after_commit',
     'local_action_committed',
+    'local_action_recovery_failed',
+    'deleted',
+    'cleanup_pending',
+    'cleanup_pending_count',
     'clipboard_verified',
     'evidence_verified',
     'evidence_persisted',
@@ -13583,7 +13752,10 @@ async function readBody(req, maxBytes = 20 * 1024 * 1024, { timeoutMs = DEFAULT_
       req.pause?.();
       finish(reject, bodyError('请求体过大，请减少提交内容后重试。', 413, { closeRequest: true, code: 'request_body_too_large' }));
     };
-    onSignalAbort = () => finish(reject, signal.reason instanceof Error ? signal.reason : requestAbortError('请求已取消'));
+    onSignalAbort = () => {
+      req.pause?.();
+      finish(reject, signal.reason instanceof Error ? signal.reason : requestAbortError('请求已取消'));
+    };
     if (signal?.aborted) {
       onSignalAbort();
       return;
@@ -13742,7 +13914,7 @@ function sideEffectGetRequiresFreshFrontendAsset(pathname = '') {
 
 async function assertFreshFrontendAsset(req, parsedUrl = null) {
   if (await serviceSourceAssetChanged()) {
-    throw Object.assign(new Error('本地代码已更新，但当前服务仍在运行旧代码；请重启本地服务后刷新页面再操作。'), {
+    throw Object.assign(new Error('本地代码已发生更改，但当前服务尚未重新载入这些更改；请重启本地服务后刷新页面再操作。'), {
       status: 409,
       code: 'service_restart_required',
     });
@@ -13755,7 +13927,7 @@ async function assertFreshFrontendAsset(req, parsedUrl = null) {
   ).trim();
   const serverVersion = String(await currentAssetVersion() || '').trim();
   if (clientVersion && (!serverVersion || clientVersion === serverVersion)) return;
-  throw Object.assign(new Error('本地页面版本已更新，请刷新页面后再继续操作。'), {
+  throw Object.assign(new Error('页面资源已变化，请刷新页面后再继续操作。'), {
     status: 409,
     code: 'stale_frontend_asset',
   });
@@ -13776,7 +13948,7 @@ function assertServiceAcceptingApiRequest(pathname = '') {
 async function assertApiAccess(req, parsedUrl) {
   assertServiceAcceptingApiRequest(parsedUrl.pathname);
   if (!hasToken(req)) {
-    throw requestValidationError('本地会话已失效或页面来自旧服务，请刷新页面后重试。', 403, 'invalid_token');
+    throw requestValidationError('本地会话已失效或页面会话来源已失效，请刷新页面后重试。', 403, 'invalid_token');
   }
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
     if (mutationAcceptsRawPng(parsedUrl.pathname)) assertAllowedMutationOrigin(req);
@@ -14160,7 +14332,7 @@ async function postSaveSettingsWarnings(patch, { signal = null, savedSettings = 
       if (Array.isArray(preview.ambiguous_refs) && preview.ambiguous_refs.length) {
         warnings.push({
           code: 'scheduler_ambiguous_group_refs',
-          message: `定时摘要设置已保存，但有 ${preview.ambiguous_refs.length} 条旧白名单或每群规则匹配到重名群；请在当前账号下重新选择这些群后再保存。`,
+          message: `定时摘要设置已保存，但有 ${preview.ambiguous_refs.length} 条待确认的白名单或每群规则匹配到重名群；请在当前账号下重新选择这些群后再保存。`,
         });
       }
       if (Number(preview.ambiguous_account_ref_count || 0) > 0) {
@@ -14178,7 +14350,7 @@ async function postSaveSettingsWarnings(patch, { signal = null, savedSettings = 
       if (preview.unscoped_refs_ignored) {
         warnings.push({
           code: 'scheduler_unscoped_refs_ignored',
-          message: `检测到 ${preview.unscoped_ref_count || 0} 条未绑定账号的旧白名单或每群规则；后台定时摘要不会自动猜测这些旧规则属于哪个账号，已忽略。请在当前账号下重新选择需要保留的群或覆盖规则后保存。`,
+          message: `检测到 ${preview.unscoped_ref_count || 0} 条未绑定账号的白名单或每群规则；后台定时摘要不会自动猜测这些规则属于哪个账号，已忽略。请在当前账号下重新选择需要保留的群或覆盖规则后保存。`,
         });
       }
       if (Number(preview.missing_manual_key_account_count || 0) > 0) {
@@ -14396,80 +14568,123 @@ async function readPngUploadToTemp(req, maxBytes = RENDERED_PNG_MAX_BYTES, { tim
   try {
     return await new Promise((resolve, reject) => {
       let settled = false;
+      let finalizing = false;
       let size = 0;
       let timer = null;
       let writing = false;
       let ended = false;
-      const cleanup = () => {
+      let abortReason = null;
+      let handleClosePromise = null;
+      const cleanup = ({ keepSignal = false } = {}) => {
         if (timer) clearTimeout(timer);
         req.off('data', onData);
         req.off('end', onEnd);
         req.off('aborted', onAborted);
         req.off('error', onError);
-        signal?.removeEventListener?.('abort', onSignalAbort);
+        if (!keepSignal) signal?.removeEventListener?.('abort', onSignalAbort);
       };
-      const fail = error => {
+      const currentAbortReason = () => {
+        if (abortReason instanceof Error) return abortReason;
+        if (!signal?.aborted) return null;
+        return signal.reason instanceof Error ? signal.reason : requestAbortError('PNG 上传已取消。');
+      };
+      const closeHandleOnce = () => {
+        if (!handleClosePromise) {
+          const currentHandle = handle;
+          handleClosePromise = Promise.resolve()
+            .then(() => currentHandle?.close?.())
+            .finally(() => {
+              if (handle === currentHandle) handle = null;
+            });
+        }
+        return handleClosePromise;
+      };
+      const settleFailure = error => {
         if (settled) return;
+        const cancellation = currentAbortReason();
         settled = true;
+        finalizing = false;
         cleanup();
-        req.pause?.();
-        Promise.resolve().then(async () => {
-          await handle?.close?.().catch(() => {});
-          handle = null;
-          await fsp.rm(file, { force: true }).catch(() => {});
-          reject(error);
-        });
+        reject(cancellation || error);
       };
-      const succeed = () => {
-        if (settled || writing) return;
+      const finalizeFailure = error => {
+        if (settled || finalizing) return;
+        finalizing = true;
+        cleanup({ keepSignal: true });
+        req.pause?.();
+        Promise.resolve()
+          .then(async () => {
+            try { await closeHandleOnce(); } catch {}
+            settleFailure(error);
+          })
+          .catch(finalizationError => settleFailure(finalizationError));
+      };
+      const finalizeSuccess = () => {
+        if (settled || finalizing || writing) return;
         if (!size) {
-          fail(requestValidationError('PNG 上传请求缺少图片数据。', 400, 'save_render_png_missing'));
+          finalizeFailure(requestValidationError('PNG 上传请求缺少图片数据。', 400, 'save_render_png_missing'));
           return;
         }
         if (declared > 0 && size !== declared) {
-          fail(requestValidationError('PNG 上传不完整，请重试。', 400, 'save_render_upload_incomplete'));
+          finalizeFailure(requestValidationError('PNG 上传不完整，请重试。', 400, 'save_render_upload_incomplete'));
           return;
         }
-        settled = true;
-        cleanup();
-        Promise.resolve().then(async () => {
-          await handle.sync();
-          await handle.close();
-          handle = null;
-          resolve({ file, bytes: size });
-        }).catch(async error => {
-          await handle?.close?.().catch(() => {});
-          handle = null;
-          await fsp.rm(file, { force: true }).catch(() => {});
-          reject(error);
-        });
+        finalizing = true;
+        cleanup({ keepSignal: true });
+        Promise.resolve()
+          .then(async () => {
+            let finalizationError = null;
+            try {
+              await handle.sync();
+            } catch (error) {
+              finalizationError = error;
+            }
+            try {
+              await closeHandleOnce();
+            } catch (error) {
+              finalizationError ||= error;
+            }
+            const cancellation = currentAbortReason();
+            if (cancellation || finalizationError) {
+              settleFailure(cancellation || finalizationError);
+              return;
+            }
+            settled = true;
+            finalizing = false;
+            cleanup();
+            resolve({ file, bytes: size });
+          })
+          .catch(error => settleFailure(error));
       };
       const onData = chunk => {
-        if (settled) return;
+        if (settled || finalizing) return;
         if (writing) {
-          fail(requestValidationError('PNG 上传流状态异常，已停止保存以避免图片损坏。请重试。', 400, 'save_render_upload_stream_invalid'));
+          finalizeFailure(requestValidationError('PNG 上传流状态异常，已停止保存以避免图片损坏。请重试。', 400, 'save_render_upload_stream_invalid'));
           return;
         }
         size += chunk.length;
         if (size > maxBytes) {
-          fail(saveRenderBodyTooLargeError());
+          finalizeFailure(saveRenderBodyTooLargeError());
           return;
         }
         writing = true;
         req.pause?.();
         writeFileHandleChunkFully(handle, chunk).then(() => {
           writing = false;
-          if (ended) succeed();
-          else if (!settled) req.resume?.();
-        }).catch(fail);
+          if (ended) finalizeSuccess();
+          else if (!settled && !finalizing) req.resume?.();
+        }).catch(finalizeFailure);
       };
       const onEnd = () => {
         ended = true;
-        succeed();
+        finalizeSuccess();
       };
-      const onAborted = () => fail(requestAbortError('PNG 上传已取消。'));
-      const onError = error => fail(error);
-      const onSignalAbort = () => fail(signal.reason instanceof Error ? signal.reason : requestAbortError('PNG 上传已取消。'));
+      const onAborted = () => finalizeFailure(requestAbortError('PNG 上传已取消。'));
+      const onError = error => finalizeFailure(error);
+      const onSignalAbort = () => {
+        abortReason ||= signal.reason instanceof Error ? signal.reason : requestAbortError('PNG 上传已取消。');
+        if (!finalizing) finalizeFailure(abortReason);
+      };
       if (signal?.aborted) {
         onSignalAbort();
         return;
@@ -14477,7 +14692,7 @@ async function readPngUploadToTemp(req, maxBytes = RENDERED_PNG_MAX_BYTES, { tim
       timer = setTimeout(() => {
         const error = requestValidationError('PNG 上传超时，请重试。', 408, 'save_render_upload_timeout');
         error.close_request = true;
-        fail(error);
+        finalizeFailure(error);
       }, Math.max(1000, Number(timeoutMs || SAVE_RENDER_BODY_TIMEOUT_MS)));
       timer.unref?.();
       signal?.addEventListener?.('abort', onSignalAbort, { once: true });
@@ -15150,17 +15365,23 @@ function schedulerUnverifiedLegacyCursorKeys(result = {}) {
     .filter(Boolean))].sort();
 }
 
-function schedulerLegacyCursorCleanupToken(status = getSchedulerStatus()) {
+function schedulerLegacyCursorCleanupToken(status = getSchedulerStatus(), { ignoredKeys = [] } = {}) {
   const result = status?.last_result || {};
-  const keys = schedulerUnverifiedLegacyCursorKeys(result);
+  const ignored = new Set((Array.isArray(ignoredKeys) ? ignoredKeys : [])
+    .map(key => String(key || '').trim())
+    .filter(Boolean));
+  const keys = schedulerUnverifiedLegacyCursorKeys(result).filter(key => !ignored.has(key));
   if (!keys.length) return '';
   const items = Array.isArray(result?.items) ? result.items : [];
   const identity = {
+    last_result_revision: Number(status?.last_result_revision || 0),
     last_started_at: String(status?.last_started_at || ''),
     last_finished_at: String(status?.last_finished_at || ''),
     keys,
     items: items
-      .filter(item => item?.legacy_cursor_unverified === true && String(item?.legacy_cursor_key || '').trim())
+      .filter(item => item?.legacy_cursor_unverified === true
+        && String(item?.legacy_cursor_key || '').trim()
+        && !ignored.has(String(item?.legacy_cursor_key || '').trim()))
       .map(item => ({
         key: String(item.legacy_cursor_key || '').trim(),
         detail: String(item.detail || ''),
@@ -15176,34 +15397,75 @@ function schedulerLegacyCursorCleanupToken(status = getSchedulerStatus()) {
 function assertSchedulerLegacyCursorCleanupToken(expectedToken = '', status = getSchedulerStatus()) {
   const expected = String(expectedToken || '').trim();
   if (!expected) {
-    throw requestValidationError('清理旧游标缺少状态版本；请刷新调度状态后重试。', 428, 'scheduler_legacy_cursor_cleanup_token_required');
+    throw requestValidationError('清理未验证游标缺少状态版本；请刷新调度状态后重试。', 428, 'scheduler_legacy_cursor_cleanup_token_required');
   }
   const current = schedulerLegacyCursorCleanupToken(status);
   if (!current || current !== expected) {
-    throw requestValidationError('调度状态已变化，已停止清理旧游标；请刷新调度状态并重新确认。', 409, 'scheduler_legacy_cursor_cleanup_token_changed');
+    throw requestValidationError('调度状态已变化，已停止清理未验证游标；请刷新调度状态并重新确认。', 409, 'scheduler_legacy_cursor_cleanup_token_changed');
   }
 }
 
 async function clearUnverifiedLegacySchedulerCursors({ signal = null, statusSnapshot = null, expectedCleanupToken = '' } = {}) {
   const status = statusSnapshot || getSchedulerStatus();
   assertSchedulerLegacyCursorCleanupToken(expectedCleanupToken, status);
+  const cleanupOwnerRevision = Number(status?.last_result_revision || 0);
   const result = status.last_result;
   const keys = schedulerUnverifiedLegacyCursorKeys(result);
   let cleared = 0;
   let attempted = 0;
   const resolvedKeys = [];
   const failed = [];
+  const cleanupStoppedForStaleToken = error => {
+    if (cleared <= 0 && attempted <= 0) return null;
+    return {
+      ok: false,
+      attempted,
+      target_count: keys.length,
+      cleared,
+      failed_count: failed.length,
+      failed: failed.map(item => ({ key: item.key ? '[redacted-id]' : '', error: item.error })),
+      cancelled_after_commit: true,
+      local_action_after_commit_reason: 'cleanup_token_changed',
+      local_action_after_commit_error: publicSchedulerErrorSummary(error?.message || String(error)),
+    };
+  };
+  const assertCleanupStillCurrent = () => {
+    const currentStatus = getSchedulerStatus();
+    if (Number(currentStatus?.last_result_revision || 0) !== cleanupOwnerRevision) {
+      throw requestValidationError('调度状态已变化，已停止清理未验证游标；请刷新调度状态并重新确认。', 409, 'scheduler_legacy_cursor_cleanup_token_changed');
+    }
+    const ignoredKeys = resolvedKeys;
+    const expectedRemainingToken = schedulerLegacyCursorCleanupToken(status, { ignoredKeys });
+    const currentRemainingToken = schedulerLegacyCursorCleanupToken(currentStatus, { ignoredKeys });
+    if (expectedRemainingToken !== currentRemainingToken) {
+      throw requestValidationError('调度状态已变化，已停止清理未验证游标；请刷新调度状态并重新确认。', 409, 'scheduler_legacy_cursor_cleanup_token_changed');
+    }
+  };
   for (const key of keys) {
     if (requestSignalAborted(signal)) {
       if (cleared > 0 || attempted > 0) {
         return { attempted, target_count: keys.length, cleared, cancelled_after_commit: true };
       }
-      throw signal.reason instanceof Error ? signal.reason : requestAbortError('清理旧游标已取消。');
+      throw signal.reason instanceof Error ? signal.reason : requestAbortError('清理未验证游标已取消。');
+    }
+    try {
+      assertCleanupStillCurrent();
+    } catch (e) {
+      const stopped = cleanupStoppedForStaleToken(e);
+      if (stopped) return stopped;
+      throw e;
     }
     attempted++;
     try {
       if (await clearGroupCursor(key)) {
         cleared++;
+        try {
+          assertCleanupStillCurrent();
+        } catch (e) {
+          const stopped = cleanupStoppedForStaleToken(e);
+          if (stopped) return stopped;
+          throw e;
+        }
         resolvedKeys.push(key);
         markSchedulerLegacyCursorsCleared([key]);
       }
@@ -15213,9 +15475,16 @@ async function clearUnverifiedLegacySchedulerCursors({ signal = null, statusSnap
     if (requestSignalAborted(signal)) {
       return { attempted, target_count: keys.length, cleared, cancelled_after_commit: true };
     }
+    try {
+      assertCleanupStillCurrent();
+    } catch (e) {
+      const stopped = cleanupStoppedForStaleToken(e);
+      if (stopped) return stopped;
+      throw e;
+    }
   }
   if (failed.length) {
-    const error = `部分旧游标清理失败：${failed.length}/${keys.length}`;
+    const error = `部分未验证游标清理失败：${failed.length}/${keys.length}`;
     return {
       ok: false,
       attempted,
@@ -15365,7 +15634,7 @@ function schedulerPersistedDisabledReasonForPublic(reason = '') {
 function schedulerDisabledReasonLabel(reason = '') {
   switch (String(reason || '')) {
     case 'persisted_disabled':
-      return '持久设置为关闭';
+      return '设置中未启用';
     case 'secrets_invalid':
       return '本机密钥文件无法解密，已关闭后台定时摘要';
     case 'llm_base_url_missing':
@@ -15379,7 +15648,7 @@ function schedulerDisabledReasonLabel(reason = '') {
     case 'scheduler_no_targets':
       return '当前没有可执行群，已关闭后台定时摘要';
     case 'scheduler_unscoped_targets':
-      return '旧规则未绑定微信账号，已关闭后台定时摘要';
+      return '规则未绑定微信账号，已关闭后台定时摘要';
     case 'scheduler_targets_need_review':
       return '自动检查目标存在归属冲突，已关闭后台定时摘要';
     case 'account_list_unavailable':
@@ -16002,7 +16271,7 @@ async function assertExpectedHistoryItemFileVersion(settings, item = {}, lookup 
     ...(allow_oversized_rerender_source ? {
       max_bytes: HISTORY_RERENDER_SOURCE_MAX_BYTES,
       too_large_code: 'history_rerender_source_too_large',
-      too_large_message: '历史 PNG 超过可安全核验的重建源文件上限，已停止确认旧版本。请移走该文件或回到总结页重新生成。',
+      too_large_message: '历史 PNG 超过可安全核验的重建源文件上限，已停止确认文件核验状态。请移走该文件或回到总结页重新生成。',
     } : {}),
   });
   return file;
@@ -16036,19 +16305,19 @@ function historyRerenderModeError(item = {}, { restore_to_current_output = false
   const oldOutput = item?._history_current === false;
   if (!oldOutput && restore_to_current_output) {
     return {
-      error: '当前输出目录中的历史应使用普通重渲染，不能走旧目录恢复流程。',
+      error: '当前输出目录中的历史应使用普通重渲染，不能重复执行恢复到当前目录流程。',
       code: 'history_restore_source_current',
     };
   }
   if (oldOutput && restore_to_current_output && !oldHistoryRerenderRestoreEligible(item)) {
     return {
-      error: '旧输出目录中的这张 PNG 仍可正常使用，不能重复恢复到当前目录。若文件已丢失、损坏或超出安全读取上限，请刷新历史页后再恢复。',
+      error: '其他输出目录中的这张 PNG 仍可正常使用，不能重复恢复到当前目录。若文件已丢失、损坏或超出安全读取上限，请刷新历史页后再恢复。',
       code: 'old_history_restore_not_needed',
     };
   }
   if (oldOutput && !restore_to_current_output) {
     return {
-      error: '这条历史来自旧输出目录，不能原地重渲染。仅当旧 PNG 丢失、损坏或超出安全读取上限时，才可恢复到当前输出目录；旧目录不会被修改。',
+      error: '这条历史来自其他输出目录，不能原地重渲染。仅当 PNG 丢失、损坏或超出安全读取上限时，才可恢复到当前输出目录；原输出目录不会被修改。',
       code: 'old_history_rerender_disabled',
     };
   }
@@ -16070,13 +16339,13 @@ function historyCopyToCurrentOutputModeError(item = {}) {
   }
   if (oldHistoryRerenderRestoreEligible(item)) {
     return {
-      error: '旧目录中的这张 PNG 当前不可直接复制；请使用“恢复到当前目录”重新生成安全副本。',
+      error: '其他输出目录中的这张 PNG 当前不可直接复制；请使用“恢复到当前目录”重新生成安全副本。',
       code: 'old_history_copy_needs_restore',
     };
   }
   if (!oldHistoryPngCopyToCurrentOutputEligible(item)) {
     return {
-      error: '旧目录中的这张 PNG 缺少可校验的文件或摘要版本，不能复制到当前目录；请刷新历史页后重试。',
+      error: '其他输出目录中的这张 PNG 缺少可校验的文件或摘要信息，不能复制到当前目录；请刷新历史页后重试。',
       code: 'old_history_copy_unavailable',
     };
   }
@@ -16204,7 +16473,7 @@ function settingsMutationPayloadObject(value) {
 function assertCanonicalSettingsMutationPayload(body = {}) {
   const settingsOps = settingsPatchOperations(body);
   if (settingsOps && Object.hasOwn(settingsOps, 'legacy_account_scope_migration')) {
-    throw requestValidationError('旧账号绑定迁移参数只能由本地服务在验证账号身份后生成；请刷新页面后重试。', 400, 'settings_legacy_scope_migration_untrusted');
+    throw requestValidationError('账号绑定迁移参数只能由本地服务在验证账号身份后生成；请刷新页面后重试。', 400, 'settings_legacy_scope_migration_untrusted');
   }
   const groups = settingsMutationPayloadObject(body.groups) ? body.groups : null;
   if (groups && Object.hasOwn(groups, 'overrides')) {
@@ -16222,7 +16491,7 @@ function assertCanonicalSettingsMutationPayload(body = {}) {
         && !Object.hasOwn(ref, 'id')
         && !Object.hasOwn(ref, 'name');
       if (!canonical) {
-        throw requestValidationError('群白名单包含旧格式或未绑定账号的引用；请刷新群列表后重新勾选，旧引用只能通过迁移/清理入口处理。', 400, 'settings_whitelist_legacy_payload_rejected');
+        throw requestValidationError('群白名单包含不受支持字段或未绑定账号的引用；请刷新群列表后重新勾选，这些引用只能通过迁移/清理入口处理。', 400, 'settings_whitelist_legacy_payload_rejected');
       }
     }
   }
@@ -16240,7 +16509,7 @@ function assertCanonicalSettingsMutationPayload(body = {}) {
       && !Object.hasOwn(item, 'name')
       && !Object.hasOwn(item, 'min_messages_per_digest');
     if (!canonical) {
-      throw requestValidationError('每群自动检查规则包含旧字段或未绑定账号的引用；请刷新群列表后重新添加，旧规则只能通过迁移/清理入口处理。', 400, 'settings_per_group_legacy_payload_rejected');
+      throw requestValidationError('每群自动检查规则包含不受支持字段或未绑定账号的引用；请刷新群列表后重新添加，这些规则只能通过迁移/清理入口处理。', 400, 'settings_per_group_legacy_payload_rejected');
     }
   }
 }
@@ -16254,7 +16523,7 @@ function assertSettingsClearAllWhitelistOperationPayload(body = {}) {
     throw requestValidationError('清空全部白名单与替换全部白名单不能同时执行；请刷新设置页后重试。', 400, 'settings_whitelist_operation_conflict');
   }
   if (migrateLegacyScope) {
-    throw requestValidationError('清空或替换全部白名单不能同时更新旧账号绑定；请分别保存。', 409, 'settings_legacy_scope_migration_operation_conflict');
+    throw requestValidationError('清空或替换全部白名单不能同时更新待迁移账号绑定；请分别保存。', 409, 'settings_legacy_scope_migration_operation_conflict');
   }
   if (clearAll) {
     if (body?.groups && Object.hasOwn(body.groups, 'whitelist')) {
@@ -16272,7 +16541,7 @@ function assertSettingsClearAllWhitelistOperationPayload(body = {}) {
     throw requestValidationError('替换全部白名单必须提交完整的新白名单；请刷新设置页后重试。', 400, 'settings_replace_all_whitelist_payload_required');
   }
   if (body.groups.whitelist.some(settingsOperationRefIsUnscoped)) {
-    throw requestValidationError('替换后的白名单包含未绑定账号的旧格式群；请刷新群列表后重新选择。', 400, 'settings_replace_all_whitelist_scope_invalid');
+    throw requestValidationError('替换后的白名单包含未绑定账号的群引用；请刷新群列表后重新选择。', 400, 'settings_replace_all_whitelist_scope_invalid');
   }
   const submittedOverrides = [
     ...(Array.isArray(body?.scheduler?.per_group) ? body.scheduler.per_group : []),
@@ -16351,7 +16620,7 @@ async function stopSchedulerBeforeSettingsSaveIfNeeded(patch = {}) {
   if (result?.timed_out || result?.running) {
     const recoveryQueued = scheduleSchedulerRestartWhenIdle({ reason: 'settings_precommit_stop_timeout' });
     logWarn('scheduler_stop_before_settings_save_timeout', { reason: result?.reason || '', recovery_queued: recoveryQueued });
-    throw requestValidationError('旧后台检查仍在退出中，设置未保存；请稍后重试或重启本地服务，避免旧规则继续请求 AI。', 409, 'scheduler_stop_before_settings_save_timeout');
+    throw requestValidationError('上一轮后台检查仍在退出中，设置未保存；请稍后重试或重启本地服务，避免在途规则继续请求 AI。', 409, 'scheduler_stop_before_settings_save_timeout');
   }
   logInfo('scheduler_stopped_before_settings_save', { reason: result?.reason || '' });
   return { ...result, required: true };
@@ -16477,7 +16746,7 @@ function outputDirCommitBarrier(startSettings = {}, message = '') {
     const latest = await loadSettings();
     if (!expectedIdentity || outputDirSettingsIdentity(latest) !== expectedIdentity) {
       throw requestValidationError(
-        message || '输出目录已切换，已停止向旧输出目录提交文件；请刷新后重试。',
+        message || '输出目录已切换，已停止向其他输出目录提交文件；请刷新后重试。',
         409,
         'output_dir_changed',
       );
@@ -16788,7 +17057,7 @@ function markOutputDirChangedAfterLocalCommit(startSettings = {}, latestSettings
   const after = outputDirRequestIdentityFromSettings(latestSettings);
   if (before && after && before !== after) {
     result.local_action_after_commit_reason = 'output_dir_changed_after_commit';
-    result.local_action_after_commit_error = '输出目录已在操作期间切换；本次动作针对的是开始时的旧输出目录。';
+    result.local_action_after_commit_error = '输出目录已在操作期间切换；本次动作针对的是开始时的原输出目录。';
   }
   return result;
 }
@@ -16919,7 +17188,7 @@ function schedulerSetupDisabledReason(settings = {}, accounts = []) {
 
 function schedulerSetupPausedWarningMessage(reason = '', legacySetupPause = false) {
   if (legacySetupPause) {
-    return '检测到旧配置里后台定时摘要曾启用；当前仍处于首次配置/密钥恢复流程，已先暂停定时摘要。完成配置后可到设置页手动重新开启。';
+    return '检测到后台定时摘要曾启用；当前仍处于首次配置/密钥恢复流程，已先暂停定时摘要。完成配置后可到设置页手动重新开启。';
   }
   switch (String(reason || '').trim()) {
     case 'manual_key_unverified':
@@ -16941,7 +17210,7 @@ function schedulerTargetAutoPauseWarningMessage(reason = '', preview = null) {
   const count = Math.max(0, Number(preview?.unscoped_ref_count || 0) || 0);
   switch (String(reason || '').trim()) {
     case 'scheduler_unscoped_targets':
-      return `检测到 ${count || '若干'} 条未绑定微信账号的旧规则；规则已保留，但程序不会猜测它们属于哪个账号。当前没有其他可执行目标，后台定时摘要已自动关闭；请在当前账号下重新选择群并保存后再开启。`;
+      return `检测到 ${count || '若干'} 条未绑定微信账号的规则；规则已保留，但程序不会猜测它们属于哪个账号。当前没有其他可执行目标，后台定时摘要已自动关闭；请在当前账号下重新选择群并保存后再开启。`;
     case 'scheduler_targets_need_review':
       return '自动检查规则存在账号归属或重名冲突，当前没有可安全执行的目标；规则已保留，后台定时摘要已自动关闭。请确认右上角账号后重新选择对应群并保存。';
     case 'scheduler_no_targets':
@@ -17105,7 +17374,7 @@ function settingsLegacyAccountScopeMigrationSources(currentSettings = {}, accoun
       .filter(account => accountIdentityAliases(account).includes(scope));
     if (matches.length !== 1) {
       throw requestValidationError(
-        `旧账号标识“${sanitizeText(scope).slice(0, 80)}”同时匹配多个微信账号；已拒绝整次迁移，避免把其他账号规则绑定到当前账号。请刷新账号列表并分别确认旧规则归属。`,
+        `待迁移账号标识“${sanitizeText(scope).slice(0, 80)}”同时匹配多个微信账号；已拒绝整次迁移，避免把其他账号规则绑定到当前账号。请刷新账号列表并分别确认这些规则的归属。`,
         409,
         'settings_legacy_scope_migration_ambiguous',
       );
@@ -17117,7 +17386,7 @@ function settingsLegacyAccountScopeMigrationSources(currentSettings = {}, accoun
   }
   if (!sources.length) {
     throw requestValidationError(
-      '当前设置里已没有可安全迁移到此账号的旧账号标识；设置可能刚被其他页面更新，请刷新后重新确认。',
+      '当前设置里已没有可安全迁移到此账号的待迁移账号标识；设置可能刚被其他页面更新，请刷新后重新确认。',
       409,
       'settings_legacy_scope_migration_stale',
     );
@@ -18274,6 +18543,22 @@ function clearDigestGroupContexts() {
   DIGEST_GROUP_CONTEXTS.clear();
 }
 
+function clearDigestGroupContextsForAccount(accountId = '') {
+  const cleanAccountId = identityChangeAccountKey(accountId);
+  if (!cleanAccountId) {
+    const count = DIGEST_GROUP_CONTEXTS.size;
+    clearDigestGroupContexts();
+    return count;
+  }
+  let cleared = 0;
+  for (const [id, item] of DIGEST_GROUP_CONTEXTS.entries()) {
+    if (identityChangeAccountKey(item?.account_id) !== cleanAccountId) continue;
+    DIGEST_GROUP_CONTEXTS.delete(id);
+    cleared += 1;
+  }
+  return cleared;
+}
+
 function digestGroupContextMirrorReadinessEligible(readiness = null, accountId = '') {
   if (!readiness || typeof readiness !== 'object' || Array.isArray(readiness)) return false;
   const scope = String(readiness.scope || readiness.mirror_scope || '').trim().toLowerCase();
@@ -18635,11 +18920,53 @@ function publicGroupMirrorReadiness(readiness = null) {
   };
 }
 
-function groupListReadInFlightKey({ accountId = '', accountFingerprint = '', allowStaleAccount = false } = {}) {
+function groupListReadMirrorIdentity(account = {}) {
+  const mirror = account?.mirror && typeof account.mirror === 'object' && !Array.isArray(account.mirror)
+    ? account.mirror
+    : null;
+  if (!mirror) return 'unprepared';
+  const sourceScopes = mirror.source_scopes
+    && typeof mirror.source_scopes === 'object'
+    && !Array.isArray(mirror.source_scopes)
+    ? mirror.source_scopes
+    : {};
+  const scoped = ['groups', 'digest', 'full'].map(scope => {
+    const record = sourceScopes[scope] && typeof sourceScopes[scope] === 'object' && !Array.isArray(sourceScopes[scope])
+      ? sourceScopes[scope]
+      : {};
+    return {
+      scope,
+      source_snapshot_meta_hash: String(record.source_snapshot_meta_hash || '').trim().toLowerCase(),
+      refreshed_at: String(record.refreshed_at || record.checked_at || '').trim(),
+    };
+  });
+  const evidence = {
+    source_generation_hash: String(mirror.source_generation_hash || '').trim().toLowerCase(),
+    source_snapshot_meta_hash: String(mirror.source_snapshot_meta_hash || '').trim().toLowerCase(),
+    published_manifest_hash: String(mirror.published_manifest_hash || '').trim().toLowerCase(),
+    refreshed_at: String(mirror.refreshed_at || mirror.imported_at || '').trim(),
+    source_last_write_time: String(mirror.source_last_write_time || '').trim(),
+    mirror_last_write_time: String(mirror.mirror_last_write_time || '').trim(),
+    scoped,
+  };
+  const hasSnapshotEvidence = !!(
+    evidence.source_generation_hash
+    || evidence.source_snapshot_meta_hash
+    || evidence.published_manifest_hash
+    || evidence.refreshed_at
+    || evidence.source_last_write_time
+    || evidence.mirror_last_write_time
+    || scoped.some(item => item.source_snapshot_meta_hash || item.refreshed_at)
+  );
+  if (!hasSnapshotEvidence) return 'unprepared';
+  return crypto.createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+}
+
+function groupListReadInFlightKey({ accountId = '', accountFingerprint = '', mirror = null, allowStaleAccount = false } = {}) {
   const id = String(accountId || '').trim();
   const fingerprint = String(accountFingerprint || '').trim().toLowerCase();
   if (!id || !fingerprint) return '';
-  return `${id}\n${fingerprint}\n${allowStaleAccount === true ? 'stale' : 'fresh'}`;
+  return `${id}\n${fingerprint}\n${groupListReadMirrorIdentity({ mirror })}\n${allowStaleAccount === true ? 'stale' : 'fresh'}`;
 }
 
 function attachGroupListInFlightReporter(entry = null, reporter = null) {
@@ -18920,6 +19247,23 @@ function cleanupGroupListResultCache(now = Date.now()) {
 
 function clearGroupListResultCache() {
   GROUP_LIST_RESULT_CACHE.clear();
+}
+
+function clearGroupListResultCacheForAccount(accountId = '') {
+  const cleanAccountId = identityChangeAccountKey(accountId);
+  if (!cleanAccountId) {
+    const count = GROUP_LIST_RESULT_CACHE.size;
+    clearGroupListResultCache();
+    return count;
+  }
+  let cleared = 0;
+  for (const key of GROUP_LIST_RESULT_CACHE.keys()) {
+    const cachedAccountId = identityChangeAccountKey(String(key).split('\n', 1)[0]);
+    if (cachedAccountId !== cleanAccountId) continue;
+    GROUP_LIST_RESULT_CACHE.delete(key);
+    cleared += 1;
+  }
+  return cleared;
 }
 
 function normalizeKeyCachePersistenceNotice(value = null) {
@@ -19385,6 +19729,7 @@ async function handleApi(req, res, parsedUrl) {
       const groupReadKey = groupListReadInFlightKey({
         accountId: requestAccountContext.account_id,
         accountFingerprint: requestAccountContext.account_fingerprint,
+        mirror: requestAccountContext.account?.mirror || null,
         allowStaleAccount,
       });
       groupRead = joinGroupListReadOperation(groupReadKey, {
@@ -19716,7 +20061,7 @@ async function handleApi(req, res, parsedUrl) {
               logWarn('scheduler_stop_before_settings_preview_failed', { error: message });
               warnings.push({
                 code: 'scheduler_stop_failed',
-                message: `设置已保存，但旧后台检查停止失败：${message || '未知错误'}。请重启本地服务后再继续。`,
+                message: `设置已保存，但上一轮后台检查停止失败：${message || '未知错误'}。请重启本地服务后再继续。`,
               });
             });
           }
@@ -19861,6 +20206,9 @@ async function handleApi(req, res, parsedUrl) {
           allowAutoScanRetryAfterFailure: true,
         });
         const responseManualKeyAccountState = manualKeyRequestAccountState(saved, settingsRequestKeyContext);
+        const responseIdentityUpgradeAccount = settingsIdentityUpgrade
+          ? publicAccount(settingsIdentityUpgradeAccount)
+          : null;
         response = {
           ok: true,
           settings: saved,
@@ -19883,7 +20231,9 @@ async function handleApi(req, res, parsedUrl) {
             previous_fingerprint: settingsIdentityUpgrade.previous_fingerprint,
             next_fingerprint: settingsIdentityUpgrade.next_fingerprint,
           } : null,
-          account: settingsIdentityUpgrade ? publicAccount(settingsIdentityUpgradeAccount) : null,
+          account_id: responseIdentityUpgradeAccount?.account_id || null,
+          account_fingerprint: responseIdentityUpgradeAccount?.manual_key_account_fingerprint || null,
+          account: responseIdentityUpgradeAccount,
         };
       }
       return sendJson(res, 200, response);
@@ -19985,7 +20335,8 @@ async function handleApi(req, res, parsedUrl) {
       throw requestValidationError('本地动作恢复必须带 action_id；已拒绝按类型读取最近一次证据。', 428, 'local_action_id_required');
     }
     const expectedTarget = localActionEvidenceExpectedTargetFromQuery(parsedUrl);
-    const evidence = localActionEvidenceFor(kind, actionId);
+    const evidence = await reconcileHistoryDeleteEvidenceForQuery(kind, actionId)
+      || localActionEvidenceFor(kind, actionId);
     const targetBinding = evidence ? assertLocalActionEvidenceMatchesExpectedTarget(evidence, expectedTarget) : null;
     return sendJson(res, 200, {
       ok: true,
@@ -20095,10 +20446,10 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/scheduler/clear-unverified-legacy-cursors' && req.method === 'POST') {
-    const abort = requestAbortSignal(req, res, '清理旧游标已取消。');
+    const abort = requestAbortSignal(req, res, '清理未验证游标已取消。');
     try {
       const body = await readBody(req, 1024, { signal: abort.signal, requireObject: true });
-      if (abort.signal.aborted) throw abort.signal.reason || requestAbortError('清理旧游标已取消。');
+      if (abort.signal.aborted) throw abort.signal.reason || requestAbortError('清理未验证游标已取消。');
       const status = getSchedulerStatus();
       if (status.running) {
         throw Object.assign(new Error('后台检查正在运行，不能同时清理调度游标。请等待本轮检查结束后再试。'), {
@@ -20121,7 +20472,7 @@ async function handleApi(req, res, parsedUrl) {
           latestSettings = await loadSettings();
         } catch (e) {
           const message = sanitizeText(e?.message || String(e));
-          postCommitStatusError = `旧游标已清理，但保存后设置复核失败${message ? `：${message}` : ''}`;
+          postCommitStatusError = `未验证游标已清理，但保存后设置复核失败${message ? `：${message}` : ''}`;
           logWarn('scheduler_clear_legacy_cursors_post_commit_status_failed', {
             phase: 'settings',
             error: message,
@@ -20137,7 +20488,7 @@ async function handleApi(req, res, parsedUrl) {
           const message = cancelledAfterCommit
             ? '页面请求已取消，已跳过保存后状态复核'
             : sanitizeText(e?.message || String(e));
-          postCommitStatusError = `旧游标已清理，但保存后状态刷新失败${message ? `：${message}` : ''}`;
+          postCommitStatusError = `未验证游标已清理，但保存后状态刷新失败${message ? `：${message}` : ''}`;
           logWarn('scheduler_clear_legacy_cursors_post_commit_status_failed', {
             phase: cancelledAfterCommit ? 'cancelled' : 'status',
             error: message,
@@ -20954,6 +21305,7 @@ async function handleApi(req, res, parsedUrl) {
         ? responseAccountForNeedSetup
         : (pickAccount(processStatus.accounts || [], accountId) || statusMirrorAccount || {});
       const responseAccountId = accountOptionValue(responseAccount) || accountId;
+      const responsePublicAccount = publicAccount(responseAccount);
       const validationOk = keyStatus.ok === true;
       const responseIdentityUpgrade = manualOnly && statusAccountBeforeIdentityVerification
         ? manualKeyIdentityUpgradeProof(statusAccountBeforeIdentityVerification, responseAccount, {
@@ -20970,7 +21322,8 @@ async function handleApi(req, res, parsedUrl) {
         account_label: publicAccountLabel(responseAccount) || responseAccountId,
         account_source: String(responseAccount?.source || '').trim(),
         account_last_write_time: String(responseAccount?.last_write_time || responseAccount?.summary?.last_write_time || ''),
-        account: publicAccount(responseAccount),
+        account: responsePublicAccount,
+        account_fingerprint: responsePublicAccount?.manual_key_account_fingerprint || null,
         account_identity_upgrade: responseIdentityUpgrade ? {
           previous_fingerprint: responseIdentityUpgrade.previous_fingerprint,
           next_fingerprint: responseIdentityUpgrade.next_fingerprint,
@@ -21249,6 +21602,7 @@ async function handleApi(req, res, parsedUrl) {
       const body = await readBody(req, 16 * 1024, { signal: abort.signal, requireObject: true });
       assertDigestBatchServiceInstance(body, '续租摘要批次');
       const owner = assertDigestBatchOwner(body.batch_id, digestBatchTokenFromRequest(req, body), '续租摘要批次');
+      throwIfDigestBatchCancelled(owner.id, '摘要批次已取消。', { token: owner.token });
       assertDigestBatchNotFinished(owner.id, owner.owner_hash, '续租摘要批次');
       let active = touchActiveDigestBatchLease(owner.id, { ownerHash: owner.owner_hash });
       let resumed = false;
@@ -21290,6 +21644,19 @@ async function handleApi(req, res, parsedUrl) {
         ownerHash: owner.owner_hash,
         source: 'batch_preview_recovery',
       });
+      const pendingState = digestBatchFinishPendingState(batchId);
+      if (pendingState.pending) {
+        return sendJson(res, 200, {
+          ok: true,
+          status: 'pending',
+          pending: true,
+          pending_reason: pendingState.reason,
+          pending_stage: pendingState.stage,
+          pending_deadline_at: pendingState.deadline_at,
+          batch_id: batchId,
+          service_instance_id: SERVICE_INSTANCE_ID,
+        });
+      }
       const accountContext = await authoritativeAccountContextForRequest({
         accountId: body.account_id,
         expectedFingerprint: expectedAccountFingerprintFromRequest(null, body),
@@ -21304,8 +21671,8 @@ async function handleApi(req, res, parsedUrl) {
         accountFingerprint: accountContext.account_fingerprint,
       });
       return sendJson(res, 200, preview
-        ? { ok: true, status: 'done', ...preview }
-        : { ok: true, status: 'missing', batch_id: batchId });
+        ? { ok: true, status: 'done', pending: false, ...preview }
+        : { ok: true, status: 'missing', pending: false, batch_id: batchId });
     } finally {
       abort.done();
     }
@@ -21422,6 +21789,7 @@ async function handleApi(req, res, parsedUrl) {
         owner_hash: digestBatchOwner.owner_hash,
         batch_index: batchIndex,
         account_id: body.account_id || '',
+        account_fingerprint: expectedAccountFingerprintFromRequest(null, body),
         group_id: body.group_id || body.groups?.[0]?.id || body.groups?.[0] || '',
         group: body.group_name || '',
         controller: abort.controller,
@@ -21444,6 +21812,7 @@ async function handleApi(req, res, parsedUrl) {
         owner_hash: digestBatchOwner.owner_hash,
         batch_index: batchIndex,
         account_id: body.account_id || '',
+        account_fingerprint: expectedAccountFingerprintFromRequest(null, body),
         group_id: body.group_id || body.groups?.[0]?.id || body.groups?.[0] || '',
         group: body.group_name || '',
         controller: abort.controller,
@@ -21525,6 +21894,7 @@ async function handleApi(req, res, parsedUrl) {
         batchId: owner.id,
         batchIndex,
         accountId,
+        accountFingerprint: accountContext.account_fingerprint,
         groupId,
       });
       return sendJson(res, 200, {
@@ -21641,7 +22011,7 @@ async function handleApi(req, res, parsedUrl) {
           signal: controller.signal,
           message: '摘要生成设置已变化，已拒绝保存旧长图；请重新生成。',
         });
-        assertWxDbIdentityGenerationCurrent(saveAccountIdentityGeneration, '保存长图');
+        assertWxDbIdentityGenerationCurrent(saveAccountIdentityGeneration, '保存长图', saveAccountContext.account_id);
         saveRenderCommitEvidencePath = localActionCommitEvidencePath(localActionId);
         preparedSaveRenderEvidence = prepareSaveRenderEvidence(verifiedDigest, {
           actionId: localActionId,
@@ -21669,12 +22039,12 @@ async function handleApi(req, res, parsedUrl) {
           signal: controller.signal,
           shouldAbort: () => !allowSaveAfterCancel && digestBatchShouldAbortSaves(saveBatchId, { token: saveBatchOwner.token }),
           commitBarrier: async () => {
-            assertWxDbIdentityGenerationCurrent(saveAccountIdentityGeneration, '保存长图');
+            assertWxDbIdentityGenerationCurrent(saveAccountIdentityGeneration, '保存长图', saveAccountContext.account_id);
             await assertDigestRuntimeSettingsCurrent(settings, {
               signal: controller.signal,
               message: '摘要生成设置已变化，已拒绝保存旧长图；请重新生成。',
             });
-            assertWxDbIdentityGenerationCurrent(saveAccountIdentityGeneration, '保存长图');
+            assertWxDbIdentityGenerationCurrent(saveAccountIdentityGeneration, '保存长图', saveAccountContext.account_id);
           },
           prepareCommitEvidence: committedItem => writeLocalActionOutputCommitEvidence(
             saveRenderCommitEvidencePath,
@@ -22206,8 +22576,12 @@ async function handleApi(req, res, parsedUrl) {
 
   if (pathname === '/api/history-delete' && req.method === 'POST') {
     const abort = requestAbortSignal(req, res, '历史删除请求已取消。');
+    let localActionLease = null;
+    let preparedDeleteEvidence = null;
     try {
-      const body = await readBody(req, 32 * 1024, { signal: abort.signal, requireObject: true });
+      const body = await readBody(req, LOCAL_ACTION_BODY_LIMIT, { signal: abort.signal, requireObject: true });
+      localActionLease = beginLocalAction(body, '删除历史记录');
+      const localActionId = localActionLease.action_id;
       const lookup = historyItemLookupFromBody(body);
       requireHistoryItemKey(lookup);
       requireHistoryFileVersion(lookup);
@@ -22217,10 +22591,55 @@ async function handleApi(req, res, parsedUrl) {
       }
       const settings = await loadSettings();
       throwIfRequestSignalAborted(abort.signal, '历史删除请求已取消。');
-      const result = await deleteHistoryItem(settings, lookup.digest_id, lookup, { signal: abort.signal });
+      preparedDeleteEvidence = prepareHistoryDeleteEvidence(lookup, { actionId: localActionId });
+      const preparedPersistence = await persistRecordedLocalActionEvidence(preparedDeleteEvidence);
+      if (preparedPersistence.evidence_persisted !== true) {
+        await discardPreparedLocalActionEvidence(preparedDeleteEvidence);
+        preparedDeleteEvidence = null;
+        throw localActionFailedError(
+          '无法持久化历史删除动作状态，已停止删除；请检查 data 目录写入权限后重试。',
+          'local_action_evidence_unavailable',
+          503,
+        );
+      }
+      let result;
+      try {
+        result = await deleteHistoryItem(settings, lookup.digest_id, lookup, { signal: abort.signal });
+      } catch (error) {
+        if (error?.mutation_outcome_unknown === true) {
+          resolveHistoryDeleteEvidence(preparedDeleteEvidence, { error });
+          rememberLocalActionEvidence(preparedDeleteEvidence);
+          await persistRecordedLocalActionEvidence(preparedDeleteEvidence);
+        } else {
+          await discardPreparedLocalActionEvidence(preparedDeleteEvidence);
+          preparedDeleteEvidence = null;
+        }
+        throw error;
+      }
+      resolveHistoryDeleteEvidence(preparedDeleteEvidence, { targetPresent: false, result });
+      rememberLocalActionEvidence(preparedDeleteEvidence);
+      const committedPersistence = await persistRecordedLocalActionEvidence(preparedDeleteEvidence);
+      if (committedPersistence.evidence_persisted !== true) {
+        throw Object.assign(new Error('历史记录已删除，但动作证据未能持久化；请刷新历史页核对。'), {
+          status: 500,
+          code: 'history_delete_evidence_persist_failed',
+          public_code: 'history_delete_evidence_persist_failed',
+          mutation_outcome_unknown: true,
+        });
+      }
       throwIfRequestSignalAborted(abort.signal, '历史删除请求已取消。');
-      return sendJson(res, 200, { ok: true, ...result });
+      return sendJson(res, 200, {
+        ok: true,
+        ...result,
+        local_action_id: localActionId,
+        local_action_committed: true,
+        verified: result?.deleted === true,
+        evidence_verified: true,
+        evidence_persisted: true,
+        committed_at: preparedDeleteEvidence.committed_at,
+      });
     } finally {
+      localActionLease?.done();
       abort.done();
     }
   }
@@ -22466,7 +22885,7 @@ async function handleApi(req, res, parsedUrl) {
       throwIfRequestSignalAborted(abort.signal, '历史重渲染预览已取消。');
       if (await outputDirSettingsChangedSince(settings, { signal: abort.signal })) {
         return rejectBeforeUpload(409, {
-          error: '输出目录已切换，已停止返回旧目录上下文的重渲染预览；请刷新历史页后在当前输出目录重新操作。',
+          error: '输出目录已切换，已停止返回其他输出目录上下文的重渲染预览；请刷新历史页后在当前输出目录重新操作。',
           code: 'output_dir_changed',
         });
       }
@@ -22521,28 +22940,28 @@ async function handleApi(req, res, parsedUrl) {
   }
 
   if (pathname === '/api/history-copy-current-output' && req.method === 'POST') {
-    const abort = requestAbortSignal(req, res, '复制旧目录长图已取消。');
+    const abort = requestAbortSignal(req, res, '复制其他输出目录长图已取消。');
     let localActionLease = null;
     let preparedHistoryCopyEvidence = null;
     let historyCopyCommitEvidencePath = '';
     let historyCopyWriteStarted = false;
     try {
       const body = await readBody(req, LOCAL_ACTION_BODY_LIMIT, { signal: abort.signal, requireObject: true });
-      localActionLease = beginLocalAction(body, '复制旧目录长图');
+      localActionLease = beginLocalAction(body, '复制其他输出目录长图');
       const localActionId = localActionLease.action_id;
       const settings = await loadSettings();
-      throwIfRequestSignalAborted(abort.signal, '复制旧目录长图已取消。');
+      throwIfRequestSignalAborted(abort.signal, '复制其他输出目录长图已取消。');
       const expectedCurrentOutputDirIdentity = normalizeOutputDirRequestIdentity(body.expected_current_output_dir_identity || '');
       if (expectedCurrentOutputDirIdentity && outputDirRequestIdentityFromSettings(settings) !== expectedCurrentOutputDirIdentity) {
         abort.done();
         return sendJson(res, 409, {
-          error: '当前输出目录已切换，旧目录 PNG 没有复制；请刷新历史页后再操作。',
+          error: '当前输出目录已切换，其他输出目录 PNG 没有复制；请刷新历史页后再操作。',
           code: 'output_dir_changed',
         });
       }
       const lookup = historyRerenderLookupFromBody(body);
       const item = await findHistoryItem(settings, lookup.digest_id, lookup, { signal: abort.signal });
-      throwIfRequestSignalAborted(abort.signal, '复制旧目录长图已取消。');
+      throwIfRequestSignalAborted(abort.signal, '复制其他输出目录长图已取消。');
       if (!item) {
         abort.done();
         return sendJson(res, 404, { error: '历史记录已不存在，可能已被清理或输出目录已切换。', code: 'history_item_missing' });
@@ -22554,29 +22973,29 @@ async function handleApi(req, res, parsedUrl) {
       }
       await assertExpectedHistoryItemFileVersion(settings, item, lookup, { extensions: ['.png'], signal: abort.signal });
       const saved = await readHistoryDigestResult(settings, item.digest_id, lookup, { signal: abort.signal });
-      throwIfRequestSignalAborted(abort.signal, '复制旧目录长图已取消。');
+      throwIfRequestSignalAborted(abort.signal, '复制其他输出目录长图已取消。');
       if (!saved.digest) {
         abort.done();
         return sendJson(res, saved.status || 404, { error: saved.message || '原摘要 JSON 已不存在，不能复制到当前目录。', code: saved.code || 'digest_json_missing' });
       }
       const latestSettings = await loadSettings();
-      throwIfRequestSignalAborted(abort.signal, '复制旧目录长图已取消。');
+      throwIfRequestSignalAborted(abort.signal, '复制其他输出目录长图已取消。');
       if (outputDirSettingsIdentity(latestSettings) !== outputDirSettingsIdentity(settings)) {
         abort.done();
         return sendJson(res, 409, {
-          error: '输出目录已切换，旧目录 PNG 没有复制；请刷新历史页后再操作。',
+          error: '输出目录已切换，其他输出目录 PNG 没有复制；请刷新历史页后再操作。',
           code: 'output_dir_changed',
         });
       }
       const assertCopyTargetStillCurrent = async () => {
         const currentSettings = await loadSettings();
-        throwIfRequestSignalAborted(abort.signal, '复制旧目录长图已取消。');
+        throwIfRequestSignalAborted(abort.signal, '复制其他输出目录长图已取消。');
         if (outputDirSettingsIdentity(currentSettings) !== outputDirSettingsIdentity(latestSettings)) {
-          throw outputDirChangedError('输出目录已在复制期间切换，旧目录 PNG 没有提交到当前目录；请刷新历史页后再操作。');
+          throw outputDirChangedError('输出目录已在复制期间切换，其他输出目录 PNG 没有提交到当前目录；请刷新历史页后再操作。');
         }
       };
       const latestItem = await findHistoryItem(latestSettings, lookup.digest_id, lookup, { signal: abort.signal });
-      throwIfRequestSignalAborted(abort.signal, '复制旧目录长图已取消。');
+      throwIfRequestSignalAborted(abort.signal, '复制其他输出目录长图已取消。');
       if (!latestItem) {
         abort.done();
         return sendJson(res, 404, { error: '历史记录已不存在，可能已被清理或输出目录已切换。', code: 'history_item_missing' });
@@ -22588,7 +23007,7 @@ async function handleApi(req, res, parsedUrl) {
       }
       await assertExpectedHistoryItemFileVersion(latestSettings, latestItem, lookup, { extensions: ['.png'], signal: abort.signal });
       const latestSaved = await readHistoryDigestResult(latestSettings, latestItem.digest_id, lookup, { signal: abort.signal });
-      throwIfRequestSignalAborted(abort.signal, '复制旧目录长图已取消。');
+      throwIfRequestSignalAborted(abort.signal, '复制其他输出目录长图已取消。');
       if (!latestSaved.digest) {
         abort.done();
         return sendJson(res, latestSaved.status || 404, { error: latestSaved.message || '原摘要 JSON 已不存在，不能复制到当前目录。', code: latestSaved.code || 'digest_json_missing' });
@@ -22605,7 +23024,7 @@ async function handleApi(req, res, parsedUrl) {
         await cleanupLocalActionCommitEvidence(historyCopyCommitEvidencePath);
         await discardPreparedLocalActionEvidence(preparedHistoryCopyEvidence);
         preparedHistoryCopyEvidence = null;
-        throw localActionFailedError('无法持久化旧目录 PNG 复制动作状态，已停止写入；请检查 data 目录写入权限后重试。', 'local_action_evidence_unavailable', 503);
+        throw localActionFailedError('无法持久化其他输出目录 PNG 复制动作状态，已停止写入；请检查 data 目录写入权限后重试。', 'local_action_evidence_unavailable', 503);
       }
       const commitEvidenceContext = {
         actionId: localActionId,
@@ -22637,7 +23056,7 @@ async function handleApi(req, res, parsedUrl) {
       const postCommitSettings = await loadSettings().catch(e => {
         if (!next.local_action_after_commit_reason) {
           next.local_action_after_commit_reason = 'post_commit_check_failed';
-          next.local_action_after_commit_error = `旧目录 PNG 已复制，但提交后输出目录复核失败：${e?.message || String(e)}`;
+          next.local_action_after_commit_error = `其他输出目录 PNG 已复制，但提交后输出目录复核失败：${e?.message || String(e)}`;
         }
         return null;
       });
@@ -22772,7 +23191,7 @@ async function handleApi(req, res, parsedUrl) {
       if (outputDirSettingsIdentity(latestSettings) !== outputDirSettingsIdentity(settings)) {
         abort.done();
         return sendJson(res, 409, {
-          error: '输出目录已切换，已停止向旧输出目录写入重渲染版本；请刷新历史页后在当前输出目录重新生成。',
+          error: '输出目录已切换，已停止向其他输出目录写入重渲染结果；请刷新历史页后在当前输出目录重新生成。',
           code: 'output_dir_changed',
         });
       }
@@ -22836,7 +23255,7 @@ async function handleApi(req, res, parsedUrl) {
       };
       const rerenderOutputCommitBarrier = outputDirCommitBarrier(
         latestSettings,
-        '输出目录已在重渲染提交期间切换；旧目录没有保留这次新版本，请刷新历史页后重试。',
+        '输出目录已在重渲染提交期间切换；原输出目录没有保留本次结果，请刷新历史页后重试。',
       );
       const next = restoreToCurrentOutput
         ? await restoreHistoryDigestToCurrentOutput({
@@ -23692,7 +24111,7 @@ async function handleApi(req, res, parsedUrl) {
       } catch (e) {
         throw outputDirOpenValidationError(e);
       }
-      assertExpectedOutputDirIdentity(settings, body, '输出目录已切换，已停止打开旧输出目录；请刷新设置页后重试。', { required: true });
+      assertExpectedOutputDirIdentity(settings, body, '输出目录已切换，已停止打开其他输出目录；请刷新设置页后重试。', { required: true });
       throwIfRequestSignalAborted(abort.signal, '打开输出目录已取消。');
       const openOutputCapability = await requireLocalActionCapability('open_output', { signal: abort.signal, actionLabel: '打开输出目录' });
       let outputDirWasMissing = false;
@@ -23706,7 +24125,7 @@ async function handleApi(req, res, parsedUrl) {
       let opener;
       await withSettingsSaveTransaction(async () => {
         actionSettings = await loadSettings();
-        assertExpectedOutputDirIdentity(actionSettings, body, '输出目录已切换，已停止打开旧输出目录；请刷新设置页后重试。', { required: true });
+      assertExpectedOutputDirIdentity(actionSettings, body, '输出目录已切换，已停止打开其他输出目录；请刷新设置页后重试。', { required: true });
         throwIfRequestSignalAborted(abort.signal, '打开输出目录已取消。');
         try {
           dir = outputDirFromSettings(actionSettings);
@@ -25492,7 +25911,7 @@ async function runDigestSSE(req, res, body, requestId = null) {
     if (!sseDisconnectedAt || controller.signal.aborted) return;
     const latestRecoveryAt = Number(activeRequest?.sse_recovery_touched_at || 0) || 0;
     if (latestRecoveryAt > observedRecoveryAt) observedRecoveryAt = latestRecoveryAt;
-    const deadlineAt = Math.max(sseDisconnectedAt, observedRecoveryAt) + DIGEST_SSE_DISCONNECT_GRACE_MS;
+    const deadlineAt = digestSseRecoveryDeadlineAt(sseDisconnectedAt, observedRecoveryAt);
     if (activeRequest) activeRequest.sse_recovery_deadline_at = deadlineAt;
     disconnectGraceTimer = setTimeout(() => {
       disconnectGraceTimer = null;
@@ -25522,7 +25941,7 @@ async function runDigestSSE(req, res, body, requestId = null) {
     observedRecoveryAt = Number(activeRequest?.sse_recovery_touched_at || 0) || 0;
     if (activeRequest) {
       activeRequest.sse_connection_lost_at = sseDisconnectedAt;
-      activeRequest.sse_recovery_deadline_at = sseDisconnectedAt + DIGEST_SSE_DISCONNECT_GRACE_MS;
+      activeRequest.sse_recovery_deadline_at = digestSseRecoveryDeadlineAt(sseDisconnectedAt);
     }
     logInfo('digest_sse_client_disconnected', {
       batch_id: batchId,
@@ -26206,7 +26625,7 @@ async function runDigestSSE(req, res, body, requestId = null) {
       actionLabel: 'AI 总结完成后复核账号',
       signal: controller.signal,
     });
-    const handoffIdentityGeneration = wxDbIdentityChangeGeneration();
+    const handoffIdentityGeneration = wxDbIdentityChangeGeneration(handoffAccountContext.account_id);
     ensureActive();
     digest.input_message_count = collection.message_count;
     digest.scanned_message_count = collection.scanned_message_count || collection.message_count;
@@ -26249,7 +26668,7 @@ async function runDigestSSE(req, res, body, requestId = null) {
         ? '摘要已完成，等待浏览器整理结构、合并 Markdown、刷新预览'
         : '摘要已完成，等待浏览器检查结构、计算版面、绘制长图、生成图片、保存历史',
     });
-    assertWxDbIdentityGenerationCurrent(handoffIdentityGeneration, '发送摘要到浏览器');
+    assertWxDbIdentityGenerationCurrent(handoffIdentityGeneration, '发送摘要到浏览器', handoffAccountContext.account_id);
     ensureActive();
     handoffSaveTicket = registerDigestSaveTicket({
       digest,
@@ -26278,7 +26697,15 @@ async function runDigestSSE(req, res, body, requestId = null) {
       digest: terminalDigest,
     });
     digestHandoffCommitted = true;
-    const digestSent = sendTerminalEvent('digest', terminalDigest);
+    const digestEvent = {
+      ...terminalDigest,
+      ...(terminalRegistration.persisted === true ? {} : {
+        terminal_recovery_persisted: false,
+        terminal_recovery_code: terminalRegistration.persistence_code,
+        terminal_recovery_message: terminalRegistration.persistence_message,
+      }),
+    };
+    const digestSent = sendTerminalEvent('digest', digestEvent);
     if (!digestSent) {
       logWarn('digest_terminal_stream_unavailable', {
         group_id: groupId,
@@ -26520,7 +26947,7 @@ function tryListen(port) {
       socket.once('close', () => ACTIVE_SOCKETS.delete(socket));
     });
     server.once('error', err => {
-      if (err.code === 'EADDRINUSE') resolve(null);
+      if (isLoopbackPortUnavailableError(err)) resolve(null);
       else reject(err);
     });
     server.listen(port, HOST, () => resolve(server));
@@ -26784,6 +27211,8 @@ if (entry === url.fileURLToPath(import.meta.url)) {
 }
 
 export const __mainInternals = {
+  readBody,
+  digestSseRecoveryDeadlineAt,
   attachmentDisposition,
   trustedPosixSystemCommandCandidates,
   resolveTrustedSystemCommandPath,
@@ -26809,6 +27238,8 @@ export const __mainInternals = {
   groupMirrorPreparationReason,
   groupListResultCacheReadinessIdentity,
   groupListResultCacheKey,
+  rememberGroupListResult,
+  cachedGroupListResult,
   groupListReadInFlightKey,
   groupListReadOperationStrength,
   joinGroupListReadOperation,
@@ -26841,12 +27272,14 @@ export const __mainInternals = {
   selectCompleteDigestTerminalRecoveryBatches,
   cleanupDigestTerminalResults,
   digestTerminalResultForRequest,
+  activeDigestRequestForTerminalResult,
   markDigestTerminalResultSaved,
   digestTerminalResultSummariesForBatch,
   releaseDigestTerminalResults,
   registerDigestSaveTicket,
   cleanupDigestSaveTickets,
   claimDigestSaveTicketForRequest,
+  handleWxDbMirrorIdentityChanged,
   invalidateDigestStateAfterWxDbIdentityChange,
   assertStoredDigestAccountContext,
   assertWxDbIdentityGenerationCurrent,
@@ -26897,6 +27330,7 @@ export const __mainInternals = {
   publicAccount,
   runtimeTmpPreservePaths,
   localActionEvidenceExpectedTargetBinding,
+  localRevealForegroundEvidence,
   recordClipboardCopyEvidence,
   recordTextClipboardCopyEvidence,
   rememberGroupProgress,
@@ -26951,6 +27385,7 @@ export const __mainInternals = {
   sanitizeDiagnosticsPayload,
   sanitizeUserFacingError,
   redactSensitiveFreeText,
+  readPngUploadToTemp,
   launchDetachedOpener,
   runNativeFileManagerCommand,
   linuxFileManager1ProbeOutputSupported,

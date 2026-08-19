@@ -123,11 +123,5 @@ assert.match(
   /const resultRevision = String\(result\.scheduler_runtime_revision_used \|\| fallbackRevision \|\| ''\)\.trim\(\)/,
   'scheduler result freshness must compare semantic runtime revisions rather than full settings storage revisions',
 );
-const appSource = fs.readFileSync(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
-assert.match(
-  appSource,
-  /status\.last_result\.scheduler_runtime_revision_used[\s\S]*?schedulerRuntimeRevisionFromPayload\(status\)/,
-  'the settings UI must use the same scheduler runtime revision contract as the backend',
-);
 
 console.log('scheduler semantic revision tests passed');

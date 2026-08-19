@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { assertRealOutputDir, assertSafeTmpPath, outputDirFromSettings, OUTPUTS_DIR, OUTPUTS_TMP_DIR, PROJECT_ROOT, TMP_DIR, toProjectRelative, isInside, platformPathIdentity } from '../lib/paths.js';
 import { readFileHandleBounded } from '../lib/bounded-read.js';
+import { createFileHandleCloser } from '../lib/bounded-read.js';
 import { ensureDir, readJson, renameAtomicWithRetry, syncDirectory, writeJsonAtomic } from '../lib/json-store.js';
 import { preserveInvalidFileBackup } from '../lib/invalid-backup.js';
 import { settingsExportPolicyRevision, settingsExportPolicyRevisionMatches } from '../config/settings.js';
@@ -19,8 +20,8 @@ import {
   validatePngFileHeaderHandle,
   validatePngFileHandle,
 } from './png-validate.js';
-import * as DigestView from '../web/public/js/digest-view-model.js';
-import { toWellFormedText, truncateUnicodeText, truncateUtf8Text } from '../web/public/js/unicode-text.js';
+import * as DigestView from '../web/public/js/shared/digest-view-model.js';
+import { toWellFormedText, truncateUnicodeText, truncateUtf8Text } from '../web/public/js/shared/unicode-text.js';
 
 let historyWriteQueue = Promise.resolve();
 const historyWriteLockContext = new AsyncLocalStorage();
@@ -65,6 +66,8 @@ const HISTORY_RERENDER_METADATA_SUPERSEDED_LIMIT = 32;
 export const HISTORY_RERENDER_SOURCE_MAX_BYTES = 256 * 1024 * 1024;
 const HISTORY_SAVE_TRANSACTION_VERSION = 1;
 const HISTORY_SAVE_TRANSACTION_SUFFIX = '.save.json';
+const HISTORY_SAVE_TRANSITION_SCHEMA = 'wx-summary.digest-save-transition.v1';
+const HISTORY_SAVE_TRANSITION_SEPARATOR = '\n\u001e';
 const HISTORY_ROOT_MARKER_FILE = '.wx-summary-history-root.json';
 const HISTORY_ROOT_MARKER_VERSION = 1;
 const HISTORY_ROOT_MARKER_MAX_BYTES = 16 * 1024;
@@ -99,6 +102,23 @@ async function writeHistoryIndexAtomic(file, items) {
   try {
     await writeJsonAtomic(file, items, { maxBytes: HISTORY_INDEX_JSON_MAX_BYTES });
   } catch (error) {
+    if (error?.atomic_write_may_have_committed === true) {
+      try {
+        error.index_may_have_committed = true;
+        error.public_code = error.public_code || 'history_index_commit_unknown';
+      } catch {
+        const wrapped = Object.assign(new Error('历史索引写入结果无法确认；索引文件可能已经替换，已保留待恢复状态。'), {
+          status: 500,
+          code: 'history_index_commit_unknown',
+          public_code: 'history_index_commit_unknown',
+          index_may_have_committed: true,
+          original_error: error?.message || String(error || 'index write outcome unknown'),
+          cause: error,
+        });
+        throw wrapped;
+      }
+      throw error;
+    }
     if (error?.code !== 'json_payload_too_large') throw error;
     throw Object.assign(new Error('历史索引已达到 64MB 安全上限，未写入可能无法再次读取的索引。请清理旧历史或切换输出目录后重试。'), {
       status: 507,
@@ -342,9 +362,20 @@ function waitForCombinedHistoryState(promise, signal = null) {
   if (!signal) return promise;
   throwIfOutputAborted(signal);
   return new Promise((resolve, reject) => {
-    const onAbort = () => reject(Object.assign(new Error('请求已取消'), { status: 499, name: 'AbortError' }));
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, Object.assign(new Error('请求已取消'), { status: 499, name: 'AbortError' }));
     signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    Promise.resolve(promise).then(
+      value => finish(resolve, value),
+      error => finish(reject, error),
+    );
   });
 }
 
@@ -524,7 +555,7 @@ async function buildCombinedHistoryState(settings, currentBase, {
       discovered_base_count: bases.length,
       pending_dir_count: discovery.pending_dir_count,
       pass_count: discovery.pass_count,
-      message: `旧输出目录较多，本轮最多新增 ${discovery.limit} 个历史目录；已累计识别 ${bases.length} 个，可继续扫描剩余目录。`,
+      message: `其他输出目录较多，本轮最多新增 ${discovery.limit} 个历史目录；已累计识别 ${bases.length} 个，可继续扫描剩余目录。`,
     });
   }
   if (discovery.visit_limit_reached) {
@@ -681,7 +712,7 @@ async function readCombinedHistoryBase(settings, currentBase, base, bases, { sig
     warnings.push({
       code: 'history_base_unreadable',
       base: toProjectRelative(base),
-      message: `旧输出目录 ${toProjectRelative(base)} 的历史索引不可读，且没有可只读重建的摘要 JSON，已跳过。`,
+      message: `其他输出目录 ${toProjectRelative(base)} 的历史索引不可读，且没有可只读重建的摘要 JSON，已跳过。`,
     });
     baseItems = [];
   }
@@ -1586,7 +1617,7 @@ async function recoverHistoryIndexReadOnly(settings, cause, base, { signal = nul
   throwIfOutputAborted(signal);
   const rebuilt = await rebuildHistoryIndexFromDigests(base, { signal, excludeBases: rebuildExcludeBases });
   if (!rebuilt.length) {
-    const err = new Error(`旧输出目录 ${toProjectRelative(base)} 的历史索引不可读，且未找到可重建的摘要 JSON。`);
+    const err = new Error(`其他输出目录 ${toProjectRelative(base)} 的历史索引不可读，且未找到可重建的摘要 JSON。`);
     err.status = 500;
     err.code = 'history_index_unreadable';
     err.cause = cause;
@@ -2131,6 +2162,75 @@ function digestSaveTransactionMarkerBuffer(payload = {}) {
   return buffer;
 }
 
+function digestSaveTransactionTransitionBuffer(payload = {}) {
+  const state = String(payload?.state || '').trim();
+  if (!['committed', 'indexed'].includes(state)) {
+    throw Object.assign(new Error('长图保存事务状态转移无效。'), { code: 'output_save_transition_invalid' });
+  }
+  const transition = {
+    schema: HISTORY_SAVE_TRANSITION_SCHEMA,
+    version: HISTORY_SAVE_TRANSACTION_VERSION,
+    operation_id: cleanDigestSaveOperationId(payload?.operation_id),
+    state,
+    committed_at: String(payload?.committed_at || ''),
+    indexed_at: String(payload?.indexed_at || ''),
+    saved_file_version: String(payload?.saved_file_version || '').trim(),
+    saved_digest_file_version: String(payload?.saved_digest_file_version || '').trim(),
+  };
+  if (!transition.operation_id) {
+    throw Object.assign(new Error('长图保存事务缺少操作标识。'), { code: 'output_save_transition_invalid' });
+  }
+  return Buffer.from(`${HISTORY_SAVE_TRANSITION_SEPARATOR}${JSON.stringify(transition)}`, 'utf-8');
+}
+
+export function parseDigestSaveTransactionMarkerBuffer(buffer = null) {
+  let records;
+  try {
+    records = (Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || ''))
+      .toString('utf-8')
+      .split(HISTORY_SAVE_TRANSITION_SEPARATOR);
+  } catch {
+    return null;
+  }
+  let transaction;
+  try {
+    transaction = JSON.parse(records[0]);
+  } catch {
+    return null;
+  }
+  if (!transaction || typeof transaction !== 'object' || Array.isArray(transaction)) return null;
+  const operationId = cleanDigestSaveOperationId(transaction.operation_id);
+  if (!operationId) return transaction;
+  const stateRank = { prepared: 0, committed: 1, indexed: 2 };
+  let currentRank = stateRank[String(transaction.state || '')] ?? -1;
+  for (const record of records.slice(1)) {
+    let transition;
+    try {
+      transition = JSON.parse(record);
+    } catch {
+      continue;
+    }
+    const nextState = String(transition?.state || '').trim();
+    const nextRank = stateRank[nextState] ?? -1;
+    if (transition?.schema !== HISTORY_SAVE_TRANSITION_SCHEMA
+      || Number(transition?.version || 0) !== HISTORY_SAVE_TRANSACTION_VERSION
+      || cleanDigestSaveOperationId(transition?.operation_id) !== operationId
+      || nextRank < currentRank
+      || nextRank < stateRank.committed) continue;
+    transaction = {
+      ...transaction,
+      state: nextState,
+      committed_at: String(transition.committed_at || transaction.committed_at || ''),
+      indexed_at: String(transition.indexed_at || transaction.indexed_at || ''),
+      saved_file_version: String(transition.saved_file_version || transaction.saved_file_version || '').trim(),
+      saved_digest_file_version: String(transition.saved_digest_file_version
+        || transaction.saved_digest_file_version || '').trim(),
+    };
+    currentRank = nextRank;
+  }
+  return transaction;
+}
+
 async function readDigestSaveTransactionMarker(base, markerPath, { signal = null } = {}) {
   throwIfOutputAborted(signal);
   const marker = path.resolve(String(markerPath || ''));
@@ -2146,7 +2246,7 @@ async function readDigestSaveTransactionMarker(base, markerPath, { signal = null
       signal,
       max_bytes: HISTORY_DIGEST_JSON_MAX_BYTES + 64 * 1024,
     });
-    raw = JSON.parse(data.toString('utf-8'));
+    raw = parseDigestSaveTransactionMarkerBuffer(data);
   } catch (error) {
     if (isOutputAbortError(error)) throw error;
     return null;
@@ -2479,7 +2579,7 @@ async function recoverDigestSaveTransactionMarker(base, markerPath, { signal = n
       savedFileVersion: pngVersion,
       savedDigestFileVersion: digestVersion,
     });
-    await writeBinaryAtomic(transaction.marker_path, digestSaveTransactionMarkerBuffer(committed), { signal });
+    await appendDigestSaveTransactionTransition(transaction.marker_path, committed, { signal });
     committed = { ...committed, marker_path: transaction.marker_path, file_path: transaction.file_path, digest_path: transaction.digest_path };
   }
   return {
@@ -2598,7 +2698,7 @@ async function markDigestSaveTransactionsIndexed(base, transactions = [], items 
       savedFileVersion: current.saved_file_version,
       savedDigestFileVersion: current.saved_digest_file_version,
     });
-    await writeBinaryAtomic(current.marker_path, digestSaveTransactionMarkerBuffer(indexed), { signal });
+    await appendDigestSaveTransactionTransition(current.marker_path, indexed, { signal });
   }
 }
 
@@ -2618,7 +2718,7 @@ async function legacyPngOnlyHistoryItem(base, pngPath, { signal = null } = {}) {
   const name = path.basename(resolved, path.extname(resolved));
   const digestId = `legacy_png_${crypto.createHash('sha256').update(historyPathDedupeKey(resolved)).digest('hex').slice(0, 24)}`;
   const createdAt = stat.mtime?.toISOString?.() || new Date().toISOString();
-  const title = cleanHistorySearchText(name, HISTORY_SEARCH_HEADLINE_MAX_CHARS) || '旧版仅长图';
+  const title = cleanHistorySearchText(name, HISTORY_SEARCH_HEADLINE_MAX_CHARS) || '仅长图历史';
   return {
     digest_id: digestId,
     group: title,
@@ -2628,8 +2728,8 @@ async function legacyPngOnlyHistoryItem(base, pngPath, { signal = null } = {}) {
     relative_path: toProjectRelative(resolved),
     model: '',
     message_count: 0,
-    headline: '旧版仅长图',
-    search_text: cleanHistorySearchText(`${title} 旧版仅长图 ${toProjectRelative(resolved)}`, HISTORY_SEARCH_TEXT_MAX_CHARS),
+    headline: '仅长图历史',
+    search_text: cleanHistorySearchText(`${title} 仅长图历史 ${toProjectRelative(resolved)}`, HISTORY_SEARCH_TEXT_MAX_CHARS),
     created_at: createdAt,
     mtime_ms: Number(stat.mtimeMs || 0) || 0,
   };
@@ -2904,7 +3004,7 @@ export async function restoreHistoryDigestToCurrentOutput({ settings, item, dige
   const currentBase = await safeOutputBase(settings);
   const sourceBase = historyBaseForItem(currentBase, sourceItem);
   if (historyOutputBaseMatches(currentBase, sourceBase)) {
-    throw historyRestoreToCurrentOutputError('当前输出目录中的历史应使用原地重渲染，不能走旧目录恢复流程。', 'history_restore_source_current');
+    throw historyRestoreToCurrentOutputError('当前输出目录中的历史应使用原地重渲染，不能重复执行恢复到当前目录流程。', 'history_restore_source_current');
   }
   await assertHistoryItemOwnedByBase(sourceBase, sourceItem, { signal });
   const sourceHistoryItemKey = historyItemKeyForItem(sourceBase, sourceItem);
@@ -3004,7 +3104,7 @@ export async function copyHistoryDigestPngToCurrentOutput({ settings, item, dige
     version_artifact: 'png',
     max_bytes: RENDERED_PNG_MAX_BYTES,
     validate_png: true,
-    missingMessage: '旧输出目录中的 PNG 已不存在，不能复制到当前目录。',
+    missingMessage: '其他输出目录中的 PNG 已不存在，不能复制到当前目录。',
     missingCode: 'png_missing',
   });
   const pngSha256 = crypto.createHash('sha256').update(pngBuffer).digest('hex');
@@ -3641,9 +3741,11 @@ async function readHistoryMarkdownSearchText(base, item = {}, { signal = null, m
   const limit = Math.max(0, Math.min(HISTORY_SEARCH_MARKDOWN_FALLBACK_MAX_BYTES, Number(maxBytes || 0) || 0));
   if (!limit) return { status: 'budget_exhausted', text: '' };
   let handle = null;
+  let closeHandle = null;
   try {
     throwIfOutputAborted(signal);
     handle = await fsp.open(filePath, 'r');
+    closeHandle = createFileHandleCloser(handle);
     const stat = await handle.stat();
     if (!stat?.isFile?.()) return { status: 'not_file', text: '' };
     if (stat.size > HISTORY_SEARCH_MARKDOWN_FALLBACK_MAX_BYTES) {
@@ -3653,6 +3755,8 @@ async function readHistoryMarkdownSearchText(base, item = {}, { signal = null, m
     const data = await readFileHandleBounded(handle, limit, {
       chunkBytes: 1024 * 1024,
       checkAbort: () => throwIfOutputAborted(signal),
+      signal,
+      closeHandle,
     });
     throwIfOutputAborted(signal);
     return {
@@ -5439,7 +5543,7 @@ async function discoverNestedHistoryBasesForMutation(base, { signal = null } = {
   throwIfOutputAborted(signal);
   const incomplete = scan.pending_dirs.length > 0 || scan.limit_reached || scan.visit_limit_reached;
   if (incomplete || scan.warnings.length) {
-    throw Object.assign(new Error('历史目录归属扫描未完成，已停止修改文件，避免误操作嵌套旧输出目录。请检查输出目录权限或减少目录层级后重试。'), {
+    throw Object.assign(new Error('历史目录归属扫描未完成，已停止修改文件，避免误操作嵌套其他输出目录。请检查输出目录权限或减少目录层级后重试。'), {
       status: 500,
       code: 'history_ownership_scan_incomplete',
       public_code: 'history_ownership_scan_incomplete',
@@ -5453,7 +5557,7 @@ async function discoverNestedHistoryBasesForMutation(base, { signal = null } = {
 async function assertHistoryItemOwnedByBase(base, item, { signal = null } = {}) {
   const nestedBases = await discoverNestedHistoryBasesForMutation(base, { signal });
   if (!historyItemNestedOwnerBase(base, item, nestedBases)) return nestedBases;
-  throw Object.assign(new Error('这条历史实际属于嵌套的旧输出目录，已停止修改；请刷新历史页后重试。'), {
+  throw Object.assign(new Error('这条历史实际属于另一个嵌套输出目录，已停止修改；请刷新历史页后重试。'), {
     status: 409,
     code: 'history_item_root_changed',
     public_code: 'history_item_root_changed',
@@ -6335,8 +6439,10 @@ function historyPngValidationOptions() {
 export async function inspectOutputPngFile(filePath, { signal = null, shouldAbort = null, validate_inflated = true } = {}) {
   throwIfOutputAborted(signal, shouldAbort);
   let handle = null;
+  let closeHandle = null;
   try {
     handle = await fsp.open(filePath, 'r');
+    closeHandle = createFileHandleCloser(handle);
   } catch (e) {
     if (e?.code === 'ENOENT') throw outputFileMissingError('长图文件已不存在，可能已被移动或删除。', 'png_missing');
     throw e;
@@ -6348,6 +6454,7 @@ export async function inspectOutputPngFile(filePath, { signal = null, shouldAbor
     const dimensions = await validatePngFileHandle(handle, {
       ...historyPngValidationOptions(),
       signal,
+      closeHandle,
       validateInflatedPayload: validate_inflated !== false,
     });
     throwIfOutputAborted(signal, shouldAbort);
@@ -6360,15 +6467,17 @@ export async function inspectOutputPngFile(filePath, { signal = null, shouldAbor
     }
     return { stat: afterStat, dimensions, file_version: afterVersion || beforeVersion };
   } finally {
-    await handle?.close?.().catch(() => {});
+    await closeHandle?.().catch(() => {});
   }
 }
 
 async function inspectOutputPngFileHeader(filePath, { signal = null, shouldAbort = null } = {}) {
   throwIfOutputAborted(signal, shouldAbort);
   let handle = null;
+  let closeHandle = null;
   try {
     handle = await fsp.open(filePath, 'r');
+    closeHandle = createFileHandleCloser(handle);
   } catch (e) {
     if (e?.code === 'ENOENT') throw outputFileMissingError('长图文件已不存在，可能已被移动或删除。', 'png_missing');
     throw e;
@@ -6380,6 +6489,7 @@ async function inspectOutputPngFileHeader(filePath, { signal = null, shouldAbort
     const dimensions = await validatePngFileHeaderHandle(handle, {
       ...historyPngValidationOptions(),
       signal,
+      closeHandle,
     });
     throwIfOutputAborted(signal, shouldAbort);
     const afterStat = await handle.stat();
@@ -6391,7 +6501,7 @@ async function inspectOutputPngFileHeader(filePath, { signal = null, shouldAbort
     }
     return { stat: afterStat, dimensions, file_version: afterVersion || beforeVersion };
   } finally {
-    await handle?.close?.().catch(() => {});
+    await closeHandle?.().catch(() => {});
   }
 }
 
@@ -6442,8 +6552,10 @@ export async function readOutputFileBuffer(filePath, {
 } = {}) {
   throwIfOutputAborted(signal, shouldAbort);
   let handle = null;
+  let closeHandle = null;
   try {
     handle = await fsp.open(filePath, 'r');
+    closeHandle = createFileHandleCloser(handle);
   } catch (e) {
     if (e?.code === 'ENOENT') throw outputFileMissingError(missingMessage, missingCode);
     throw e;
@@ -6462,12 +6574,15 @@ export async function readOutputFileBuffer(filePath, {
       await validatePngFileHandle(handle, {
         ...historyPngValidationOptions(),
         signal,
+        closeHandle,
       });
       throwIfOutputAborted(signal, shouldAbort);
     }
     const data = await readFileHandleBounded(handle, maxBytes, {
       chunkBytes: 1024 * 1024,
       checkAbort: () => throwIfOutputAborted(signal, shouldAbort),
+      signal,
+      closeHandle,
       createTooLargeError: actualBytes => outputFileTooLargeError(maxBytes, actualBytes, { png: validate_png }),
     });
     throwIfOutputAborted(signal, shouldAbort);
@@ -6482,7 +6597,7 @@ export async function readOutputFileBuffer(filePath, {
     if (expected && !outputFileVersionMatches(expected, contentVersion)) throw outputFileVersionChangedError(expected, contentVersion || afterVersion, { artifact: version_artifact });
     return { data, file_version: contentVersion || afterVersion || beforeVersion };
   } finally {
-    await handle.close().catch(() => {});
+    await closeHandle?.().catch(() => {});
   }
 }
 
@@ -6550,6 +6665,7 @@ export async function openOutputFileHandleForStableRead(filePath, {
   throwIfOutputAborted(signal, shouldAbort);
   let sourceHandle = null;
   let snapshotHandle = null;
+  let snapshotCloseHandle = null;
   let snapshotPath = '';
   let completed = false;
   try {
@@ -6574,6 +6690,7 @@ export async function openOutputFileHandleForStableRead(filePath, {
       ensureParent: true,
     })).resolved;
     snapshotHandle = await fsp.open(snapshotPath, 'wx+');
+    snapshotCloseHandle = createFileHandleCloser(snapshotHandle);
     const copied = await copyOutputFileHandleToSnapshot(sourceHandle, snapshotHandle, beforeStat.size, {
       signal,
       shouldAbort,
@@ -6592,6 +6709,7 @@ export async function openOutputFileHandleForStableRead(filePath, {
       await validatePngFileHandle(snapshotHandle, {
         ...historyPngValidationOptions(),
         signal,
+        closeHandle: snapshotCloseHandle,
       });
       throwIfOutputAborted(signal, shouldAbort);
     }
@@ -6605,7 +6723,7 @@ export async function openOutputFileHandleForStableRead(filePath, {
     let cleanupPromise = null;
     const cleanup = () => {
       cleanupPromise ||= (async () => {
-        await snapshotHandle?.close?.().catch(() => {});
+        await snapshotCloseHandle?.().catch(() => {});
         snapshotHandle = null;
         await cleanupOutputFileStreamSnapshot(snapshotPath);
       })();
@@ -6625,7 +6743,7 @@ export async function openOutputFileHandleForStableRead(filePath, {
   } finally {
     await sourceHandle?.close?.().catch(() => {});
     if (!completed) {
-      await snapshotHandle?.close?.().catch(() => {});
+      await snapshotCloseHandle?.().catch(() => {});
       await cleanupOutputFileStreamSnapshot(snapshotPath);
     }
   }
@@ -6689,7 +6807,7 @@ export async function readHistoryDigestResult(settings, digestId, lookup = {}, {
   const digestPath = resolveDigestPath(base, item);
   const missingMessage = recordedDigestPath
     ? '原摘要 JSON 已不存在，不能导出 MD 或重新渲染。'
-    : '这条旧版历史只保存了 PNG，没有原摘要 JSON；不能导出 MD 或重新渲染，现有 PNG 仍可下载、复制或打开。';
+    : '这条历史只保存了 PNG，没有原摘要 JSON；不能导出 MD 或重新渲染，现有 PNG 仍可下载、复制或打开。';
   if (!digestPath) {
     return {
       item,
@@ -6828,7 +6946,7 @@ export async function overwriteRenderedPng({ settings, item, digest, source_dige
       artifact: 'png',
       max_bytes: HISTORY_RERENDER_SOURCE_MAX_BYTES,
       too_large_code: 'history_rerender_source_too_large',
-      too_large_message: '历史 PNG 超过可安全核验的重建源文件上限，已停止确认旧版本。请移走该文件或回到总结页重新生成。',
+      too_large_message: '历史 PNG 超过可安全核验的重建源文件上限，已停止确认文件核验状态。请移走该文件或回到总结页重新生成。',
     });
     await assertExpectedOutputFileVersion(sourceDigestPath, expectedDigest, { signal, shouldAbort, artifact: 'digest' });
     await assertHistoryRerenderDigestMatchesSource(base, sourceDigestPath, item, digest, expectedDigest, { signal, shouldAbort, expectedSourceDigestRevision: sourceDigestRevision });
@@ -6849,7 +6967,7 @@ export async function overwriteRenderedPng({ settings, item, digest, source_dige
         artifact: 'png',
         max_bytes: HISTORY_RERENDER_SOURCE_MAX_BYTES,
         too_large_code: 'history_rerender_source_too_large',
-        too_large_message: '历史 PNG 超过可安全核验的重建源文件上限，已停止确认旧版本。请移走该文件或回到总结页重新生成。',
+        too_large_message: '历史 PNG 超过可安全核验的重建源文件上限，已停止确认文件核验状态。请移走该文件或回到总结页重新生成。',
       });
       await assertExpectedOutputFileVersion(sourceDigestPath, expectedDigest, { signal, shouldAbort, artifact: 'digest' });
       await assertHistoryRerenderDigestMatchesSource(base, sourceDigestPath, item, digest, expectedDigest, { signal, shouldAbort, expectedSourceDigestRevision: sourceDigestRevision });
@@ -7882,6 +8000,43 @@ async function writeBinaryAtomic(filePath, buffer, { signal = null, shouldAbort 
   }
 }
 
+async function appendDigestSaveTransactionTransition(filePath, payload, {
+  signal = null,
+  shouldAbort = null,
+} = {}) {
+  const record = digestSaveTransactionTransitionBuffer(payload);
+  const maxBytes = HISTORY_DIGEST_JSON_MAX_BYTES + 64 * 1024;
+  let handle = null;
+  let closeHandle = null;
+  try {
+    throwIfOutputAborted(signal, shouldAbort);
+    handle = await fsp.open(filePath, 'r+');
+    closeHandle = createFileHandleCloser(handle);
+    const stat = await handle.stat();
+    if (!stat?.isFile?.()) {
+      throw Object.assign(new Error('长图保存事务标记不是普通文件。'), { code: 'output_save_marker_invalid' });
+    }
+    if (Number(stat.size || 0) + record.length > maxBytes) {
+      throw digestJsonTooLargeError(Number(stat.size || 0) + record.length, maxBytes, '长图保存事务');
+    }
+    let written = 0;
+    while (written < record.length) {
+      throwIfOutputAborted(signal, shouldAbort);
+      const result = await handle.write(record, written, record.length - written, stat.size + written);
+      if (!result.bytesWritten) {
+        throw Object.assign(new Error('长图保存事务状态写入未取得进展。'), { code: 'output_save_transition_stalled' });
+      }
+      written += result.bytesWritten;
+    }
+    await handle.sync();
+    await closeHandle();
+    handle = null;
+    await syncDirectory(path.dirname(filePath));
+  } finally {
+    await closeHandle?.().catch(() => {});
+  }
+}
+
 async function copyOutputSourceToHandle(sourceFile, handle, { signal = null, shouldAbort = null } = {}) {
   const source = await fsp.open(sourceFile, 'r');
   const buffer = Buffer.allocUnsafe(256 * 1024);
@@ -8041,7 +8196,7 @@ async function writeTransactionalDigestPair({
             savedFileVersion,
             savedDigestFileVersion,
           });
-          await writeBinaryAtomic(markerPath, digestSaveTransactionMarkerBuffer(committed), { signal, shouldAbort });
+          await appendDigestSaveTransactionTransition(markerPath, committed, { signal, shouldAbort });
           await runOutputSavePhaseHook(phaseHook, 'after_marker_commit', { file_path: filePath, digest_path: digestPath, marker_path: markerPath });
           return {
             file_path: filePath,
@@ -8118,6 +8273,7 @@ async function writeOutputTempFile(targetPath, writer, { signal = null, shouldAb
       throwIfOutputAborted(signal, shouldAbort);
       await handle.close();
       handle = null;
+      throwIfOutputAborted(signal, shouldAbort);
       return tmp;
     } catch (e) {
       if (handle) await handle.close().catch(() => {});
@@ -8824,6 +8980,7 @@ async function upsertHistory(settings, item, { signal = null, shouldAbort = null
 
 function historyIndexWriteMayHaveCommitted(error = null) {
   return error?.index_may_have_committed === true
+    || error?.atomic_write_may_have_committed === true
     || String(error?.code || error?.public_code || '').trim() === 'history_index_rollback_failed';
 }
 

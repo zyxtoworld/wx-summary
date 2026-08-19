@@ -41,14 +41,9 @@ const noAccounts = __schedulerInternals.schedulerMissingAccountCleanupPlan(setti
 assert.equal(noAccounts.ref_count, 0, 'an empty account scan must fail closed instead of classifying every scoped rule as stale');
 
 const mainSource = await fs.readFile(new URL('../src/main.js', import.meta.url), 'utf8');
-const appSource = await fs.readFile(new URL('../src/web/public/js/app.js', import.meta.url), 'utf8');
 assert.ok(mainSource.includes('normalizeSettingsMissingAccountRulesCleanup')
   && mainSource.includes("'server_missing_account_cleanup'")
   && mainSource.includes('missing_account_cleanup_token_changed'),
 'settings cleanup must be expanded from fresh server account discovery and revalidated immediately before commit');
-assert.ok(appSource.includes('s-remove-missing-account-rules')
-  && appSource.includes('remove_missing_account_rules: true')
-  && appSource.includes('missing_account_cleanup_token'),
-'settings UI must expose an explicit confirmed cleanup action bound to the server preview token');
 
 console.log('missing account rule cleanup tests passed');

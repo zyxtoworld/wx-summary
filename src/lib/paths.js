@@ -234,7 +234,7 @@ export async function assertSafeTmpPath(targetPath, {
   await assertTmpAncestorTree(parent, realTmp, label);
   if (ensureParent) await fsp.mkdir(parent, { recursive: true });
   await assertTmpAncestorTree(parent, realTmp, label);
-  const stat = await fsp.lstat(resolved).catch(e => {
+  let stat = await fsp.lstat(resolved).catch(e => {
     if (e?.code === 'ENOENT') return null;
     throw e;
   });
@@ -249,7 +249,36 @@ export async function assertSafeTmpPath(targetPath, {
   }
   if (stat.isSymbolicLink?.()) throw unsafeTmpPathError(`${label} must not be a symlink or junction`, 'TMP_PATH_REPARSE_POINT');
   if (requireFile && !stat.isFile()) throw unsafeTmpPathError(`${label} must be a regular file`, 'TMP_PATH_NOT_FILE');
-  const realTarget = await fsp.realpath(resolved).catch(() => '');
+  let realTarget = '';
+  try {
+    realTarget = await fsp.realpath(resolved);
+  } catch (error) {
+    // A lock or temporary artifact may disappear after lstat while another
+    // owner publishes or releases it. Re-check the exact path before treating
+    // that handoff as missing; a replacement must still pass all normal type
+    // and real-path checks.
+    if (error?.code === 'ENOENT') {
+      const current = await fsp.lstat(resolved).catch(e => {
+        if (e?.code === 'ENOENT') return null;
+        throw e;
+      });
+      if (!current) {
+        if (!allowMissing) {
+          const missing = new Error(`${label} does not exist`);
+          missing.status = 404;
+          missing.code = 'TMP_PATH_MISSING';
+          throw missing;
+        }
+        return { resolved, realTmp, exists: false };
+      }
+      if (current.isSymbolicLink?.()) throw unsafeTmpPathError(`${label} must not be a symlink or junction`, 'TMP_PATH_REPARSE_POINT');
+      if (requireFile && !current.isFile()) throw unsafeTmpPathError(`${label} must be a regular file`, 'TMP_PATH_NOT_FILE');
+      stat = current;
+      realTarget = await fsp.realpath(resolved);
+    } else {
+      throw error;
+    }
+  }
   if (!realTarget || !isInside(realTmp, realTarget)) throw unsafeTmpPathError(`${label} real path is outside outputs/.tmp`, 'TMP_PATH_REALPATH_OUTSIDE');
   return { resolved, realTmp, realTarget, exists: true, stat };
 }

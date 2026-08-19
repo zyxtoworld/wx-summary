@@ -56,6 +56,14 @@ try {
     accountFingerprint,
   });
   assert.equal(recoveredAgain?.done, 1, 'a rebuilt preview snapshot must retain its account binding for later recovery calls');
+  const unpersistedPreview = __mainInternals.digestBatchPreviewRecoveryPayload({
+    total: 1,
+    total_confirmed: true,
+    recovery_persisted: false,
+    digests: new Map([[0, digest]]),
+  }, 'preview-unpersisted-payload');
+  assert.equal(unpersistedPreview?.terminal_recovery_persisted, false,
+    'text-preview recovery must expose an unpersisted terminal marker to the browser');
   assert.throws(
     () => __mainInternals.recoverDigestBatchPreview(batchId, {
       token: batchToken,

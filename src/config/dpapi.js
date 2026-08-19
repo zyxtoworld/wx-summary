@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { attachWindowsProcessCleanup, terminateWindowsProcessTree } from '../lib/windows-process-tree.js';
 
 const PROTECT_SCRIPT = `
 Add-Type -AssemblyName System.Security
@@ -72,7 +73,7 @@ function windowsPowerShellExecutablePath() {
   }) || '';
 }
 
-function runPowerShell(script, stdin, timeoutMs = COMMAND_TIMEOUT_MS) {
+function runPowerShell(script, stdin, timeoutMs = COMMAND_TIMEOUT_MS, terminateProcessTree = terminateWindowsProcessTree) {
   return new Promise((resolve, reject) => {
     const exe = windowsPowerShellExecutablePath();
     if (!exe) {
@@ -84,33 +85,176 @@ function runPowerShell(script, stdin, timeoutMs = COMMAND_TIMEOUT_MS) {
     let settled = false;
     let out = '';
     let err = '';
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(new Error(`${exe} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    child.stdout.setEncoding('utf-8');
-    child.stderr.setEncoding('utf-8');
-    child.stdout.on('data', chunk => { out = appendLimited(out, chunk); });
-    child.stderr.on('data', chunk => { err = appendLimited(err, chunk); });
-    child.on('error', error => {
-      if (settled) return;
-      settled = true;
+    let timer = null;
+    let childClosed = false;
+    let terminationStarted = false;
+    let terminationFailure = null;
+    let terminationCleanup = null;
+    let closeListenerAttached = false;
+    let childErrorDrain = null;
+    let stdinErrorDrain = null;
+
+    const clearTimer = () => {
+      if (timer === null) return;
       clearTimeout(timer);
-      reject(error);
-    });
-    child.on('close', code => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve(out);
-      } else {
-        reject(new Error((err || `PowerShell exited with ${code}`).trim()));
+      timer = null;
+    };
+    const removeOutputListeners = () => {
+      child.stdout?.removeListener?.('data', onStdoutData);
+      child.stderr?.removeListener?.('data', onStderrData);
+    };
+    const removeErrorDrains = () => {
+      if (childErrorDrain) child.removeListener?.('error', childErrorDrain);
+      if (stdinErrorDrain) child.stdin?.removeListener?.('error', stdinErrorDrain);
+      childErrorDrain = null;
+      stdinErrorDrain = null;
+    };
+    const attachErrorDrain = (stream, handler) => {
+      if (!stream) return false;
+      try {
+        if (typeof stream.on === 'function') {
+          stream.on('error', handler);
+          return true;
+        }
+        if (typeof stream.once === 'function') {
+          stream.once('error', handler);
+          return true;
+        }
+      } catch {}
+      return false;
+    };
+    const installErrorDrains = () => {
+      if (!childErrorDrain) {
+        const drain = () => {};
+        if (attachErrorDrain(child, drain)) childErrorDrain = drain;
       }
-    });
-    child.stdin.end(stdin, 'utf-8');
+      if (!stdinErrorDrain) {
+        const drain = () => {};
+        if (attachErrorDrain(child.stdin, drain)) stdinErrorDrain = drain;
+      }
+    };
+    const removeBusinessListeners = () => {
+      removeOutputListeners();
+      child.stdin?.removeListener?.('error', onStdinError);
+      child.removeListener?.('error', onChildError);
+    };
+    const ensureCloseOwner = () => {
+      if (closeListenerAttached || childClosed) return;
+      try {
+        child.on('close', onChildClose);
+        closeListenerAttached = true;
+      } catch {}
+    };
+    const cleanupTerminalListeners = ({ childEnded = childClosed } = {}) => {
+      removeBusinessListeners();
+      if (childEnded) {
+        removeErrorDrains();
+        if (closeListenerAttached) child.removeListener?.('close', onChildClose);
+        closeListenerAttached = false;
+      } else {
+        installErrorDrains();
+      }
+    };
+    const preserveCleanupError = (terminalError, cleanupError) => {
+      if (!terminalError || (typeof terminalError !== 'object' && typeof terminalError !== 'function')) return;
+      try {
+        if (!terminalError.cause) terminalError.cause = cleanupError;
+      } catch {}
+    };
+    const rememberTerminationFailure = detail => {
+      if (terminationFailure) return;
+      if (detail?.error) {
+        terminationFailure = detail.error;
+        return;
+      }
+      if (detail?.result === false) {
+        const cleanupError = new Error(`${exe} child kill returned false`);
+        cleanupError.code = 'CHILD_KILL_FAILED';
+        terminationFailure = cleanupError;
+      }
+    };
+    const settle = (kind, value, { childEnded = childClosed } = {}) => {
+      if (settled) return false;
+      settled = true;
+      clearTimer();
+      cleanupTerminalListeners({ childEnded });
+      if (kind === 'resolve') resolve(value);
+      else reject(value);
+      return true;
+    };
+    const attachTerminationEvidence = (terminalError, termination) => {
+      if (terminationFailure) preserveCleanupError(terminalError, terminationFailure);
+      if (!termination || typeof termination !== 'object') return;
+      try { terminalError.cleanup_confirmed = termination.terminated === true; } catch {}
+      if (termination.terminated !== true && termination.cleanup?.then) {
+        terminationCleanup = termination.cleanup;
+        attachWindowsProcessCleanup(terminalError, termination.cleanup);
+        void Promise.resolve(termination.cleanup).then(() => {
+          if (settled && childClosed) cleanupTerminalListeners({ childEnded: true });
+        }, () => {});
+      }
+    };
+    const beginTermination = error => {
+      if (settled || terminationStarted) return terminationCleanup;
+      terminationStarted = true;
+      clearTimer();
+      ensureCloseOwner();
+      removeBusinessListeners();
+      installErrorDrains();
+      terminationCleanup = Promise.resolve().then(() => terminateProcessTree(child, {
+        isClosed: () => childClosed,
+        retryMs: 1000,
+        pollMs: 25,
+        responseWaitMs: 5000,
+        onKillAttempt: rememberTerminationFailure,
+      })).then(termination => {
+        attachTerminationEvidence(error, termination);
+        settle('reject', error, { childEnded: childClosed });
+      }).catch(cleanupError => {
+        preserveCleanupError(error, cleanupError);
+        settle('reject', error, { childEnded: childClosed });
+      });
+      return terminationCleanup;
+    };
+    const onStdoutData = chunk => { out = appendLimited(out, chunk); };
+    const onStderrData = chunk => { err = appendLimited(err, chunk); };
+    const onStdinError = error => {
+      beginTermination(error);
+    };
+    const onChildError = error => {
+      beginTermination(error);
+    };
+    const onChildClose = code => {
+      childClosed = true;
+      if (terminationStarted) {
+        cleanupTerminalListeners({ childEnded: true });
+        return;
+      }
+      if (!settled) {
+        if (code === 0) settle('resolve', out, { childEnded: true });
+        else settle('reject', new Error((err || `PowerShell exited with ${code}`).trim()), { childEnded: true });
+      } else {
+        cleanupTerminalListeners({ childEnded: true });
+      }
+    };
+    const onTimeout = () => {
+      const timeoutError = new Error(`${exe} timed out after ${timeoutMs}ms`);
+      beginTermination(timeoutError);
+    };
+
+    try {
+      timer = setTimeout(onTimeout, timeoutMs);
+      child.on('error', onChildError);
+      ensureCloseOwner();
+      child.stdout.setEncoding('utf-8');
+      child.stderr.setEncoding('utf-8');
+      child.stdout.on('data', onStdoutData);
+      child.stderr.on('data', onStderrData);
+      child.stdin.on('error', onStdinError);
+      child.stdin.end(stdin, 'utf-8');
+    } catch (error) {
+      beginTermination(error);
+    }
   });
 }
 

@@ -28,6 +28,7 @@ const state = {
   last_finished_at: '',
   last_error: '',
   last_result: null,
+  last_result_revision: 0,
   last_result_stale: false,
   last_request_result: null,
   settings_revision: '',
@@ -302,6 +303,12 @@ function rememberSchedulerSettingsRevision(settings = {}) {
 }
 
 function setSchedulerLastResult(result = null) {
+  const previousResultRevision = Number(state.last_result_revision || 0);
+  state.last_result_revision = Number.isSafeInteger(previousResultRevision)
+    && previousResultRevision >= 0
+    && previousResultRevision < Number.MAX_SAFE_INTEGER
+    ? previousResultRevision + 1
+    : Number.MAX_SAFE_INTEGER;
   if (result && typeof result === 'object' && !Array.isArray(result)) {
     const settingsRevisionUsed = String(result.settings_revision_used || state.settings_revision || '').trim();
     const runtimeRevisionUsed = String(result.scheduler_runtime_revision_used || state.scheduler_runtime_revision || '').trim();
@@ -357,7 +364,7 @@ function markSchedulerPersistentDisableFailed(error, { reason = 'setup_required'
   return { message, result, published: true };
 }
 
-function schedulerStaleSettingsError(message = '设置已变化，已停止旧调度任务提交。', detail = 'stale_settings_before_save') {
+function schedulerStaleSettingsError(message = '设置已变化，已停止变更前调度任务提交。', detail = 'stale_settings_before_save') {
   const err = new Error(message);
   err.code = 'stale_settings';
   err.detail = detail;
@@ -537,7 +544,7 @@ async function schedulerSettingsChangedSince(settings = {}, signal = null) {
 
 async function assertSchedulerSettingsFreshBeforeExternalSideEffect(settings = {}, signal = null) {
   if (!await schedulerSettingsChangedSince(settings, signal)) return;
-  throw schedulerStaleSettingsError('设置已变化，已停止按旧设置请求 AI；下次会按新设置重试。', 'stale_settings_before_ai');
+  throw schedulerStaleSettingsError('设置已变化，已停止按变更前设置请求 AI；下次会按当前设置重试。', 'stale_settings_before_ai');
 }
 
 function queueSchedulerLifecycle(action) {
@@ -659,7 +666,7 @@ async function startSchedulerSerialized({ immediate = false, signal = null } = {
     state.timer_active = false;
     state.runtime_state_degraded = false;
     state.next_run_at = '';
-    state.last_error = '旧后台检查仍在退出中，已拒绝启动新的定时器。';
+    state.last_error = '上一轮后台检查仍在退出中，已拒绝启动新的定时器。';
     logWarn('scheduler_start_skipped_previous_run_still_running');
     return getSchedulerStatus();
   }
@@ -1255,7 +1262,10 @@ function schedulerCancelledRunResult(partialResult = null, { reason = 'manual', 
 
 function schedulerSaveFailureMayHaveCommittedOutput(error = null) {
   const code = String(error?.public_code || error?.code || '').trim();
-  return code === 'output_save_cleanup_failed' || code === 'history_index_rollback_failed';
+  return error?.atomic_write_may_have_committed === true
+    || error?.index_may_have_committed === true
+    || code === 'output_save_cleanup_failed'
+    || code === 'history_index_rollback_failed';
 }
 
 function savedSchedulerOutputHistoryUnbound(saved = {}) {
@@ -1854,6 +1864,7 @@ async function rememberPendingSchedulerCursorCommit({ settings = {}, cursorKey =
     rule_fingerprint: String(state.rule_fingerprint || '').trim(),
     account_id: accountIdentity(account),
     account_identity_id: accountCursorIdentity(account),
+    account_fingerprint: manualKeyAccountFingerprint(account),
     group_id: String(group?.id || group?.group_id || '').trim(),
     group: String(group?.name || group?.group_name || '').trim(),
     phase: filePath && fileVersion ? 'saved' : 'prepared',
@@ -1927,10 +1938,19 @@ async function recoverPendingSchedulerCursorCommit({ settings = {}, cursorKey = 
   const store = await loadSchedulerPendingCursors();
   let entry = store[storeKey];
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
-  const sameRule = !entry.rule_fingerprint || !ruleFingerprint || entry.rule_fingerprint === ruleFingerprint;
+  const entryRuleFingerprint = String(entry.rule_fingerprint || '').trim();
+  const currentRuleFingerprint = String(ruleFingerprint || '').trim();
+  const sameRule = !!entryRuleFingerprint
+    && !!currentRuleFingerprint
+    && entryRuleFingerprint === currentRuleFingerprint;
   const currentAccountIdentityId = accountCursorIdentity(account);
   const sameAccountIdentity = !!currentAccountIdentityId
     && String(entry.account_identity_id || '').trim().toLowerCase() === currentAccountIdentityId;
+  const currentAccountFingerprint = manualKeyAccountFingerprint(account).toLowerCase();
+  const entryAccountFingerprint = String(entry.account_fingerprint || '').trim().toLowerCase();
+  const sameAccountFingerprint = !!currentAccountFingerprint
+    && !!entryAccountFingerprint
+    && entryAccountFingerprint === currentAccountFingerprint;
   const groupId = String(group?.id || group?.group_id || '').trim();
   const sameGroup = !entry.group_id || !groupId || entry.group_id === groupId;
   const cursorState = normalizeSchedulerCursorState(entry.cursor_state || {});
@@ -1938,16 +1958,21 @@ async function recoverPendingSchedulerCursorCommit({ settings = {}, cursorKey = 
     await forgetPendingSchedulerCursorCommit(cursorKey).catch(e => logWarn('scheduler_pending_cursor_clear_failed', { cursor_key: cursorKey, error: sanitizeText(e?.message || String(e)) }));
     return null;
   }
-  if (!sameAccountIdentity) {
-    const message = entry.account_identity_id
-      ? '待恢复游标属于另一个微信本人账号，已隔离且不会推进当前账号游标。'
-      : '待恢复游标缺少微信本人身份，已隔离且不会自动绑定到当前账号。';
+  if (!sameAccountIdentity || !sameAccountFingerprint) {
+    const message = !sameAccountIdentity
+      ? (entry.account_identity_id
+        ? '待恢复游标属于另一个微信本人账号，已隔离且不会推进当前账号游标。'
+        : '待恢复游标缺少微信本人身份，已隔离且不会自动绑定到当前账号。')
+      : (entryAccountFingerprint
+        ? '待恢复游标属于该账号的另一数据指纹，已隔离且不会推进当前账号游标。'
+        : '待恢复游标缺少账号数据指纹，已隔离且不会自动绑定到当前账号。');
     return {
       recovery_failed: true,
       recovery_error: message,
       cursor_state: cursorState,
       entry,
       identity_unverified: true,
+      account_fingerprint_mismatch: sameAccountIdentity && !sameAccountFingerprint,
     };
   }
   if (!cursorState.last_seq) {
@@ -1999,6 +2024,23 @@ async function recoverPendingSchedulerCursorCommit({ settings = {}, cursorKey = 
     };
   }
   if (!sameRule) {
+    if (!entryRuleFingerprint || !currentRuleFingerprint) {
+      const message = '待恢复游标缺少可验证的规则版本，已保留恢复记录且不会推进当前游标；请在当前规则下重试。';
+      logWarn('scheduler_pending_history_rule_unverified', {
+        account_id: accountIdentity(account),
+        group_id: groupId,
+        digest_id: entry.digest_id || '',
+        cursor_key: cursorKey,
+      });
+      return {
+        recovery_failed: true,
+        recovery_error: message,
+        cursor_state: cursorState,
+        entry,
+        history_item: indexedHistoryItem,
+        rule_fingerprint_unverified: true,
+      };
+    }
     await forgetPendingSchedulerCursorCommit(cursorKey).catch(e => logWarn('scheduler_pending_cursor_clear_failed', { cursor_key: cursorKey, error: sanitizeText(e?.message || String(e)) }));
     logWarn('scheduler_pending_history_recovered_rule_changed', {
       account_id: accountIdentity(account),
@@ -2359,7 +2401,7 @@ async function executeSchedulerTick({ reason, force = false, signal = null, expe
       group: item.group,
       error: item.detail === 'account_identity_unverified'
         ? '该微信账号尚未通过消息库确认本人身份，已停止自动检查；请先在总结页读取一次该账号消息，再重新保存调度规则。'
-        : '该规则仍绑定旧存储目录，已停止把它自动继承给当前微信本人账号；请在设置页确认后重新保存。',
+        : '该规则仍绑定非当前存储目录，已停止把它自动继承给当前微信本人账号；请在设置页确认后重新保存。',
     })));
   }
   const targetAccounts = schedulerAccountsForTargetRefs(accounts, schedulerRefs);
@@ -2466,7 +2508,7 @@ async function executeSchedulerTick({ reason, force = false, signal = null, expe
       account_id: ref.account_id || '',
       account: ref.account_id || '',
       group: ref.group || '',
-      error: '自动检查规则的账号标识命中多个微信账号，已停止按旧别名猜测目标；请重新保存为当前账号的群规则。',
+      error: '自动检查规则的账号标识命中多个微信账号，已停止按非当前别名猜测目标；请重新保存为当前账号的群规则。',
     })));
     logWarn('scheduler_ambiguous_account_refs', { count: ambiguousAccountRefs.length });
   }
@@ -2479,7 +2521,7 @@ async function executeSchedulerTick({ reason, force = false, signal = null, expe
       account_id: ref.account_id || '',
       group: ref.ref || '',
       label: `重名自动检查规则：${ref.ref || '未命名群'}`,
-      error: '自动检查规则匹配到多个群，已停止按群名或旧 ID 猜测；请重新保存为带账号范围的群规则。',
+      error: '自动检查规则匹配到多个群，已停止按群名或历史 ID 猜测；请重新保存为带账号范围的群规则。',
     })));
     logWarn('scheduler_ambiguous_group_refs', { refs: ambiguousRefs });
   }
@@ -2505,8 +2547,8 @@ async function executeSchedulerTick({ reason, force = false, signal = null, expe
     result.items.push(...unscopedRefs.slice(0, 50).map(ref => schedulerBlockedTargetItem({
       detail: 'unscoped_group_refs_ignored',
       group: schedulerRefLabel(ref),
-      label: `未绑定账号的旧规则：${schedulerRefLabel(ref) || '未命名群'}`,
-      error: '旧规则没有账号范围，已停止在多账号/项目副本环境中猜测目标；请重新保存白名单或每群规则。',
+      label: `未绑定账号的规则：${schedulerRefLabel(ref) || '未命名群'}`,
+      error: '该规则没有账号范围，已停止在多账号/项目副本环境中猜测目标；请重新保存白名单或每群规则。',
     })));
     logWarn('scheduler_unscoped_group_refs_ignored', { count: unscopedRefCount });
   }
@@ -2543,14 +2585,17 @@ async function executeSchedulerTick({ reason, force = false, signal = null, expe
       for (const group of targets) {
         throwIfSchedulerAborted(signal);
         const currentIndex = completedTargets + 1;
-        const reportTargetProgress = progress => updateActiveSchedulerProgress({
-          ...(progress && typeof progress === 'object' ? progress : {}),
-          total_targets: totalTargets,
-          completed_targets: completedTargets,
-          current_index: currentIndex,
-          account: account.name || '当前微信账号',
-          group: group.name || '未命名群',
-        });
+        const reportTargetProgress = progress => {
+          if (!schedulerGenerationCanPublish(generation) || signal?.aborted) return null;
+          return updateActiveSchedulerProgress({
+            ...(progress && typeof progress === 'object' ? progress : {}),
+            total_targets: totalTargets,
+            completed_targets: completedTargets,
+            current_index: currentIndex,
+            account: account.name || '当前微信账号',
+            group: group.name || '未命名群',
+          });
+        };
         reportTargetProgress({
           phase: 'target_prepare',
           label: '准备群消息',
@@ -3200,7 +3245,7 @@ async function runGroupDigest({ settings, account, group, window, accounts = [],
   digest.account_identity_id = accountCursorIdentity(account);
   digest.group_id = String(group?.id || group?.group_id || collection.source_snapshot?.group_id || '').trim();
   if (await schedulerSettingsChangedSince(settings, signal)) {
-    const message = '设置已变化，已停止按旧设置保存调度摘要。';
+    const message = '设置已变化，已停止按变更前设置保存调度摘要。';
     return {
       ...itemBase,
       ...cursorResultMeta,
@@ -3232,7 +3277,7 @@ async function runGroupDigest({ settings, account, group, window, accounts = [],
   }
   throwIfSchedulerAborted(signal);
   if (await schedulerSettingsChangedSince(settings, signal)) {
-    const message = '设置已变化，已拒绝保存旧调度长图。';
+    const message = '设置已变化，已拒绝保存变更前调度长图。';
     return {
       ...itemBase,
       ...cursorResultMeta,
@@ -3297,11 +3342,14 @@ async function runGroupDigest({ settings, account, group, window, accounts = [],
       signal,
       commitBarrier: async () => {
         if (await schedulerSettingsChangedSince(settings, signal)) {
-          throw schedulerStaleSettingsError('设置已变化，已拒绝提交旧调度长图；下次会按新设置重试。');
+          throw schedulerStaleSettingsError('设置已变化，已拒绝提交变更前调度长图；下次会按当前设置重试。');
         }
         await assertSchedulerAccountIdentityCurrent(account, signal, '长图提交前');
       },
       postArtifactCommitBarrier: async () => {
+        if (await schedulerSettingsChangedSince(settings, signal)) {
+          throw schedulerStaleSettingsError('设置已变化，已拒绝把变更前调度长图提交到当前历史和游标。');
+        }
         await assertSchedulerAccountIdentityCurrent(account, signal, '长图输出提交后');
       },
     });
@@ -3531,8 +3579,8 @@ async function commitSchedulerCursorState(cursorKey, state, signal = null, meta 
   }
   const cursor = await withSettingsSaveTransaction(async () => {
     throwIfSchedulerAborted(signal);
-    if (!meta?.outputCommitted && meta?.settings && await schedulerSettingsChangedSince(meta.settings, signal)) {
-      throw schedulerStaleSettingsError('设置已变化，已拒绝推进旧调度游标；下次会按新设置重试。');
+    if (meta?.settings && await schedulerSettingsChangedSince(meta.settings, signal)) {
+      throw schedulerStaleSettingsError('设置已变化，已拒绝推进变更前调度游标；下次会按当前设置重试。');
     }
     return setAccountGroupCursorState(accountIdentityId, groupId, state);
   });
@@ -4809,6 +4857,7 @@ export const __schedulerInternals = {
   tryAcquireSchedulerRunLease,
   releaseSchedulerRunLease,
   schedulerGenerationValue: () => schedulerGeneration,
+  markSchedulerPersistentDisableFailed,
   applySchedulerRuntimePersistenceResult,
   markSchedulerRuntimeBlocked,
   schedulerTerminalShutdownActive: () => schedulerTerminalShutdown,

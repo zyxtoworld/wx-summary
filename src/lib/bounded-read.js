@@ -4,6 +4,8 @@ export async function readFileHandleBounded(handle, maxBytes, {
   chunkBytes = DEFAULT_READ_CHUNK_BYTES,
   checkAbort = null,
   createTooLargeError = null,
+  signal = null,
+  closeHandle = null,
 } = {}) {
   const numericLimit = Number(maxBytes);
   if (!Number.isSafeInteger(numericLimit) || numericLimit <= 0) {
@@ -13,43 +15,80 @@ export async function readFileHandleBounded(handle, maxBytes, {
   const safeChunkBytes = Number.isSafeInteger(requestedChunkBytes) && requestedChunkBytes > 0
     ? requestedChunkBytes
     : DEFAULT_READ_CHUNK_BYTES;
-  if (typeof checkAbort === 'function') checkAbort();
-  const stat = await handle.stat();
-  const observedBytes = Number.isSafeInteger(stat?.size) && stat.size >= 0 ? stat.size : numericLimit;
-  const allocationBytes = Math.max(1, Math.min(numericLimit + 1, observedBytes + 1));
-  const data = Buffer.allocUnsafe(allocationBytes);
-  let total = 0;
-  let position = 0;
-  while (total < allocationBytes) {
-    if (typeof checkAbort === 'function') checkAbort();
-    const readBytes = Math.min(safeChunkBytes, allocationBytes - total);
-    const { bytesRead } = await handle.read(data, total, readBytes, position);
-    if (!bytesRead) break;
-    total += bytesRead;
-    position += bytesRead;
-    if (total > numericLimit) {
-      throw typeof createTooLargeError === 'function'
-        ? createTooLargeError(total, numericLimit)
-        : Object.assign(new Error('file exceeds bounded read limit'), {
-          code: 'file_too_large',
-          status: 413,
-          bytes: total,
-          max_bytes: numericLimit,
-        });
+  const close = typeof closeHandle === 'function' ? closeHandle : null;
+  let closePromise = null;
+  const requestClose = () => {
+    if (!close) return null;
+    if (!closePromise) {
+      closePromise = Promise.resolve().then(() => close());
+      closePromise.catch(() => {});
     }
-  }
-  if (typeof checkAbort === 'function') checkAbort();
-  let finalStat = null;
+    return closePromise;
+  };
+  const onAbort = () => { void requestClose()?.catch(() => {}); };
+  signal?.addEventListener?.('abort', onAbort, { once: true });
   try {
-    finalStat = await handle.stat();
-  } catch (error) {
-    throw boundedReadChangedError(stat, null, total, numericLimit, error);
+    if (typeof checkAbort === 'function') checkAbort();
+    const stat = await handle.stat();
+    const observedBytes = Number.isSafeInteger(stat?.size) && stat.size >= 0 ? stat.size : numericLimit;
+    const allocationBytes = Math.max(1, Math.min(numericLimit + 1, observedBytes + 1));
+    const data = Buffer.allocUnsafe(allocationBytes);
+    let total = 0;
+    let position = 0;
+    while (total < allocationBytes) {
+      if (typeof checkAbort === 'function') checkAbort();
+      const readBytes = Math.min(safeChunkBytes, allocationBytes - total);
+      const { bytesRead } = await handle.read(data, total, readBytes, position);
+      if (!bytesRead) break;
+      total += bytesRead;
+      position += bytesRead;
+      if (total > numericLimit) {
+        throw typeof createTooLargeError === 'function'
+          ? createTooLargeError(total, numericLimit)
+          : Object.assign(new Error('file exceeds bounded read limit'), {
+            code: 'file_too_large',
+            status: 413,
+            bytes: total,
+            max_bytes: numericLimit,
+          });
+      }
+    }
+    if (typeof checkAbort === 'function') checkAbort();
+    let finalStat = null;
+    try {
+      finalStat = await handle.stat();
+    } catch (error) {
+      throw boundedReadChangedError(stat, null, total, numericLimit, error);
+    }
+    if (typeof checkAbort === 'function') checkAbort();
+    if (total !== observedBytes || !boundedReadStatsMatch(stat, finalStat)) {
+      throw boundedReadChangedError(stat, finalStat, total, numericLimit);
+    }
+    return data.subarray(0, total);
+  } finally {
+    let closeError = null;
+    try {
+      if (signal?.aborted) await requestClose();
+    } catch (error) {
+      closeError = error;
+    }
+    try {
+      if (signal?.aborted && typeof checkAbort === 'function') checkAbort();
+    } finally {
+      signal?.removeEventListener?.('abort', onAbort);
+    }
+    if (closeError) throw closeError;
   }
-  if (typeof checkAbort === 'function') checkAbort();
-  if (total !== observedBytes || !boundedReadStatsMatch(stat, finalStat)) {
-    throw boundedReadChangedError(stat, finalStat, total, numericLimit);
-  }
-  return data.subarray(0, total);
+}
+
+export function createFileHandleCloser(handle) {
+  let closePromise = null;
+  return () => {
+    if (!closePromise) {
+      closePromise = Promise.resolve().then(() => handle.close());
+    }
+    return closePromise;
+  };
 }
 
 function boundedReadStatsMatch(before, after) {

@@ -1,32 +1,32 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
+import {
+  localStatusDisplayItem,
+  localStatusPngRevealSummary,
+} from '../src/web/public/js/pages/settings/system-status.js';
 
-const root = path.resolve(import.meta.dirname, '..');
-const app = fs.readFileSync(path.join(root, 'src', 'web', 'public', 'js', 'app.js'), 'utf8');
+assert.match(localStatusPngRevealSummary({}), /尚未记录到定位已保存 PNG/);
+assert.match(localStatusPngRevealSummary({ latest_evidence: {}, target_binding: { current: false } }), /不是当前最近保存的长图/);
+assert.match(localStatusPngRevealSummary({ latest_evidence: {}, target_binding: { current: true } }), /最近保存的长图作为验收目标/);
 
-const start = app.indexOf('function localStatusPngRevealSummary(');
-const end = app.indexOf('\n  function localStatusDisplayItem(', start);
-assert.ok(start >= 0 && end > start, 'local PNG reveal status helper must remain available');
+const recorded = localStatusDisplayItem({
+  id: 'B8',
+  status: 'needs_user_confirmation',
+  ready_for_user_confirmation: false,
+  software_evidence_status: 'reveal_requested_needs_visual_confirmation',
+  latest_evidence: { file_kind: 'png' },
+  target_binding: { current: true },
+});
+assert.equal(recorded.status, 'needs_user_confirmation', 'display enrichment must not change the check protocol status');
+assert.equal(recorded.display_status, '需定位当前图');
+assert.match(recorded.software_evidence_summary, /最近保存的长图/);
 
-const source = app.slice(start, end);
-assert.match(source, /missing_current_png_save_evidence/,
-  'a recorded reveal without a current saved-PNG target must have its own state');
-assert.match(source, /已记录到定位 PNG，但当前服务还没有“最近保存的长图”作为验收目标/,
-  'the UI must not claim that no reveal was recorded when only the current saved-PNG target is missing');
-assert.match(source, /已记录到定位 PNG，但它不是当前最近保存的长图/,
-  'the UI must explain a reveal bound to an older PNG');
-assert.match(source, /尚未记录到定位已保存 PNG 的操作；定位 MD 不计入这项图片验收/,
-  'the no-evidence copy must remain reserved for a genuinely missing PNG reveal');
-
-const displayStart = app.indexOf('function localStatusDisplayItem(');
-const displayEnd = app.indexOf('\n  async function refreshAcceptanceChecks(', displayStart);
-const displaySource = app.slice(displayStart, displayEnd);
-assert.match(displaySource, /const b8HasRecordedReveal = !!item\?\.latest_evidence/,
-  'the B8 card must distinguish an existing reveal record from no evidence');
-assert.match(displaySource, /state: completed \? '已记录' : \(failed \? '需要重试' : \(b8HasRecordedReveal \? '需定位当前图' : '等待操作'\)\)/,
-  'the B8 state label must identify recorded-but-stale reveal evidence');
-assert.match(displaySource, /summary: localStatusPngRevealSummary\(item, \{ completed, failed \}\)/,
-  'the B8 card must use the evidence-aware summary');
+const complete = localStatusDisplayItem({
+  id: 'B8',
+  status: 'needs_user_confirmation',
+  ready_for_user_confirmation: true,
+  latest_evidence: { file_kind: 'png' },
+  target_binding: { current: true },
+});
+assert.equal(complete.display_status, '已记录');
 
 console.log('local status PNG reveal display tests passed');
