@@ -13131,10 +13131,16 @@ async function verifyCollectorFilters() {
 }
 
 async function verifyCursorStore() {
-  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'wx-summary-cursors-'));
+  const cursorCaseDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'wx-summary-cursors-case-'));
+  const syntheticProjectRoot = path.join(cursorCaseDir, 'synthetic-project-root');
+  const externalStoreDir = path.join(cursorCaseDir, 'external-store');
+  await fsp.mkdir(syntheticProjectRoot, { recursive: true });
+  await fsp.mkdir(externalStoreDir, { recursive: true });
+  const tempDir = await fsp.mkdtemp(path.join(syntheticProjectRoot, 'cursors-'));
   const cursorFile = path.join(tempDir, 'cursors.json');
+  const defaultCursorFile = path.join(externalStoreDir, 'cursors.json');
   const cursorOptions = { file: cursorFile };
-  const defaultCursorOptions = { file: cursorFile, defaultStore: true };
+  const defaultCursorOptions = { file: defaultCursorFile, defaultStore: true, projectRoot: syntheticProjectRoot };
   const emptyStore = { version: 3, accounts: {}, legacy: {} };
   try {
     await fsp.rm(cursorFile, { force: true });
@@ -13206,7 +13212,7 @@ async function verifyCursorStore() {
     }, cursorOptions)));
     const concurrent = await loadCursors(cursorOptions);
     assert.equal(Object.keys(concurrent.legacy).filter(key => key.startsWith('concurrent-')).length, 16, 'concurrent cursor writes should merge inside the legacy partition instead of dropping entries from stale read-modify-write cycles');
-    const isolatedDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'wx-summary-cursors-invalid-'));
+    const isolatedDir = await fsp.mkdtemp(path.join(syntheticProjectRoot, 'cursors-invalid-'));
     try {
       const validLegacyFile = path.join(isolatedDir, 'valid-cursors.json');
       await fsp.writeFile(validLegacyFile, JSON.stringify({ 'wxid_a::group-a@chatroom': 'ts.100' }), 'utf-8');
@@ -13252,7 +13258,7 @@ async function verifyCursorStore() {
     } finally {
       await fsp.rm(isolatedDir, { recursive: true, force: true });
     }
-    await fsp.writeFile(cursorFile, JSON.stringify({ 'wxid_bad::group@chatroom': { seen: ['m.1'] } }), 'utf-8');
+    await fsp.writeFile(defaultCursorFile, JSON.stringify({ 'wxid_bad::group@chatroom': { seen: ['m.1'] } }), 'utf-8');
     await assert.rejects(
       () => loadCursors(defaultCursorOptions),
       error => error?.code === 'CURSORS_INVALID' && /停止全部自动检查/.test(error.message || ''),
@@ -13263,12 +13269,12 @@ async function verifyCursorStore() {
     assert.equal(recoveryInfo?.backup_available, true, 'ordinary corrupt cursor files should expose a content-addressed recovery backup');
     assert.equal(recoveryInfo?.original_preserved, true, 'default cursor recovery must keep the corrupt active file in place to remain fail-closed');
     assert.equal(JSON.stringify(recoveryInfo).includes(ROOT), false, 'default cursor recovery info should not expose the absolute project root');
-    const afterRecoveryFiles = await fsp.readdir(path.dirname(cursorFile));
+    const afterRecoveryFiles = await fsp.readdir(path.dirname(defaultCursorFile));
     assert.ok(afterRecoveryFiles.some(name => /^cursors\.invalid\.[a-f0-9]{24}\.json$/.test(name)), 'invalid default cursor file should be copied to a content-addressed backup');
     const invalidBackupCount = afterRecoveryFiles.filter(name => /^cursors\.invalid\.[a-f0-9]{24}\.json$/.test(name)).length;
-    assert.deepEqual(JSON.parse(await fsp.readFile(cursorFile, 'utf-8')), { 'wxid_bad::group@chatroom': { seen: ['m.1'] } }, 'default cursor recovery should preserve the corrupt active file so later reads cannot silently treat it as a first-run empty store');
+    assert.deepEqual(JSON.parse(await fsp.readFile(defaultCursorFile, 'utf-8')), { 'wxid_bad::group@chatroom': { seen: ['m.1'] } }, 'default cursor recovery should preserve the corrupt active file so later reads cannot silently treat it as a first-run empty store');
     await assert.rejects(() => loadCursors(defaultCursorOptions), error => error?.code === 'CURSORS_INVALID', 'reading default cursors again should remain fail-closed until the operator restores or repairs the file');
-    const afterSecondRecoveryRead = await fsp.readdir(path.dirname(cursorFile));
+    const afterSecondRecoveryRead = await fsp.readdir(path.dirname(defaultCursorFile));
     assert.equal(
       afterSecondRecoveryRead.filter(name => /^cursors\.invalid\.[a-f0-9]{24}\.json$/.test(name)).length,
       invalidBackupCount,
@@ -13276,20 +13282,20 @@ async function verifyCursorStore() {
     );
     clearCursorRecoveryInfo();
     await assert.rejects(() => loadCursors(defaultCursorOptions), error => error?.code === 'CURSORS_INVALID', 'a fresh-process-equivalent cursor read should still fail closed on the preserved corrupt source');
-    const afterFreshRecoveryRead = await fsp.readdir(path.dirname(cursorFile));
+    const afterFreshRecoveryRead = await fsp.readdir(path.dirname(defaultCursorFile));
     assert.equal(
       afterFreshRecoveryRead.filter(name => /^cursors\.invalid\.[a-f0-9]{24}\.json$/.test(name)).length,
       invalidBackupCount,
       'content-addressed cursor recovery must reuse the same backup after process recovery state is reset',
     );
-    await fsp.rm(cursorFile, { force: true });
+    await fsp.rm(defaultCursorFile, { force: true });
     await assert.rejects(
       () => revalidateCursorStore(),
       error => error?.code === 'cursor_store_revalidation_file_missing',
       'revalidation must not treat a manually deleted corrupt cursor file as a safe empty store',
     );
     assert.ok(getCursorRecoveryInfo(), 'a rejected missing-file revalidation must keep the scheduler blocked');
-    await fsp.writeFile(cursorFile, JSON.stringify(emptyStore), 'utf-8');
+    await fsp.writeFile(defaultCursorFile, JSON.stringify(emptyStore), 'utf-8');
     const revalidatedCursorStore = await revalidateCursorStore();
     assert.equal(revalidatedCursorStore.revalidated, true, 'an explicitly repaired cursor file should clear the in-process block after a strict read');
     assert.equal(getCursorRecoveryInfo(), null, 'successful strict revalidation should clear the persistent in-process stop state');
@@ -13458,7 +13464,7 @@ async function verifyCursorStore() {
     assert.equal(singleAccountUnscopedFallback.legacyCursorUnverified, undefined, 'single-account complete group lookup may migrate an unscoped legacy cursor');
   } finally {
     clearCursorRecoveryInfo();
-    await fsp.rm(tempDir, { recursive: true, force: true });
+    await fsp.rm(cursorCaseDir, { recursive: true, force: true });
   }
 }
 

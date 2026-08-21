@@ -13,8 +13,9 @@ const VERIFIED_ACCOUNT_ID_RE = /^wxacct_[a-f0-9]{24}$/;
 export const CURSOR_STORE_MAX_BYTES = 16 * 1024 * 1024;
 export const CURSOR_SEEN_WINDOW_MAX_BYTES = 2 * 1024 * 1024;
 
-export async function loadCursors({ file = CURSORS_FILE, defaultStore = false } = {}) {
+export async function loadCursors({ file = CURSORS_FILE, defaultStore = false, projectRoot = PROJECT_ROOT } = {}) {
   const cursorFile = cursorStoreFile(file);
+  const recoveryProjectRoot = path.resolve(String(projectRoot || PROJECT_ROOT));
   const isDefaultStore = defaultStore === true || path.resolve(cursorFile) === path.resolve(CURSORS_FILE);
   if (isDefaultStore && cursorRecoveryInfo) {
     throw cursorStoreInvalidError(cursorRecoveryInfo, null);
@@ -29,20 +30,21 @@ export async function loadCursors({ file = CURSORS_FILE, defaultStore = false } 
     if (e?.code === 'ENOENT') return emptyCursorStore();
     const preserved = await backupInvalidCursorsFile(cursorFile, { preserveOriginal: isDefaultStore });
     const evidencePath = preserved.backup_path || preserved.original_path || cursorFile;
-    const relativeBackup = projectRelativePath(evidencePath);
+    const relativeBackup = projectRelativePath(evidencePath, recoveryProjectRoot);
     const recovery = {
       original_path: cursorFile,
       backup_path: evidencePath,
       backup_relative_path: relativeBackup,
+      recovery_project_root: recoveryProjectRoot,
       backup_available: preserved.backup_available === true,
       original_preserved: preserved.original_preserved === true,
       error: e?.message || String(e),
     };
     if (isDefaultStore) {
       cursorRecoveryInfo = recovery;
-      throw cursorStoreInvalidError(recovery, e);
+      throw cursorStoreInvalidError(recovery, e, recoveryProjectRoot);
     }
-    throw cursorStoreInvalidError(recovery, e);
+    throw cursorStoreInvalidError(recovery, e, recoveryProjectRoot);
   }
 }
 
@@ -108,8 +110,8 @@ async function backupInvalidCursorsFile(file, { preserveOriginal = false } = {})
   }
 }
 
-function cursorStoreInvalidError(recovery = {}, cause = null) {
-  const relativeBackup = recovery.backup_relative_path || projectRelativePath(recovery.backup_path || CURSORS_FILE);
+function cursorStoreInvalidError(recovery = {}, cause = null, projectRoot = recovery.recovery_project_root || PROJECT_ROOT) {
+  const relativeBackup = recovery.backup_relative_path || projectRelativePath(recovery.backup_path || CURSORS_FILE, projectRoot);
   const evidenceMessage = recovery.backup_available === true
     ? `已按内容备份为 ${relativeBackup}`
     : `原文件已保留在 ${relativeBackup}`;
@@ -130,16 +132,19 @@ function cursorBackupTimestamp(date) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
-function projectRelativePath(file) {
+function projectRelativePath(file, projectRoot = PROJECT_ROOT) {
   const resolved = path.resolve(file);
-  if (!isInside(PROJECT_ROOT, resolved)) return path.basename(resolved);
-  return path.relative(PROJECT_ROOT, resolved).replaceAll(path.sep, '/');
+  const resolvedProjectRoot = path.resolve(String(projectRoot || PROJECT_ROOT));
+  if (!isInside(resolvedProjectRoot, resolved)) return path.basename(resolved);
+  return path.relative(resolvedProjectRoot, resolved).replaceAll(path.sep, '/');
 }
 
 export function getCursorRecoveryInfo() {
   if (!cursorRecoveryInfo) return null;
   return {
-    backup_relative_path: cursorRecoveryInfo.backup_relative_path || (cursorRecoveryInfo.backup_path ? projectRelativePath(cursorRecoveryInfo.backup_path) : ''),
+    backup_relative_path: cursorRecoveryInfo.backup_relative_path || (cursorRecoveryInfo.backup_path
+      ? projectRelativePath(cursorRecoveryInfo.backup_path, cursorRecoveryInfo.recovery_project_root || PROJECT_ROOT)
+      : ''),
     backup_available: cursorRecoveryInfo.backup_available === true,
     original_preserved: cursorRecoveryInfo.original_preserved === true,
     error: redactCursorRecoveryError(cursorRecoveryInfo.error || ''),
@@ -170,7 +175,11 @@ export async function revalidateCursorStore() {
     }
     cursorRecoveryInfo = null;
     try {
-      const store = await loadCursors({ file: cursorFile, defaultStore: true });
+      const store = await loadCursors({
+        file: cursorFile,
+        defaultStore: true,
+        projectRoot: previousRecovery.recovery_project_root || PROJECT_ROOT,
+      });
       const afterStat = await fsp.lstat(cursorFile).catch(() => null);
       if (!cursorFileSnapshotMatches(stat, afterStat)) {
         throw Object.assign(new Error('重新检查期间 data/cursors.json 又发生变化；为避免按不一致快照恢复，自动检查仍保持停止。'), {
